@@ -15,6 +15,7 @@
 
 #![deny(missing_docs)]
 
+pub mod character;
 pub mod error;
 pub mod gateway_client;
 pub mod job_object;

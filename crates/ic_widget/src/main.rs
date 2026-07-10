@@ -23,6 +23,7 @@ use ic_llama::{
     Digest, HubModel, LocalLlm, LocalLlmOptions, ModelId, ModelStore, SidecarState, SpawnHook,
     Verdict,
 };
+use ic_widget::character::{self, CharacterInputs, CharacterState};
 use ic_widget::error::Error;
 use ic_widget::gateway_client::{
     ClientActionId, GateRef, GateResolution, GatewayClient, GatewayEvent, ProjectionItem, RunId,
@@ -80,6 +81,16 @@ struct AppState {
     window_store: WindowStateStore,
     /// Persisted user settings — the active provider today.
     settings_store: SettingsStore,
+    /// The character's animation inputs and last emitted state, so a `character://state`
+    /// event fires only when the derived state actually changes.
+    character: Mutex<CharacterTracker>,
+}
+
+/// The inputs the character state derives from, plus the last state emitted.
+#[derive(Default)]
+struct CharacterTracker {
+    inputs: CharacterInputs,
+    last: Option<CharacterState>,
 }
 
 impl AppState {
@@ -142,7 +153,14 @@ async fn create_thread(
     if let Some(previous) = pump.take() {
         previous.abort();
     }
-    *pump = Some(tokio::spawn(pump_events(app, client, thread_id.clone())));
+    *pump = Some(tokio::spawn(pump_events(
+        app.clone(),
+        client,
+        thread_id.clone(),
+    )));
+
+    // A fresh thread has no active run; clear any phase left from the last one.
+    update_character(&app, |inputs| inputs.run = None).await;
 
     tracing::info!(%thread_id, "the widget created a thread and started its event pump");
     Ok(thread_id.to_string())
@@ -474,8 +492,13 @@ async fn apply_provider(
         .map_err(user_facing)?;
 
     // Tell the UI we are restarting before the teardown, so the badge is honest
-    // during the gap.
+    // during the gap. The old run, if any, is gone with the old gateway.
     let _ = app.emit("gateway://state", GatewayState::Starting);
+    update_character(&app, |inputs| {
+        inputs.gateway = GatewayState::Starting;
+        inputs.run = None;
+    })
+    .await;
 
     if let Some(mut gateway) = state.gateway.lock().await.take() {
         gateway.stop().await;
@@ -710,6 +733,34 @@ async fn run_download(app: AppHandle, root: PathBuf, model: HubModel, id: String
     let _ = app.emit("model://event", event);
 }
 
+// ------------------------------------------------------------------ character
+
+/// Update the character's inputs and emit `character://state` if the derived
+/// state changed. Deduped so the 1-second run-status poll does not spam the UI.
+async fn update_character(app: &AppHandle, mutate: impl FnOnce(&mut CharacterInputs)) {
+    let state = app.state::<AppState>();
+    let next = {
+        let mut tracker = state.character.lock().await;
+        mutate(&mut tracker.inputs);
+        let next = character::derive(&tracker.inputs);
+        if tracker.last == Some(next) {
+            return;
+        }
+        tracker.last = Some(next);
+        next
+    };
+    let _ = app.emit("character://state", next);
+}
+
+/// The current character state, for a UI that mounts after the last event fired.
+#[tauri::command]
+async fn character_state(state: tauri::State<'_, AppState>) -> Result<CharacterState, String> {
+    let tracker = state.character.lock().await;
+    Ok(tracker
+        .last
+        .unwrap_or_else(|| character::derive(&tracker.inputs)))
+}
+
 #[tauri::command]
 async fn open_dashboard(app: AppHandle) -> Result<(), String> {
     show_dashboard(&app).map_err(|error| error.to_string())
@@ -761,6 +812,8 @@ async fn pump_events(app: AppHandle, client: GatewayClient, thread_id: ThreadId)
                                 failure_summary: status.failure_summary.clone(),
                             },
                         );
+                        update_character(&app, |inputs| inputs.run = Some(status.status.clone()))
+                            .await;
                     }
                 }
                 continue;
@@ -1148,6 +1201,7 @@ async fn bring_up_gateway(app: AppHandle, selection: ProviderSelection) {
                     let current = states.borrow_and_update().clone();
                     tracing::info!(?current, "gateway state changed");
                     let _ = handle.emit("gateway://state", &current);
+                    update_character(&handle, |inputs| inputs.gateway = current.clone()).await;
                 }
             });
 
@@ -1157,9 +1211,16 @@ async fn bring_up_gateway(app: AppHandle, selection: ProviderSelection) {
             // event that has been and gone.
             *app.state::<AppState>().gateway.lock().await = Some(gateway);
             let _ = app.emit("gateway://state", GatewayState::Ready);
+            update_character(&app, |inputs| inputs.gateway = GatewayState::Ready).await;
         }
         Err(reason) => {
             tracing::error!(%reason, "the gateway did not start");
+            update_character(&app, |inputs| {
+                inputs.gateway = GatewayState::Unhealthy {
+                    reason: reason.clone(),
+                }
+            })
+            .await;
             let _ = app.emit("gateway://state", GatewayState::Unhealthy { reason });
         }
     }
@@ -1278,6 +1339,7 @@ fn main() {
             download_model,
             cancel_download,
             remove_model,
+            character_state,
             open_dashboard,
         ])
         .setup(|app| {
@@ -1294,6 +1356,7 @@ fn main() {
                 window_state: std::sync::Mutex::new(window_state),
                 window_store: store,
                 settings_store: SettingsStore::at(SettingsStore::default_path()?),
+                character: Mutex::new(CharacterTracker::default()),
             });
 
             let handle = app.handle().clone();

@@ -85,6 +85,49 @@ button.ghost {
   color: var(--danger);
 }
 
+.character {
+  display: flex;
+  justify-content: center;
+  align-items: flex-end;
+  padding: 10px 0 4px;
+  user-select: none;
+}
+.character-face {
+  font-size: 52px;
+  line-height: 1;
+  transition: transform 0.15s ease;
+}
+.character-face[data-state="thinking"] {
+  animation: bob 1.4s ease-in-out infinite;
+}
+.character-face[data-state="speaking"] {
+  animation: bob 0.5s ease-in-out infinite;
+}
+.character-face[data-state="error"] {
+  animation: shake 0.4s ease-in-out infinite;
+}
+@keyframes bob {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-6px);
+  }
+}
+@keyframes shake {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  25% {
+    transform: translateX(-4px);
+  }
+  75% {
+    transform: translateX(4px);
+  }
+}
+
 .transcript {
   flex: 1;
   overflow-y: auto;

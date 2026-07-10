@@ -169,6 +169,18 @@ export type ModelEvent =
     }
   | { kind: "finished"; id: string; ok: boolean; cancelled: boolean; error: string | null };
 
+/**
+ * The character's animation state. Mirrors `ic_widget::character::CharacterState`
+ * and is derived on the backend from the gateway's health and the active run.
+ */
+export type CharacterState =
+  | "idle"
+  | "listening"
+  | "thinking"
+  | "speaking"
+  | "concerned"
+  | "error";
+
 export const api = {
   gatewayState: () => invoke<GatewayState>("gateway_state"),
   createThread: () => invoke<string>("create_thread"),
@@ -197,11 +209,17 @@ export const api = {
     invoke<void>("download_model", { repo, file }),
   cancelDownload: () => invoke<void>("cancel_download"),
   removeModel: (id: string) => invoke<void>("remove_model", { id }),
+  characterState: () => invoke<CharacterState>("character_state"),
 };
 
 /** Subscribe to model-download progress and completion. */
 export function onModelEvent(handler: (event: ModelEvent) => void): Promise<UnlistenFn> {
   return listen<ModelEvent>("model://event", (event) => handler(event.payload));
+}
+
+/** Subscribe to character animation-state changes. */
+export function onCharacterState(handler: (state: CharacterState) => void): Promise<UnlistenFn> {
+  return listen<CharacterState>("character://state", (event) => handler(event.payload));
 }
 
 /** Subscribe to gateway health transitions. */

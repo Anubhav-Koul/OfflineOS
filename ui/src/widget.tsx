@@ -5,6 +5,7 @@ import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import {
   api,
   onChatEvent,
+  onCharacterState,
   onGatewayState,
   TERMINAL_PHASES,
   type ChatEvent,
@@ -12,6 +13,7 @@ import {
   type Message,
   type RunPhase,
 } from "./api";
+import { createRenderer, PLACEHOLDER_CONFIG } from "./character";
 import "./styles.css";
 
 /**
@@ -226,6 +228,8 @@ function App() {
         </button>
       </header>
 
+      <CharacterView />
+
       <div class="transcript" ref={transcript}>
         <For each={bubbles()}>
           {(bubble) => <div class={`bubble ${bubble.role}`}>{bubble.text}</div>}
@@ -303,6 +307,30 @@ function HealthBadge(props: { state: GatewayState }) {
       {label()}
     </span>
   );
+}
+
+/**
+ * The character. Owns a {@link CharacterRenderer} and drives it from
+ * `character://state`, reading the current state on mount to cover the race
+ * where it changed before we subscribed.
+ */
+function CharacterView() {
+  let container: HTMLDivElement | undefined;
+
+  onMount(async () => {
+    const renderer = createRenderer(PLACEHOLDER_CONFIG);
+    if (container) await renderer.mount(container);
+
+    const unlisten = await onCharacterState((state) => renderer.setState(state));
+    renderer.setState(await api.characterState());
+
+    onCleanup(() => {
+      unlisten();
+      renderer.destroy();
+    });
+  });
+
+  return <div class="character" ref={container} />;
 }
 
 const root = document.getElementById("root");

@@ -49,6 +49,18 @@ pub struct CharacterInputs {
     pub speaking: bool,
 }
 
+impl Default for CharacterInputs {
+    /// The state at launch: the gateway is still coming up, nothing else set.
+    fn default() -> Self {
+        Self {
+            gateway: GatewayState::Starting,
+            run: None,
+            listening: false,
+            speaking: false,
+        }
+    }
+}
+
 /// Map the app's state onto the character's.
 ///
 /// Priority, highest first: a broken backend (`Error`) overrides everything; a

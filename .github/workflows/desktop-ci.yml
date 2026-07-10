@@ -1,0 +1,125 @@
+# Desktop fork CI — Windows-first (Phase 0 step 6).
+#
+# The upstream workflows in this directory target Ubuntu and the hosted
+# product. This workflow is the desktop fork's gate: it proves the Reborn
+# runtime builds and serves on Windows (MSVC) and that the WebChat v2 chat
+# contract `ic_widget` builds against still holds end-to-end.
+#
+# Scope is deliberately narrow (fork crates + the serve path), not a full
+# workspace clippy, so pre-existing upstream lints do not fail the fork gate.
+name: desktop-ci
+
+on:
+  push:
+    branches: [desktop/main]
+  pull_request:
+    branches: [desktop/main]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: desktop-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  quality:
+    name: fmt + clippy (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Format check
+        run: cargo fmt --all -- --check
+      # Lint only fork-authored code with `-D warnings`. Extending this to
+      # upstream crates (e.g. `ironclaw_reborn_cli` and its deps) would fail on
+      # pre-existing upstream clippy lints that are out of scope for the fork.
+      - name: Clippy (ic_integration_tests)
+        run: >
+          cargo clippy
+          -p ic_integration_tests
+          --all-targets
+          --features webui-v2-beta
+          -- -D warnings
+      - name: Clippy (ic_llama)
+        run: cargo clippy -p ic_llama --all-targets -- -D warnings
+      # The library only: the Tauri shell needs the frontend bundle, which the
+      # `widget` job builds.
+      - name: Clippy (ic_widget)
+        run: cargo clippy -p ic_widget --lib --tests -- -D warnings
+
+  ic-llama:
+    name: ic_llama tests (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # Hermetic: no network, no GPU, no real weights. The GGUF tests build
+      # synthetic model files, the download tests drive a mock origin, and the
+      # supervisor tests spawn `testsupport/fake_llama_server.rs`. The one test
+      # that needs real weights (`local_model_roundtrip`) is `#[ignore]`d.
+      - name: Run ic_llama tests
+        run: cargo test -p ic_llama
+
+  gate:
+    name: serve round-trip gate (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # The integration test launches the `serve` binary but does not build it
+      # (a separate crate cannot force a sibling binary build). Build it first,
+      # then run the gate against it.
+      - name: Build ironclaw-reborn (webui-v2-beta)
+        run: cargo build -p ironclaw_reborn_cli --bin ironclaw-reborn --features webui-v2-beta
+      - name: Run chat round-trip gate
+        run: cargo test -p ic_integration_tests --features webui-v2-beta -- --nocapture
+      # `ic_widget`'s gateway-client and supervisor tests drive the same binary.
+      # They are the contract tests for the API the desktop app is built on.
+      - name: Run ic_widget gateway tests
+        run: cargo test -p ic_widget --features webui-v2-beta
+
+  widget:
+    name: widget app build (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      # `frontendDist` must exist before `tauri-build` runs, so the UI is built
+      # first rather than through `beforeBuildCommand`.
+      - name: Build the frontend
+        run: npm ci && npm run build
+        working-directory: ui
+      - name: Build the widget
+        run: cargo build -p ic_widget --features app --bin ic-widget
+
+  release-build:
+    name: core release build (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # Core release build, no webui feature (matches CLAUDE.md command
+      # reference) — confirms the default fork build stays green on Windows.
+      - name: Release build
+        run: cargo build --release

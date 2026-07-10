@@ -1,0 +1,94 @@
+[package]
+name = "ic_widget"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Phase 2 of the desktop fork: the Tauri widget + dashboard, and the one client module the rest of the app talks to `ironclaw-reborn serve` through."
+
+[lib]
+name = "ic_widget"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ic-widget"
+path = "src/main.rs"
+# The Tauri shell is heavy to compile and needs WebView2. Everything worth
+# testing (the gateway client, the supervisor, window state) lives in the lib and
+# builds without it, so `cargo test -p ic_widget` stays fast.
+required-features = ["app"]
+
+[features]
+default = []
+# Compile the integration tests that spawn a real `ironclaw-reborn serve`.
+# Mirrors `ic_integration_tests`: the binary must be built first, so a plain
+# `cargo test --workspace` does not fail for a missing binary.
+webui-v2-beta = []
+app = [
+    "dep:tauri",
+    "dep:tauri-build",
+    "dep:tauri-plugin-global-shortcut",
+    "dep:tauri-plugin-single-instance",
+    "dep:tracing-subscriber",
+]
+
+[build-dependencies]
+tauri-build = { version = "2", optional = true }
+
+[dependencies]
+ic_llama = { path = "../ic_llama" }
+
+tokio = { version = "1", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls-native-roots",
+    "stream",
+] }
+futures-util = "0.3"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+hex = "0.4.3"
+keyring = { version = "3", features = ["windows-native"] }
+dirs = "6"
+
+tauri = { version = "2", features = ["tray-icon"], optional = true }
+tauri-plugin-global-shortcut = { version = "2", optional = true }
+tauri-plugin-single-instance = { version = "2", optional = true }
+# Without a subscriber every `tracing` call in the app is discarded, which makes
+# a misbehaving widget impossible to diagnose from a user's console.
+tracing-subscriber = { version = "0.3", features = [
+    "env-filter",
+], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    # `CreateJobObjectW` takes a SECURITY_ATTRIBUTES pointer, so the job-object
+    # bindings are gated behind the security module.
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+ic_integration_tests = { path = "../ic_integration_tests" }
+tempfile = "3"
+
+[lints]
+workspace = true

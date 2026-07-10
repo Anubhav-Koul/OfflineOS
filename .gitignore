@@ -72,3 +72,18 @@ tests/fixtures/llm_traces/live/*.log
 
 # Local test artifacts
 .anvil/
+
+# Desktop fork: frontend build artifacts (crates/ic_widget's `ui/`).
+# `package-lock.json` IS committed — CI runs `npm ci` against it.
+/ui/node_modules/
+/ui/dist/
+
+# Tauri codegen output.
+/crates/ic_widget/gen/
+
+# Live2D character: keep the runtime assets the app loads (ren_en/runtime/),
+# exclude the Cubism editor project sources. `ren_t01.cmo3` alone is ~44 MB and
+# is never a build input — Phase 3 copies only `runtime/` into assets/. A binary
+# that large in history would bloat every clone forever, even once deleted.
+/ren_en/*.cmo3
+/ren_en/*.can3

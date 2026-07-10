@@ -92,6 +92,31 @@ export interface Automation {
   is_active: boolean;
 }
 
+/** The sidecar's live state. `reason` is set only when `state` is "suspect". */
+export interface SidecarState {
+  state: "starting" | "loading" | "ready" | "restarting" | "suspect" | "stopped";
+  reason?: string;
+  attempt?: number;
+  backoff_ms?: number;
+}
+
+/**
+ * The local model panel. `local_model_status` returns `null` when the app runs
+ * without local inference. `verdict` and `sidecar.state` are snake_case badge
+ * values; sizes are MiB.
+ */
+export interface LocalModel {
+  model_id: string;
+  backend: string;
+  sidecar: SidecarState;
+  n_gpu_layers: number;
+  block_count: number;
+  verdict: "full_offload" | "partial_offload" | "cpu_only" | "refused";
+  estimated_vram_mb: number;
+  estimated_host_mb: number;
+  warnings: string[];
+}
+
 export const api = {
   gatewayState: () => invoke<GatewayState>("gateway_state"),
   createThread: () => invoke<string>("create_thread"),
@@ -106,6 +131,7 @@ export const api = {
   gatewayLog: () => invoke<string>("gateway_log"),
   listThreads: () => invoke<Thread[]>("list_threads"),
   listAutomations: () => invoke<Automation[]>("list_automations"),
+  localModelStatus: () => invoke<LocalModel | null>("local_model_status"),
 };
 
 /** Subscribe to gateway health transitions. */

@@ -280,3 +280,41 @@ ul.rows .row:first-child {
   font-size: 12px;
   white-space: nowrap;
 }
+
+dl.facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px 16px;
+  margin: 12px 0 0;
+}
+dl.facts div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+dl.facts dt {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+dl.facts dd {
+  margin: 0;
+  font-weight: 600;
+}
+
+ul.warnings {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 10px;
+  border-radius: 6px;
+  background: rgba(226, 176, 74, 0.1);
+  color: var(--warn);
+  font-size: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+ul.warnings li::before {
+  content: "⚠ ";
+}

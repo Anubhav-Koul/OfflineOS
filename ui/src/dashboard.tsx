@@ -7,6 +7,7 @@ import {
   onGatewayState,
   type Automation,
   type GatewayState,
+  type LocalModel,
   type Thread,
 } from "./api";
 import "./styles.css";
@@ -69,16 +70,43 @@ function createPanelData<T>(load: () => Promise<T[]>) {
   return { rows, error, loading, loaded, refresh };
 }
 
+/** The single-value sibling of {@link createPanelData}, for a panel that shows
+ * one record (or none) rather than a list. */
+function createValueData<T>(load: () => Promise<T>) {
+  const [value, setValue] = createSignal<T | undefined>(undefined);
+  const [error, setError] = createSignal<string | null>(null);
+  const [loading, setLoading] = createSignal(false);
+  const [loaded, setLoaded] = createSignal(false);
+
+  const refresh = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const next = await load();
+      setValue(() => next);
+      setLoaded(true);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return { value, error, loading, loaded, refresh };
+}
+
 function Dashboard() {
   const [gateway, setGateway] = createSignal<GatewayState>({ state: "starting" });
   const [log, setLog] = createSignal("");
 
   const sessions = createPanelData<Thread>(api.listThreads);
   const automations = createPanelData<Automation>(api.listAutomations);
+  const model = createValueData<LocalModel | null>(api.localModelStatus);
 
   const loadAll = () => {
     void sessions.refresh();
     void automations.refresh();
+    void model.refresh();
   };
 
   onMount(async () => {
@@ -189,6 +217,77 @@ function Dashboard() {
       </section>
 
       <section>
+        <div class="panel-head">
+          <h2>Local model</h2>
+          <button class="ghost" disabled={model.loading()} onClick={() => void model.refresh()}>
+            Refresh
+          </button>
+        </div>
+        <Show
+          when={!model.error()}
+          fallback={<p class="reason-inline">{model.error()}</p>}
+        >
+          <Show
+            when={model.loaded()}
+            fallback={<p class="muted">{model.loading() ? "Loading…" : ""}</p>}
+          >
+            <Show
+              when={model.value()}
+              fallback={
+                <p class="muted">
+                  No local model running — the app is using a configured cloud provider, or no
+                  model is installed yet.
+                </p>
+              }
+            >
+              {(m) => (
+                <div class="model">
+                  <div class="row">
+                    <span class="row-title">{m().model_id}</span>
+                    <span class={`badge ${sidecarBadgeClass(m().sidecar.state)}`}>
+                      {m().sidecar.state}
+                    </span>
+                  </div>
+                  <Show when={m().sidecar.reason}>
+                    {(reason) => <p class="reason-inline">{reason()}</p>}
+                  </Show>
+                  <dl class="facts">
+                    <div>
+                      <dt>Backend</dt>
+                      <dd>{m().backend}</dd>
+                    </div>
+                    <div>
+                      <dt>Offload</dt>
+                      <dd>{offloadLabel(m().verdict)}</dd>
+                    </div>
+                    <div>
+                      <dt>GPU layers</dt>
+                      <dd>
+                        {m().n_gpu_layers} / {m().block_count}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Est. VRAM</dt>
+                      <dd>{m().estimated_vram_mb} MiB</dd>
+                    </div>
+                    <div>
+                      <dt>Est. RAM</dt>
+                      <dd>{m().estimated_host_mb} MiB</dd>
+                    </div>
+                  </dl>
+                  <Show when={m().warnings.length > 0}>
+                    <ul class="warnings">
+                      <For each={m().warnings}>{(warning) => <li>{warning}</li>}</For>
+                    </ul>
+                  </Show>
+                </div>
+              )}
+            </Show>
+          </Show>
+        </Show>
+      </section>
+
+      <section>
         <h2>Not available yet</h2>
         <p class="muted">
           These panels are in the plan but have no endpoint in{" "}
@@ -246,6 +345,40 @@ function badgeClass(state: string): string {
       return "stopped";
     default:
       return "";
+  }
+}
+
+/** Map a sidecar state onto one of the existing badge colour classes. */
+function sidecarBadgeClass(state: string): string {
+  switch (state) {
+    case "ready":
+      return "ready";
+    case "loading":
+    case "starting":
+    case "restarting":
+      return "starting";
+    case "suspect":
+      return "unhealthy";
+    case "stopped":
+      return "stopped";
+    default:
+      return "";
+  }
+}
+
+/** A plain-language label for a placement verdict. */
+function offloadLabel(verdict: string): string {
+  switch (verdict) {
+    case "full_offload":
+      return "Full (GPU)";
+    case "partial_offload":
+      return "Partial (GPU + CPU)";
+    case "cpu_only":
+      return "CPU only";
+    case "refused":
+      return "Refused";
+    default:
+      return verdict;
   }
 }
 

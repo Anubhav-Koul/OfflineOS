@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ic_llama::download::Downloader;
-use ic_llama::{LocalLlm, LocalLlmOptions, ModelStore, SpawnHook};
+use ic_llama::{LocalLlm, LocalLlmOptions, ModelStore, SidecarState, SpawnHook, Verdict};
 use ic_widget::error::Error;
 use ic_widget::gateway_client::{
     ClientActionId, GateRef, GateResolution, GatewayClient, GatewayEvent, ProjectionItem, RunId,
@@ -298,6 +298,68 @@ async fn list_automations(state: tauri::State<'_, AppState>) -> Result<Vec<UiAut
             is_active: automation.is_active,
         })
         .collect())
+}
+
+/// The local model panel's data. `None` when no local model is running.
+#[derive(Serialize)]
+struct UiModel {
+    /// The name the model answers to.
+    model_id: String,
+    /// Which llama.cpp build is serving it (`vulkan`, `cuda12`, `cpu`).
+    backend: String,
+    /// The sidecar's live state — `{ state: "ready" }`, `{ state: "suspect",
+    /// reason }`, etc. The panel renders it as a badge.
+    sidecar: SidecarState,
+    /// Layers offloaded to the GPU, out of `block_count`. Equal means full
+    /// offload (plus the output tensors when it exceeds `block_count`).
+    n_gpu_layers: u32,
+    /// The model's transformer layer count.
+    block_count: u32,
+    /// `full_offload` / `partial_offload` / `cpu_only` / `refused`.
+    verdict: String,
+    /// Estimated VRAM the server consumes, in MiB.
+    estimated_vram_mb: u64,
+    /// Estimated host RAM the server consumes, in MiB.
+    estimated_host_mb: u64,
+    /// Placement advisories, already human-readable.
+    warnings: Vec<String>,
+}
+
+/// Read-only status of the running local model. Reflects placement decided at
+/// launch plus the sidecar's live health; `None` when the app is running
+/// without local inference.
+#[tauri::command]
+async fn local_model_status(state: tauri::State<'_, AppState>) -> Result<Option<UiModel>, String> {
+    let guard = state.local_llm.lock().await;
+    let Some(llm) = guard.as_ref() else {
+        return Ok(None);
+    };
+    let placement = llm.placement();
+    Ok(Some(UiModel {
+        model_id: llm.sidecar().model_id().to_string(),
+        backend: llm.backend().as_str().to_string(),
+        sidecar: llm.sidecar().state(),
+        n_gpu_layers: placement.n_gpu_layers,
+        block_count: llm.model().gguf.block_count,
+        verdict: verdict_label(&placement.verdict).to_string(),
+        estimated_vram_mb: placement.estimated_vram_bytes / (1024 * 1024),
+        estimated_host_mb: placement.estimated_host_bytes / (1024 * 1024),
+        warnings: placement
+            .warnings
+            .iter()
+            .map(|warning| warning.to_string())
+            .collect(),
+    }))
+}
+
+/// The stable wire label for a placement verdict.
+fn verdict_label(verdict: &Verdict) -> &'static str {
+    match verdict {
+        Verdict::FullOffload => "full_offload",
+        Verdict::PartialOffload => "partial_offload",
+        Verdict::CpuOnly => "cpu_only",
+        Verdict::Refuse { .. } => "refused",
+    }
 }
 
 #[tauri::command]
@@ -784,6 +846,7 @@ fn main() {
             resolve_gate,
             list_threads,
             list_automations,
+            local_model_status,
             open_dashboard,
         ])
         .setup(|app| {

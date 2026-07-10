@@ -230,6 +230,69 @@ async fn resolve_gate(
         .map_err(user_facing)
 }
 
+// ----------------------------------------------------------- dashboard panels
+
+/// A row in the sessions panel.
+#[derive(Serialize)]
+struct UiThread {
+    thread_id: String,
+    /// `None` until the agent has titled the thread; the UI shows a placeholder.
+    title: Option<String>,
+}
+
+/// The caller's threads, newest first. Threads survive gateway restarts (they
+/// are persisted through the libSQL-backed root filesystem), so this is a stable
+/// list, not a per-session one.
+#[tauri::command]
+async fn list_threads(state: tauri::State<'_, AppState>) -> Result<Vec<UiThread>, String> {
+    let client = state.client().await?;
+    let threads = client.list_threads(None).await.map_err(user_facing)?;
+    Ok(threads
+        .into_iter()
+        .map(|thread| UiThread {
+            thread_id: thread.thread_id.to_string(),
+            title: thread.title,
+        })
+        .collect())
+}
+
+/// A row in the automations panel.
+#[derive(Serialize)]
+struct UiAutomation {
+    automation_id: String,
+    name: String,
+    /// Snake_case state (`scheduled`, `paused`, …), rendered as a badge.
+    state: String,
+    next_run_at: Option<String>,
+    last_run_at: Option<String>,
+    /// `ok` / `error` / a raw status, or `None` before the first run.
+    last_status: Option<String>,
+    is_active: bool,
+}
+
+/// The caller's scheduled automations. These are schedule entries, **not** run
+/// history — no run-history route exists (see `docs/desktop/dashboard-gaps.md`).
+#[tauri::command]
+async fn list_automations(state: tauri::State<'_, AppState>) -> Result<Vec<UiAutomation>, String> {
+    let client = state.client().await?;
+    let automations = client.list_automations(None).await.map_err(user_facing)?;
+    Ok(automations
+        .into_iter()
+        .map(|automation| UiAutomation {
+            automation_id: automation.automation_id,
+            name: automation.name,
+            state: automation.state.as_str().to_string(),
+            next_run_at: automation.next_run_at,
+            last_run_at: automation.last_run_at,
+            last_status: automation
+                .last_status
+                .as_ref()
+                .map(|status| status.as_str().to_string()),
+            is_active: automation.is_active,
+        })
+        .collect())
+}
+
 #[tauri::command]
 async fn open_dashboard(app: AppHandle) -> Result<(), String> {
     show_dashboard(&app).map_err(|error| error.to_string())
@@ -615,6 +678,8 @@ fn main() {
             cancel_run,
             fetch_timeline,
             resolve_gate,
+            list_threads,
+            list_automations,
             open_dashboard,
         ])
         .setup(|app| {

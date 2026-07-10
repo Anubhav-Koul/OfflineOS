@@ -226,3 +226,57 @@ pre.reason {
 pre.reason {
   color: var(--danger);
 }
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.panel-head h2 {
+  margin: 0;
+}
+.panel-head .ghost {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.muted.small {
+  font-size: 12px;
+  margin: 4px 0 10px;
+}
+
+.reason-inline {
+  color: var(--danger);
+  font-size: 13px;
+  margin: 6px 0 0;
+}
+
+ul.rows {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+ul.rows .row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 4px;
+  border-top: 1px solid #2b2f38;
+}
+ul.rows .row:first-child {
+  border-top: none;
+}
+.row-title {
+  font-weight: 600;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.row-meta {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}

@@ -4,9 +4,9 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 /**
  * The typed edge of the Rust bridge.
  *
- * Every field name here matches a `serde` rename in `crates/ic_widget/src/commands.rs`.
- * Nothing else in the UI calls `invoke` or `listen`, so a change to a command's
- * shape breaks in exactly one file.
+ * Every field name here matches a `serde` field on a command return type in
+ * `crates/ic_widget/src/main.rs`. Nothing else in the UI calls `invoke` or
+ * `listen`, so a change to a command's shape breaks in exactly one file.
  */
 
 export type GatewayState =
@@ -70,6 +70,28 @@ export interface CancelResult {
   already_terminal: boolean;
 }
 
+/** A row in the sessions panel. Threads survive gateway restarts. */
+export interface Thread {
+  thread_id: string;
+  /** `null` until the agent titles the thread. */
+  title: string | null;
+}
+
+/**
+ * A row in the automations panel. These are schedule entries, not run history.
+ * `state` is a snake_case badge value; `last_status` is `null` before the first
+ * run.
+ */
+export interface Automation {
+  automation_id: string;
+  name: string;
+  state: string;
+  next_run_at: string | null;
+  last_run_at: string | null;
+  last_status: string | null;
+  is_active: boolean;
+}
+
 export const api = {
   gatewayState: () => invoke<GatewayState>("gateway_state"),
   createThread: () => invoke<string>("create_thread"),
@@ -82,6 +104,8 @@ export const api = {
     invoke<void>("resolve_gate", { threadId, runId, gateRef, approved }),
   openDashboard: () => invoke<void>("open_dashboard"),
   gatewayLog: () => invoke<string>("gateway_log"),
+  listThreads: () => invoke<Thread[]>("list_threads"),
+  listAutomations: () => invoke<Automation[]>("list_automations"),
 };
 
 /** Subscribe to gateway health transitions. */

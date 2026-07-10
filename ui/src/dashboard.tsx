@@ -1,18 +1,24 @@
 /* @refresh reload */
 import { render } from "solid-js/web";
-import { createSignal, onCleanup, onMount, Show } from "solid-js";
+import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 
-import { api, onGatewayState, type GatewayState } from "./api";
+import {
+  api,
+  onGatewayState,
+  type Automation,
+  type GatewayState,
+  type Thread,
+} from "./api";
 import "./styles.css";
 
 /**
  * The dashboard.
  *
- * Phase 2a ships the panels the `serve` API can actually back: gateway health
- * and its log. The memory browser, skills list, and audit-log viewer named in
- * the project plan have **no HTTP route** in `ironclaw-reborn serve` — see
- * `docs/desktop/dashboard-gaps.md`. They are listed here as explicitly
- * unavailable rather than faked.
+ * Panels are split by what the `serve` API can actually back. Sessions
+ * (`GET /threads`) and automations (`GET /automations`) have live routes.
+ * The memory browser, skills list, audit log, and run history have **no HTTP
+ * route** in `ironclaw-reborn serve` — see `docs/desktop/dashboard-gaps.md`.
+ * They are listed as explicitly unavailable rather than faked.
  */
 
 const UNAVAILABLE_PANELS = [
@@ -28,17 +34,67 @@ const UNAVAILABLE_PANELS = [
     name: "Audit log",
     reason: "audit records go to internal sinks, not an HTTP route",
   },
+  {
+    name: "Run history",
+    reason: "automations expose schedules only, not past runs",
+  },
 ] as const;
+
+/**
+ * A panel whose data is loaded on demand from a command that needs the gateway.
+ *
+ * Tracks the three states the UI must tell apart: never-loaded, in-flight, and
+ * failed. A command rejects with a friendly string while the gateway is still
+ * starting, so `error` is shown as-is — it is already user-facing.
+ */
+function createPanelData<T>(load: () => Promise<T[]>) {
+  const [rows, setRows] = createSignal<T[]>([]);
+  const [error, setError] = createSignal<string | null>(null);
+  const [loading, setLoading] = createSignal(false);
+  const [loaded, setLoaded] = createSignal(false);
+
+  const refresh = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      setRows(await load());
+      setLoaded(true);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return { rows, error, loading, loaded, refresh };
+}
 
 function Dashboard() {
   const [gateway, setGateway] = createSignal<GatewayState>({ state: "starting" });
   const [log, setLog] = createSignal("");
 
+  const sessions = createPanelData<Thread>(api.listThreads);
+  const automations = createPanelData<Automation>(api.listAutomations);
+
+  const loadAll = () => {
+    void sessions.refresh();
+    void automations.refresh();
+  };
+
   onMount(async () => {
-    const unlisten = await onGatewayState(setGateway);
+    const unlisten = await onGatewayState((state) => {
+      const wasReady = gateway().state === "ready";
+      setGateway(state);
+      // Panels can only load once the gateway answers. Load on the first
+      // ready we see, not on mount — the gateway takes ~500 ms to boot.
+      if (state.state === "ready" && !wasReady) loadAll();
+    });
     onCleanup(unlisten);
-    setGateway(await api.gatewayState());
+
+    const current = await api.gatewayState();
+    setGateway(current);
     setLog(await api.gatewayLog());
+    if (current.state === "ready") loadAll();
   });
 
   const refreshLog = async () => setLog(await api.gatewayLog());
@@ -62,6 +118,77 @@ function Dashboard() {
       </section>
 
       <section>
+        <div class="panel-head">
+          <h2>Sessions</h2>
+          <button class="ghost" disabled={sessions.loading()} onClick={() => void sessions.refresh()}>
+            Refresh
+          </button>
+        </div>
+        <PanelBody
+          error={sessions.error()}
+          loading={sessions.loading()}
+          loaded={sessions.loaded()}
+          empty={sessions.rows().length === 0}
+          emptyText="No conversations yet."
+        >
+          <ul class="rows">
+            <For each={sessions.rows()}>
+              {(thread) => (
+                <li class="row">
+                  <span class="row-title">{thread.title ?? "Untitled conversation"}</span>
+                  <span class="row-meta">{thread.thread_id}</span>
+                </li>
+              )}
+            </For>
+          </ul>
+        </PanelBody>
+      </section>
+
+      <section>
+        <div class="panel-head">
+          <h2>Automations</h2>
+          <button
+            class="ghost"
+            disabled={automations.loading()}
+            onClick={() => void automations.refresh()}
+          >
+            Refresh
+          </button>
+        </div>
+        <p class="muted small">
+          Scheduled entries only — <code>serve</code> exposes no run history.
+        </p>
+        <PanelBody
+          error={automations.error()}
+          loading={automations.loading()}
+          loaded={automations.loaded()}
+          empty={automations.rows().length === 0}
+          emptyText="No automations scheduled."
+        >
+          <ul class="rows">
+            <For each={automations.rows()}>
+              {(automation) => (
+                <li class="row">
+                  <span class="row-title">{automation.name}</span>
+                  <span class={`badge ${badgeClass(automation.state)}`}>{automation.state}</span>
+                  <span class="row-meta">
+                    {automation.next_run_at
+                      ? `next ${formatWhen(automation.next_run_at)}`
+                      : automation.last_run_at
+                        ? `last ${formatWhen(automation.last_run_at)}`
+                        : "never run"}
+                    <Show when={automation.last_status}>
+                      {(status) => <> · {status()}</>}
+                    </Show>
+                  </span>
+                </li>
+              )}
+            </For>
+          </ul>
+        </PanelBody>
+      </section>
+
+      <section>
         <h2>Not available yet</h2>
         <p class="muted">
           These panels are in the plan but have no endpoint in{" "}
@@ -77,6 +204,55 @@ function Dashboard() {
       </section>
     </div>
   );
+}
+
+/** The shared shell around a panel's rows: error, loading, empty, or content. */
+function PanelBody(props: {
+  error: string | null;
+  loading: boolean;
+  loaded: boolean;
+  empty: boolean;
+  emptyText: string;
+  children: unknown;
+}) {
+  return (
+    <Show
+      when={!props.error}
+      fallback={<p class="reason-inline">{props.error}</p>}
+    >
+      <Show
+        when={props.loaded && !props.empty}
+        fallback={
+          <p class="muted">{props.loading && !props.loaded ? "Loading…" : props.emptyText}</p>
+        }
+      >
+        {props.children as never}
+      </Show>
+    </Show>
+  );
+}
+
+/** Map a wire state onto one of the existing badge colour classes. */
+function badgeClass(state: string): string {
+  switch (state) {
+    case "active":
+    case "scheduled":
+      return "ready";
+    case "paused":
+    case "inactive":
+    case "completed":
+      return "starting";
+    case "disabled":
+      return "stopped";
+    default:
+      return "";
+  }
+}
+
+/** Render an RFC 3339 timestamp in the user's locale, or pass it through. */
+function formatWhen(iso: string): string {
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? iso : date.toLocaleString();
 }
 
 const root = document.getElementById("root");

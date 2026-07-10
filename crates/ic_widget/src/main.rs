@@ -18,6 +18,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use ic_llama::download::Downloader;
+use ic_llama::{LocalLlm, LocalLlmOptions, ModelStore, SpawnHook};
 use ic_widget::error::Error;
 use ic_widget::gateway_client::{
     ClientActionId, GateRef, GateResolution, GatewayClient, GatewayEvent, ProjectionItem, RunId,
@@ -60,6 +62,11 @@ struct AppState {
     /// holds a boxed response body that is `Send` but not `Sync`. This is only
     /// ever spawned from inside an async command, so the runtime is present.
     pump: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The local model, once one has been brought up. `None` when no model is
+    /// installed or the launch failed — the gateway then runs without local
+    /// inference. Held for its `Drop`, which stops the sidecar and its proxy;
+    /// the sidecar also rides in `job`, so a hard kill takes it down too.
+    local_llm: Mutex<Option<LocalLlm>>,
     window_state: std::sync::Mutex<WindowState>,
     window_store: WindowStateStore,
 }
@@ -529,18 +536,115 @@ fn reborn_home() -> Result<PathBuf, String> {
         .ok_or_else(|| "could not locate the local application data directory".to_string())
 }
 
+/// Where the local model store and the llama.cpp runtime live.
+fn llama_root() -> Result<PathBuf, String> {
+    dirs::data_local_dir()
+        .map(|base| base.join("IronClaw Desktop").join("llama"))
+        .ok_or_else(|| "could not locate the local application data directory".to_string())
+}
+
+/// Bring up a local model, if one is installed and usable.
+///
+/// Best-effort: any failure — no model, a suspect model, a model too big for
+/// this machine, a llama.cpp download that did not complete — degrades to
+/// `None`, and the gateway runs without local inference rather than failing to
+/// start. Every failure is logged; none is swallowed silently.
+///
+/// The child `llama-server` is enlisted in `job` on every (re)spawn, so it dies
+/// with the widget even under a hard kill — the same guarantee the gateway has.
+async fn launch_local_model(job: Arc<ProcessJob>) -> Option<LocalLlm> {
+    let root = match llama_root() {
+        Ok(root) => root,
+        Err(error) => {
+            tracing::warn!(%error, "no local model directory; running without local inference");
+            return None;
+        }
+    };
+
+    let downloader = match Downloader::new() {
+        Ok(downloader) => downloader,
+        Err(error) => {
+            tracing::warn!(%error, "could not init the model downloader; skipping local inference");
+            return None;
+        }
+    };
+
+    let store = ModelStore::new(&root, downloader);
+    let installed = match store.list().await {
+        Ok(installed) => installed,
+        Err(error) => {
+            tracing::warn!(%error, "could not list installed models; skipping local inference");
+            return None;
+        }
+    };
+
+    // The first model that isn't marked suspect. A richer selection (a
+    // user-pinned default) lands with the model panel; until then, first usable
+    // wins, deterministically ordered by the store.
+    let Some(model) = installed.into_iter().find(|model| model.is_loadable()) else {
+        tracing::info!("no installed local model; the gateway will start without one");
+        return None;
+    };
+
+    tracing::info!(model = %model.id, "bringing up the local model");
+    let options = LocalLlmOptions {
+        on_sidecar_spawn: Some(enlist_in_job(job)),
+        ..Default::default()
+    };
+    match LocalLlm::launch(&root, &model.id, options).await {
+        Ok(llm) => {
+            for warning in &llm.placement().warnings {
+                tracing::warn!(model = %model.id, "{warning}");
+            }
+            tracing::info!(model = %model.id, "the local model is ready");
+            Some(llm)
+        }
+        Err(error) => {
+            tracing::warn!(model = %model.id, %error, "the local model did not start; running without it");
+            None
+        }
+    }
+}
+
+/// A spawn hook that puts `llama-server` in the widget's process job. Mirrors the
+/// gateway's own containment: a child outside the job survives a hard kill.
+fn enlist_in_job(job: Arc<ProcessJob>) -> SpawnHook {
+    SpawnHook::new(move |child| {
+        job.assign(child)
+            .map_err(|error| std::io::Error::other(error.to_string()))
+    })
+}
+
 /// Start the gateway off the main thread and mirror its state onto the UI.
 ///
 /// A first boot runs migrations and installs bundled skills. Blocking the UI for
 /// that would be a splash screen; a health badge is a better answer.
 fn spawn_gateway(app: AppHandle, job: Arc<ProcessJob>) {
     tauri::async_runtime::spawn(async move {
+        // The gateway reads `LLM_BASE_URL` once at startup and never re-reads it,
+        // so the local model must be up — and its proxy URL known — before the
+        // gateway spawns. The sidecar shares the gateway's job.
+        let local = launch_local_model(Arc::clone(&job)).await;
+        let llm_env: Vec<(String, String)> = local
+            .as_ref()
+            .map(|llm| {
+                llm.env()
+                    .vars()
+                    .map(|(name, value)| (name.to_string(), value.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Keep the model alive for the app's lifetime; its `Drop` stops the
+        // sidecar and proxy on a graceful exit.
+        *app.state::<AppState>().local_llm.lock().await = local;
+
         let started = async {
             let token = SecretStore::new()
                 .gateway_token()
                 .map_err(|error| error.to_string())?;
-            let config = GatewayConfig::new(reborn_binary(), reborn_home()?, token)
+            let mut config = GatewayConfig::new(reborn_binary(), reborn_home()?, token)
                 .map_err(|error| error.to_string())?;
+            config.llm_env = llm_env;
             GatewaySupervisor::start(config, job)
                 .await
                 .map_err(|error| error.to_string())
@@ -691,6 +795,7 @@ fn main() {
                 gateway: Mutex::new(None),
                 job: Arc::clone(&job),
                 pump: Mutex::new(None),
+                local_llm: Mutex::new(None),
                 window_state: std::sync::Mutex::new(window_state),
                 window_store: store,
             });

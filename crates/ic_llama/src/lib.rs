@@ -70,5 +70,5 @@ pub use placement::{Placement, PlacementPolicy, Verdict};
 pub use proxy::SchemaProxy;
 pub use release::{Backend, LLAMA_CPP_TAG};
 pub use runtime::LlamaRuntime;
-pub use server::{Sidecar, SidecarConfig, SidecarState};
+pub use server::{Sidecar, SidecarConfig, SidecarState, SpawnHook};
 pub use wiring::LlmEnv;

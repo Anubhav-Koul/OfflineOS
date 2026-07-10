@@ -7,10 +7,12 @@
 //! response.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ic_llama::wiring::{LLM_BASE_URL, LLM_MODEL, LlmEnv};
-use ic_llama::{Error, ModelId, Sidecar, SidecarConfig, SidecarState};
+use ic_llama::{Error, ModelId, Sidecar, SidecarConfig, SidecarState, SpawnHook};
 use tokio::sync::watch;
 
 /// The fake server, built by cargo alongside this test.
@@ -138,6 +140,57 @@ async fn a_server_that_crashes_once_is_restarted_and_comes_up() {
         "the failed attempt's output should be kept for diagnostics:\n{}",
         sidecar.output_tail()
     );
+}
+
+#[tokio::test]
+async fn the_spawn_hook_runs_on_every_spawn_including_restarts() {
+    // The desktop widget uses this hook to enlist each child in its process
+    // job. A restart produces a *new* child that must be enlisted too, so the
+    // hook has to fire on the restart, not just the first spawn.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let counter = temp.path().join("attempts");
+
+    let mut config = config("flaky");
+    set_env(&mut config, "FAKE_LLAMA_CRASH_TIMES", 1);
+    set_env(&mut config, "FAKE_LLAMA_STATE_FILE", counter.display());
+
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&spawns);
+    config.on_spawn = Some(SpawnHook::new(move |_child| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }));
+
+    let sidecar = Sidecar::start(config).await.expect("survives one crash");
+    assert_eq!(sidecar.state(), SidecarState::Ready);
+
+    // Crashed once then came up: two spawns, so two hook calls.
+    assert_eq!(spawns.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn a_spawn_hook_error_fails_the_attempt_and_kills_the_child() {
+    // A child that cannot be contained (job assignment failed) must not be left
+    // running. A hook that always errors turns every spawn into a failed
+    // attempt, so the supervisor exhausts its retries and declares the model
+    // suspect — the same terminal path as a child that will not start.
+    let mut config = config("ready");
+    config.max_crashes = 2;
+    let port = config.port;
+    config.on_spawn = Some(SpawnHook::new(|_child| {
+        Err(std::io::Error::other("job assignment refused"))
+    }));
+
+    let error = Sidecar::start(config)
+        .await
+        .expect_err("an uncontainable child must not report ready");
+    assert!(
+        matches!(error, Error::ModelSuspect { .. }),
+        "expected the retries to be exhausted, got {error:?}"
+    );
+
+    // The child the hook rejected was killed, not leaked: its port is free.
+    wait_for_port_release(port, Duration::from_secs(5)).await;
 }
 
 #[tokio::test]

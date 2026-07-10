@@ -21,6 +21,7 @@
 //! killed and counted as a failure, since it is wedged rather than working.
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -91,6 +92,42 @@ impl SidecarState {
     }
 }
 
+/// Called with the freshly spawned `llama-server` child on **every** (re)start,
+/// before the server is awaited.
+///
+/// This exists for one reason: the desktop widget enlists the child in the
+/// Windows Job Object that guarantees every process it owns dies when the widget
+/// does — the one thing that survives a hard `TerminateProcess`, where `Drop`
+/// and `kill_on_drop` do not run. Returning an error fails that spawn attempt,
+/// exactly as a spawn failure would, so a child that cannot be contained is
+/// killed rather than left to outlive the app holding a GPU allocation.
+///
+/// Kept generic over the child handle so this crate does not depend on the
+/// widget's job type.
+#[derive(Clone)]
+pub struct SpawnHook(SpawnHookFn);
+
+/// The callback a [`SpawnHook`] wraps.
+type SpawnHookFn = Arc<dyn Fn(&Child) -> std::io::Result<()> + Send + Sync>;
+
+impl SpawnHook {
+    /// Wrap a callback. It must be cheap and non-blocking: it runs on the
+    /// supervisor task between spawning the child and awaiting its health.
+    pub fn new(hook: impl Fn(&Child) -> std::io::Result<()> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(hook))
+    }
+
+    fn call(&self, child: &Child) -> std::io::Result<()> {
+        (self.0)(child)
+    }
+}
+
+impl fmt::Debug for SpawnHook {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SpawnHook(..)")
+    }
+}
+
 /// How to launch `llama-server`.
 #[derive(Debug, Clone)]
 pub struct SidecarConfig {
@@ -126,6 +163,10 @@ pub struct SidecarConfig {
     pub initial_backoff: Duration,
     /// Ceiling on the restart delay.
     pub max_backoff: Duration,
+    /// Run against the child on every (re)spawn, before it is awaited. `None`
+    /// leaves the child uncontained — fine for tests, but a desktop caller
+    /// should enlist it in its process job. See [`SpawnHook`].
+    pub on_spawn: Option<SpawnHook>,
 }
 
 impl SidecarConfig {
@@ -147,6 +188,7 @@ impl SidecarConfig {
             stability_window: DEFAULT_STABILITY_WINDOW,
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(30),
+            on_spawn: None,
         })
     }
 
@@ -596,6 +638,19 @@ fn spawn(config: &SidecarConfig, output: &OutputTail) -> Result<Child> {
     let mut child = command.spawn().map_err(|source| {
         Error::io(format!("launching {}", config.server_bin.display()), source)
     })?;
+
+    // Contain the child before it can load a model or bind its port. A child
+    // outside the caller's job survives a hard kill of the widget, holding a GPU
+    // allocation and the loopback port. Better to fail the attempt.
+    if let Some(hook) = &config.on_spawn
+        && let Err(source) = hook.call(&child)
+    {
+        let _ = child.start_kill();
+        return Err(Error::io(
+            "enlisting llama-server in the process job",
+            source,
+        ));
+    }
 
     // Drain both pipes. An unread pipe fills and blocks the child, and
     // llama.cpp is chatty enough to hit that during model load.

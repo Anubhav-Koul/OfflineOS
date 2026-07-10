@@ -16,7 +16,7 @@ use crate::placement::{Placement, PlacementPolicy, PlacementRequest, plan};
 use crate::proxy::SchemaProxy;
 use crate::release::Backend;
 use crate::runtime::{InstallProgressFn, LlamaRuntime};
-use crate::server::{Sidecar, SidecarConfig, SidecarState};
+use crate::server::{Sidecar, SidecarConfig, SidecarState, SpawnHook};
 use crate::wiring::LlmEnv;
 
 /// Knobs for [`LocalLlm::launch`].
@@ -31,6 +31,10 @@ pub struct LocalLlmOptions {
     pub policy: PlacementPolicy,
     /// Reports progress while the llama.cpp archives download on first run.
     pub install_progress: Option<InstallProgressFn>,
+    /// Run against the `llama-server` child on every (re)spawn. A desktop caller
+    /// passes this to enlist the child in its process job, so it dies with the
+    /// app even on a hard kill. See [`SpawnHook`].
+    pub on_sidecar_spawn: Option<SpawnHook>,
 }
 
 /// A running local model.
@@ -99,6 +103,7 @@ impl LocalLlm {
         if let Some(ctx_size) = options.ctx_size {
             config.ctx_size = ctx_size;
         }
+        config.on_spawn = options.on_sidecar_spawn;
 
         let placement = plan(PlacementRequest {
             model: &model.gguf,

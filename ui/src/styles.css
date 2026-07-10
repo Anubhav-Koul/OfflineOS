@@ -86,11 +86,18 @@ button.ghost {
 }
 
 .character {
+  position: relative;
+  height: 220px;
   display: flex;
   justify-content: center;
   align-items: flex-end;
   padding: 10px 0 4px;
   user-select: none;
+  flex: none;
+}
+.character canvas {
+  position: absolute;
+  inset: 0;
 }
 .character-face {
   font-size: 52px;

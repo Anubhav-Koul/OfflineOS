@@ -7,6 +7,11 @@
   </head>
   <body class="widget-body">
     <div id="root"></div>
+    <!-- Live2D Cubism Core: a classic script so `window.Live2DCubismCore` is
+         defined before pixi-live2d-display loads. Proprietary, redistributable
+         (see /live2d/LICENSE.md). Its WebAssembly needs `wasm-unsafe-eval` in
+         the CSP (tauri.conf.json). -->
+    <script src="/live2d/live2dcubismcore.min.js"></script>
     <script type="module" src="/src/widget.tsx"></script>
   </body>
 </html>

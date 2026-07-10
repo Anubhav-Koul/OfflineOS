@@ -81,9 +81,13 @@ tests/fixtures/llm_traces/live/*.log
 # Tauri codegen output.
 /crates/ic_widget/gen/
 
-# Live2D character: keep the runtime assets the app loads (ren_en/runtime/),
-# exclude the Cubism editor project sources. `ren_t01.cmo3` alone is ~44 MB and
-# is never a build input — Phase 3 copies only `runtime/` into assets/. A binary
-# that large in history would bloat every clone forever, even once deleted.
+# Live2D character: the runtime assets the app loads now live under
+# ui/public/characters/ren/live2d/. `ren_en/` keeps only the Cubism editor
+# project sources, which are never a build input — `ren_t01.cmo3` alone is
+# ~44 MB and would bloat every clone forever.
 /ren_en/*.cmo3
 /ren_en/*.can3
+
+# Full Cubism SDK for Web download (~26 MB): Framework, Samples, Core. Only the
+# redistributable Core is vendored under ui/public/live2d/; the rest stays local.
+/CubismSdkForWeb-*/

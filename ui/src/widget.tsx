@@ -13,7 +13,12 @@ import {
   type Message,
   type RunPhase,
 } from "./api";
-import { createRenderer, PLACEHOLDER_CONFIG } from "./character";
+import {
+  createRenderer,
+  loadCharacterConfig,
+  PLACEHOLDER_CONFIG,
+  type CharacterRenderer,
+} from "./character";
 import "./styles.css";
 
 /**
@@ -314,12 +319,28 @@ function HealthBadge(props: { state: GatewayState }) {
  * `character://state`, reading the current state on mount to cover the race
  * where it changed before we subscribed.
  */
+const REN_CONFIG_URL = "/characters/ren/character.json";
+
 function CharacterView() {
   let container: HTMLDivElement | undefined;
 
   onMount(async () => {
-    const renderer = createRenderer(PLACEHOLDER_CONFIG);
-    if (container) await renderer.mount(container);
+    if (!container) return;
+
+    // Try the Live2D character; on any failure — missing Core, a Cubism 5.3
+    // feature WebView2 will not render, a bad asset path — fall back to the
+    // placeholder so the character still reacts and the console carries the
+    // reason. This is the Phase 3 compatibility check in practice.
+    let renderer: CharacterRenderer;
+    try {
+      const config = await loadCharacterConfig(REN_CONFIG_URL);
+      renderer = createRenderer(config);
+      await renderer.mount(container);
+    } catch (error) {
+      console.error("[character] Live2D failed to load; using placeholder", error);
+      renderer = createRenderer(PLACEHOLDER_CONFIG);
+      await renderer.mount(container);
+    }
 
     const unlisten = await onCharacterState((state) => renderer.setState(state));
     renderer.setState(await api.characterState());

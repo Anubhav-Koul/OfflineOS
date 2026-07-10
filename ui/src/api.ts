@@ -117,6 +117,28 @@ export interface LocalModel {
   warnings: string[];
 }
 
+/**
+ * Which LLM the gateway runs on. Exactly one is active. `model` is an optional
+ * override of the provider's default. Matches `ic_widget::settings`.
+ */
+export type ProviderSelection =
+  | { kind: "local" }
+  | { kind: "cloud"; id: string; model?: string | null };
+
+/** A configurable cloud provider. `has_key` never carries the key itself. */
+export interface Provider {
+  id: string;
+  description: string;
+  default_model: string;
+  has_key: boolean;
+}
+
+/** The provider panel's data: the active selection and the cloud catalog. */
+export interface ProviderSettings {
+  active: ProviderSelection;
+  providers: Provider[];
+}
+
 export const api = {
   gatewayState: () => invoke<GatewayState>("gateway_state"),
   createThread: () => invoke<string>("create_thread"),
@@ -132,6 +154,13 @@ export const api = {
   listThreads: () => invoke<Thread[]>("list_threads"),
   listAutomations: () => invoke<Automation[]>("list_automations"),
   localModelStatus: () => invoke<LocalModel | null>("local_model_status"),
+  providerSettings: () => invoke<ProviderSettings>("provider_settings"),
+  setProviderKey: (providerId: string, key: string) =>
+    invoke<void>("set_provider_key", { providerId, key }),
+  clearProviderKey: (providerId: string) =>
+    invoke<void>("clear_provider_key", { providerId }),
+  applyProvider: (selection: ProviderSelection) =>
+    invoke<void>("apply_provider", { selection }),
 };
 
 /** Subscribe to gateway health transitions. */

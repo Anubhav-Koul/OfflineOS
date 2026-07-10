@@ -318,3 +318,55 @@ ul.warnings {
 ul.warnings li::before {
   content: "⚠ ";
 }
+
+.provider-option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 4px;
+  border-top: 1px solid #2b2f38;
+}
+.provider-option:first-of-type {
+  border-top: none;
+}
+.provider-option.column {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+}
+.provider-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.provider-name {
+  font-weight: 600;
+  flex: 1;
+}
+.provider-desc {
+  margin: 0 0 0 26px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.key-row {
+  display: flex;
+  gap: 8px;
+  margin-left: 26px;
+}
+.key-row input {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid #2b2f38;
+  border-radius: 6px;
+  color: var(--text);
+  padding: 7px 10px;
+  font-size: 13px;
+}
+button.ghost.danger {
+  color: var(--danger);
+}
+.apply-row {
+  margin-top: 14px;
+  display: flex;
+  justify-content: flex-end;
+}

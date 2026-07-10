@@ -20,6 +20,7 @@ pub mod gateway_client;
 pub mod job_object;
 pub mod providers;
 pub mod secrets;
+pub mod settings;
 pub mod supervisor;
 pub mod window_state;
 

@@ -8,6 +8,9 @@ import {
   type Automation,
   type GatewayState,
   type LocalModel,
+  type Provider,
+  type ProviderSelection,
+  type ProviderSettings,
   type Thread,
 } from "./api";
 import "./styles.css";
@@ -93,6 +96,192 @@ function createValueData<T>(load: () => Promise<T>) {
   };
 
   return { value, error, loading, loaded, refresh };
+}
+
+/** Whether two selections name the same provider (model override aside). */
+function selectionEquals(a: ProviderSelection, b: ProviderSelection): boolean {
+  if (a.kind !== b.kind) return false;
+  if (a.kind === "cloud" && b.kind === "cloud") return a.id === b.id;
+  return true;
+}
+
+/**
+ * The active-provider switch and API-key manager.
+ *
+ * Loads on its own — it reads the settings file and the credential store, not
+ * the gateway, so it works before the gateway is ready. Applying a change
+ * restarts the gateway on the backend, which reloads this page.
+ */
+function ProviderPanel() {
+  const data = createValueData<ProviderSettings>(api.providerSettings);
+  const [chosen, setChosen] = createSignal<ProviderSelection>({ kind: "local" });
+  const [drafts, setDrafts] = createSignal<Record<string, string>>({});
+  const [applying, setApplying] = createSignal(false);
+  const [notice, setNotice] = createSignal<string | null>(null);
+
+  const reload = async () => {
+    await data.refresh();
+    const current = data.value();
+    if (current) setChosen(current.active);
+  };
+  onMount(reload);
+
+  const draft = (id: string) => drafts()[id] ?? "";
+  const setDraft = (id: string, value: string) => setDrafts((all) => ({ ...all, [id]: value }));
+
+  const saveKey = async (id: string) => {
+    const key = draft(id).trim();
+    if (!key) return;
+    setNotice(null);
+    try {
+      await api.setProviderKey(id, key);
+      setDraft(id, "");
+      await data.refresh();
+    } catch (reason) {
+      setNotice(String(reason));
+    }
+  };
+
+  const clearKey = async (id: string) => {
+    setNotice(null);
+    try {
+      await api.clearProviderKey(id);
+      await data.refresh();
+    } catch (reason) {
+      setNotice(String(reason));
+    }
+  };
+
+  // A cloud provider with no stored key would start the gateway unconfigured.
+  const chosenNeedsKey = (): boolean => {
+    const pick = chosen();
+    if (pick.kind !== "cloud") return false;
+    const provider = data.value()?.providers.find((p) => p.id === pick.id);
+    return !provider?.has_key;
+  };
+
+  const canApply = (): boolean => {
+    const current = data.value();
+    if (!current || applying()) return false;
+    if (selectionEquals(chosen(), current.active)) return false;
+    return !chosenNeedsKey();
+  };
+
+  const apply = async () => {
+    setApplying(true);
+    setNotice(null);
+    try {
+      // Restarts the gateway and reloads this page; the promise may not settle
+      // before the reload takes over.
+      await api.applyProvider(chosen());
+    } catch (reason) {
+      setNotice(String(reason));
+      setApplying(false);
+    }
+  };
+
+  return (
+    <section>
+      <div class="panel-head">
+        <h2>Provider</h2>
+        <button class="ghost" disabled={data.loading()} onClick={() => void reload()}>
+          Refresh
+        </button>
+      </div>
+      <p class="muted small">
+        One provider is active at a time. Switching restarts the agent.
+      </p>
+
+      <Show when={!data.error()} fallback={<p class="reason-inline">{data.error()}</p>}>
+        <Show when={data.value()} fallback={<p class="muted">Loading…</p>}>
+          {(settings) => (
+            <>
+              <label class="provider-option">
+                <input
+                  type="radio"
+                  name="provider"
+                  checked={chosen().kind === "local"}
+                  onChange={() => setChosen({ kind: "local" })}
+                />
+                <span class="provider-name">Local model</span>
+                <span class="row-meta">bundled llama.cpp · no key needed</span>
+              </label>
+
+              <For each={settings().providers}>
+                {(provider) => (
+                  <ProviderRow
+                    provider={provider}
+                    active={
+                      chosen().kind === "cloud" &&
+                      (chosen() as { id: string }).id === provider.id
+                    }
+                    draft={draft(provider.id)}
+                    onSelect={() => setChosen({ kind: "cloud", id: provider.id })}
+                    onDraft={(value) => setDraft(provider.id, value)}
+                    onSave={() => void saveKey(provider.id)}
+                    onClear={() => void clearKey(provider.id)}
+                  />
+                )}
+              </For>
+
+              <Show when={notice()}>
+                <p class="reason-inline">{notice()}</p>
+              </Show>
+              <Show when={chosenNeedsKey()}>
+                <p class="muted small">Add an API key for this provider before applying.</p>
+              </Show>
+
+              <div class="apply-row">
+                <button disabled={!canApply()} onClick={() => void apply()}>
+                  {applying() ? "Applying…" : "Apply & restart"}
+                </button>
+              </div>
+            </>
+          )}
+        </Show>
+      </Show>
+    </section>
+  );
+}
+
+/** One selectable cloud provider with its API-key controls. */
+function ProviderRow(props: {
+  provider: Provider;
+  active: boolean;
+  draft: string;
+  onSelect: () => void;
+  onDraft: (value: string) => void;
+  onSave: () => void;
+  onClear: () => void;
+}) {
+  return (
+    <div class="provider-option column">
+      <label class="provider-head">
+        <input type="radio" name="provider" checked={props.active} onChange={props.onSelect} />
+        <span class="provider-name">{props.provider.id}</span>
+        <Show when={props.provider.has_key} fallback={<span class="row-meta">no key</span>}>
+          <span class="badge ready">key set</span>
+        </Show>
+      </label>
+      <p class="provider-desc">{props.provider.description}</p>
+      <div class="key-row">
+        <input
+          type="password"
+          placeholder={props.provider.has_key ? "Replace API key" : "Paste API key"}
+          value={props.draft}
+          onInput={(event) => props.onDraft(event.currentTarget.value)}
+        />
+        <button class="ghost" disabled={!props.draft.trim()} onClick={props.onSave}>
+          Save
+        </button>
+        <Show when={props.provider.has_key}>
+          <button class="ghost danger" onClick={props.onClear}>
+            Clear
+          </button>
+        </Show>
+      </div>
+    </div>
+  );
 }
 
 function Dashboard() {
@@ -286,6 +475,8 @@ function Dashboard() {
           </Show>
         </Show>
       </section>
+
+      <ProviderPanel />
 
       <section>
         <h2>Not available yet</h2>

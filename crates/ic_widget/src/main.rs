@@ -25,6 +25,7 @@ use ic_widget::gateway_client::{
     ClientActionId, GateRef, GateResolution, GatewayClient, GatewayEvent, ProjectionItem, RunId,
     ThreadId,
 };
+use ic_widget::settings::{ProviderSelection, Settings, SettingsStore};
 use ic_widget::supervisor::{GatewayConfig, GatewayState, GatewaySupervisor};
 use ic_widget::window_state::{LayoutHash, MonitorInfo, WindowPosition};
 use ic_widget::{ProcessJob, RunPhase, SecretStore, WindowState, WindowStateStore};
@@ -69,6 +70,8 @@ struct AppState {
     local_llm: Mutex<Option<LocalLlm>>,
     window_state: std::sync::Mutex<WindowState>,
     window_store: WindowStateStore,
+    /// Persisted user settings — the active provider today.
+    settings_store: SettingsStore,
 }
 
 impl AppState {
@@ -359,6 +362,135 @@ fn verdict_label(verdict: &Verdict) -> &'static str {
         Verdict::PartialOffload => "partial_offload",
         Verdict::CpuOnly => "cpu_only",
         Verdict::Refuse { .. } => "refused",
+    }
+}
+
+// -------------------------------------------------------------- provider keys
+
+/// A configurable cloud provider, as the settings panel sees it.
+#[derive(Serialize)]
+struct UiProvider {
+    /// The `LLM_BACKEND` id.
+    id: String,
+    /// One-line description from the catalog.
+    description: String,
+    /// The model used unless the user overrides it.
+    default_model: String,
+    /// Whether an API key is stored for it. **Never the key itself.**
+    has_key: bool,
+}
+
+/// The provider panel's data: what is active, and the configurable providers.
+#[derive(Serialize)]
+struct UiProviderSettings {
+    /// The selection the gateway is running on.
+    active: ProviderSelection,
+    /// The cloud providers that take an API key. The local model is a separate,
+    /// always-available choice the UI offers alongside these.
+    providers: Vec<UiProvider>,
+}
+
+/// The active selection and the configurable cloud providers, each flagged with
+/// whether a key is stored. The key values never leave the credential store.
+#[tauri::command]
+async fn provider_settings(
+    state: tauri::State<'_, AppState>,
+) -> Result<UiProviderSettings, String> {
+    let active = state
+        .settings_store
+        .load()
+        .map_err(user_facing)?
+        .active_provider;
+
+    let secrets = SecretStore::new();
+    let catalog = ic_widget::providers::api_key_providers().map_err(user_facing)?;
+    let mut providers = Vec::with_capacity(catalog.len());
+    for provider in catalog {
+        // A keyring read failure is surfaced, not folded into "no key" — that
+        // would let a transient store error read as an unconfigured provider.
+        let has_key = secrets.has_provider_key(&provider).map_err(user_facing)?;
+        providers.push(UiProvider {
+            id: provider.id.clone(),
+            description: provider.description.clone(),
+            default_model: provider.default_model.clone(),
+            has_key,
+        });
+    }
+    Ok(UiProviderSettings { active, providers })
+}
+
+/// Resolve a provider id from the catalog, or a user-facing error.
+fn provider_by_id(id: &str) -> Result<ic_widget::providers::Provider, String> {
+    ic_widget::providers::find(id)
+        .map_err(user_facing)?
+        .ok_or_else(|| "That provider is not in the catalog.".to_string())
+}
+
+/// Store an API key for a provider. Does not restart the gateway — the key
+/// takes effect on the next [`apply_provider`].
+#[tauri::command]
+async fn set_provider_key(provider_id: String, key: String) -> Result<(), String> {
+    let provider = provider_by_id(&provider_id)?;
+    SecretStore::new()
+        .set_provider_key(&provider, &key)
+        .map_err(user_facing)
+}
+
+/// Forget a provider's API key.
+#[tauri::command]
+async fn clear_provider_key(provider_id: String) -> Result<(), String> {
+    let provider = provider_by_id(&provider_id)?;
+    SecretStore::new()
+        .clear_provider_key(&provider)
+        .map_err(user_facing)
+}
+
+/// Switch the active provider and restart the gateway onto it.
+///
+/// Persists the choice first, so a crash mid-restart still comes back on the new
+/// provider. Then it tears the current gateway and local model down — freeing
+/// the sidecar's VRAM and port — and brings the gateway back up on the new
+/// selection. The webviews hold a client bound to the old gateway, so they are
+/// reloaded to re-read state and re-establish their thread.
+#[tauri::command]
+async fn apply_provider(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    selection: ProviderSelection,
+) -> Result<(), String> {
+    state
+        .settings_store
+        .save(&Settings {
+            active_provider: selection.clone(),
+        })
+        .map_err(user_facing)?;
+
+    // Tell the UI we are restarting before the teardown, so the badge is honest
+    // during the gap.
+    let _ = app.emit("gateway://state", GatewayState::Starting);
+
+    if let Some(mut gateway) = state.gateway.lock().await.take() {
+        gateway.stop().await;
+    }
+    // Dropping the model stops the sidecar and its proxy, freeing VRAM and the
+    // port before the new selection reserves anything.
+    drop(state.local_llm.lock().await.take());
+
+    bring_up_gateway(app.clone(), selection).await;
+
+    // The old client the webviews were using is gone. A reload re-runs their
+    // mount, which re-reads gateway state and re-creates the thread and its pump
+    // against the new gateway.
+    reload_webviews(&app);
+    Ok(())
+}
+
+/// Reload every webview, after the gateway behind them has been replaced.
+fn reload_webviews(app: &AppHandle) {
+    for label in [WIDGET, DASHBOARD] {
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.eval("window.location.reload()");
+        }
     }
 }
 
@@ -677,70 +809,144 @@ fn enlist_in_job(job: Arc<ProcessJob>) -> SpawnHook {
     })
 }
 
-/// Start the gateway off the main thread and mirror its state onto the UI.
+/// The provider environment for a selection, plus the local model when one was
+/// launched.
+///
+/// `Local` brings up the sidecar (best-effort; see [`launch_local_model`]).
+/// `Cloud` reads the provider's key from the credential store and builds its
+/// environment; a provider with no stored key yields an empty environment, so
+/// the gateway starts but has no credentials — the dashboard shows that, rather
+/// than the app refusing to launch.
+async fn resolve_provider(
+    job: Arc<ProcessJob>,
+    selection: &ProviderSelection,
+) -> (Vec<(String, String)>, Option<LocalLlm>) {
+    match selection {
+        ProviderSelection::Local => {
+            let local = launch_local_model(job).await;
+            let env = local
+                .as_ref()
+                .map(|llm| {
+                    llm.env()
+                        .vars()
+                        .map(|(name, value)| (name.to_string(), value.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (env, local)
+        }
+        ProviderSelection::Cloud { id, model } => (cloud_provider_env(id, model.as_deref()), None),
+    }
+}
+
+/// The environment that points the gateway at a cloud provider, or empty when it
+/// cannot be built. Every empty-returning path is logged.
+fn cloud_provider_env(id: &str, model: Option<&str>) -> Vec<(String, String)> {
+    let provider = match ic_widget::providers::find(id) {
+        Ok(Some(provider)) => provider,
+        Ok(None) => {
+            tracing::warn!(
+                provider = id,
+                "unknown provider id; starting without credentials"
+            );
+            return Vec::new();
+        }
+        Err(error) => {
+            tracing::warn!(%error, "could not read the provider catalog");
+            return Vec::new();
+        }
+    };
+    match SecretStore::new().provider_key(&provider) {
+        Ok(Some(key)) => provider.llm_env(&key, model).unwrap_or_default(),
+        Ok(None) => {
+            tracing::warn!(
+                provider = id,
+                "no API key stored; starting without credentials"
+            );
+            Vec::new()
+        }
+        Err(error) => {
+            tracing::warn!(provider = id, %error, "could not read the API key");
+            Vec::new()
+        }
+    }
+}
+
+/// Start the gateway off the main thread on the saved provider selection.
 ///
 /// A first boot runs migrations and installs bundled skills. Blocking the UI for
 /// that would be a splash screen; a health badge is a better answer.
-fn spawn_gateway(app: AppHandle, job: Arc<ProcessJob>) {
+fn spawn_gateway(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        // The gateway reads `LLM_BASE_URL` once at startup and never re-reads it,
-        // so the local model must be up — and its proxy URL known — before the
-        // gateway spawns. The sidecar shares the gateway's job.
-        let local = launch_local_model(Arc::clone(&job)).await;
-        let llm_env: Vec<(String, String)> = local
-            .as_ref()
-            .map(|llm| {
-                llm.env()
-                    .vars()
-                    .map(|(name, value)| (name.to_string(), value.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        // Keep the model alive for the app's lifetime; its `Drop` stops the
-        // sidecar and proxy on a graceful exit.
-        *app.state::<AppState>().local_llm.lock().await = local;
-
-        let started = async {
-            let token = SecretStore::new()
-                .gateway_token()
-                .map_err(|error| error.to_string())?;
-            let mut config = GatewayConfig::new(reborn_binary(), reborn_home()?, token)
-                .map_err(|error| error.to_string())?;
-            config.llm_env = llm_env;
-            GatewaySupervisor::start(config, job)
-                .await
-                .map_err(|error| error.to_string())
-        }
-        .await;
-
-        match started {
-            Ok(gateway) => {
-                tracing::info!(base_url = gateway.client().base_url(), "gateway is ready");
-
-                // Mirror every later transition onto the UI.
-                let mut states = gateway.subscribe();
-                let handle = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    while states.changed().await.is_ok() {
-                        let current = states.borrow_and_update().clone();
-                        tracing::info!(?current, "gateway state changed");
-                        let _ = handle.emit("gateway://state", &current);
-                    }
-                });
-
-                // Store *before* emitting. A UI that has not subscribed yet will
-                // miss the event and fall back to reading `gateway_state`, and
-                // that read must already see `Ready` — otherwise the widget waits
-                // forever for an event that has been and gone.
-                *app.state::<AppState>().gateway.lock().await = Some(gateway);
-                let _ = app.emit("gateway://state", GatewayState::Ready);
+        let selection = match app.state::<AppState>().settings_store.load() {
+            Ok(settings) => settings.active_provider,
+            Err(error) => {
+                tracing::warn!(%error, "could not read settings; defaulting to the local model");
+                ProviderSelection::default()
             }
-            Err(reason) => {
-                tracing::error!(%reason, "the gateway did not start");
-                let _ = app.emit("gateway://state", GatewayState::Unhealthy { reason });
-            }
-        }
+        };
+        bring_up_gateway(app, selection).await;
     });
+}
+
+/// Bring the gateway up on `selection`, storing it into app state and mirroring
+/// its health onto the UI. Shared by the first boot and by an
+/// [`apply_provider`] restart.
+///
+/// The caller is responsible for tearing down any previous gateway and model
+/// first; this replaces the stored `local_llm`, so a leftover would be dropped
+/// here regardless, but the gateway must be stopped by the caller to free its
+/// port before this reserves a new one.
+async fn bring_up_gateway(app: AppHandle, selection: ProviderSelection) {
+    let job = Arc::clone(&app.state::<AppState>().job);
+
+    // The gateway reads `LLM_BASE_URL` once at startup and never re-reads it, so
+    // the model must be up — and its proxy URL known — before the gateway spawns.
+    let (llm_env, local) = resolve_provider(job.clone(), &selection).await;
+    // Keep the model alive for the app's lifetime; its `Drop` stops the sidecar
+    // and proxy on a graceful exit. Storing `None` drops any previous model.
+    *app.state::<AppState>().local_llm.lock().await = local;
+
+    let started = async {
+        let token = SecretStore::new()
+            .gateway_token()
+            .map_err(|error| error.to_string())?;
+        let mut config = GatewayConfig::new(reborn_binary(), reborn_home()?, token)
+            .map_err(|error| error.to_string())?;
+        config.llm_env = llm_env;
+        GatewaySupervisor::start(config, job)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    .await;
+
+    match started {
+        Ok(gateway) => {
+            tracing::info!(base_url = gateway.client().base_url(), "gateway is ready");
+
+            // Mirror every later transition onto the UI.
+            let mut states = gateway.subscribe();
+            let handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                while states.changed().await.is_ok() {
+                    let current = states.borrow_and_update().clone();
+                    tracing::info!(?current, "gateway state changed");
+                    let _ = handle.emit("gateway://state", &current);
+                }
+            });
+
+            // Store *before* emitting. A UI that has not subscribed yet will miss
+            // the event and fall back to reading `gateway_state`, and that read
+            // must already see `Ready` — otherwise the widget waits forever for an
+            // event that has been and gone.
+            *app.state::<AppState>().gateway.lock().await = Some(gateway);
+            let _ = app.emit("gateway://state", GatewayState::Ready);
+        }
+        Err(reason) => {
+            tracing::error!(%reason, "the gateway did not start");
+            let _ = app.emit("gateway://state", GatewayState::Unhealthy { reason });
+        }
+    }
 }
 
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
@@ -847,6 +1053,10 @@ fn main() {
             list_threads,
             list_automations,
             local_model_status,
+            provider_settings,
+            set_provider_key,
+            clear_provider_key,
+            apply_provider,
             open_dashboard,
         ])
         .setup(|app| {
@@ -861,6 +1071,7 @@ fn main() {
                 local_llm: Mutex::new(None),
                 window_state: std::sync::Mutex::new(window_state),
                 window_store: store,
+                settings_store: SettingsStore::at(SettingsStore::default_path()?),
             });
 
             let handle = app.handle().clone();
@@ -870,7 +1081,7 @@ fn main() {
 
             build_tray(&handle)?;
             register_summon_hotkey(&handle);
-            spawn_gateway(handle.clone(), job);
+            spawn_gateway(handle.clone());
 
             // Persist the widget's position whenever the user drags it.
             widget.on_window_event(move |event| {

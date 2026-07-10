@@ -320,14 +320,16 @@ it you get a warning and the tray still works; nothing else is affected.
 - **Nothing about the widget's own behavior is observable in that database.** Use
   the stderr log, not the DB, to check whether the UI is alive.
 
-## Phase 2b notes — dashboard panels + LLM wiring (in progress, recorded 2026-07-10)
+## Phase 2b notes — dashboard panels + LLM wiring (recorded 2026-07-10)
 
 `crates/ic_widget` + `ui/` + `crates/ic_llama` (+
 `docs/desktop/llm-provider-selection.md`). No IronClaw core crate was touched.
-The interactive panels are done; **GGUF download UI and tokens/sec are the
-explicitly-deferred follow-ups**, and a **live smoke run with a real GGUF is
-still pending** (everything below is verified by build + fmt + scoped clippy +
-unit/integration tests, not yet by launching the packaged app).
+The interactive panels are done and **verified by a manual smoke run on
+2026-07-10**: `cargo run -p ic_widget --features app` launched the widget, the
+supervised gateway reached ready, and the dashboard panels rendered. The two
+remaining pieces are **explicitly-deferred follow-ups — GGUF download UI and
+tokens/sec** (see below); with those outstanding, 2b is functionally complete
+but not feature-complete.
 
 ### The seam that had to be closed first
 

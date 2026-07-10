@@ -18,8 +18,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ic_llama::download::Downloader;
-use ic_llama::{LocalLlm, LocalLlmOptions, ModelStore, SidecarState, SpawnHook, Verdict};
+use ic_llama::download::{Downloader, Progress, ProgressFn};
+use ic_llama::{
+    Digest, HubModel, LocalLlm, LocalLlmOptions, ModelId, ModelStore, SidecarState, SpawnHook,
+    Verdict,
+};
 use ic_widget::error::Error;
 use ic_widget::gateway_client::{
     ClientActionId, GateRef, GateResolution, GatewayClient, GatewayEvent, ProjectionItem, RunId,
@@ -68,6 +71,11 @@ struct AppState {
     /// inference. Held for its `Drop`, which stops the sidecar and its proxy;
     /// the sidecar also rides in `job`, so a hard kill takes it down too.
     local_llm: Mutex<Option<LocalLlm>>,
+    /// The in-flight model download, if any: its model id and task handle. One
+    /// at a time. Aborting the handle stops the transfer; the partial `.part`
+    /// file survives and resumes on the next attempt, so an abort is a safe
+    /// pause, not corruption. The id lets a cancel report which download ended.
+    download: Mutex<Option<(String, tokio::task::JoinHandle<()>)>>,
     window_state: std::sync::Mutex<WindowState>,
     window_store: WindowStateStore,
     /// Persisted user settings — the active provider today.
@@ -492,6 +500,214 @@ fn reload_webviews(app: &AppHandle) {
             let _ = window.eval("window.location.reload()");
         }
     }
+}
+
+// ------------------------------------------------------------- model download
+
+/// Turn a download failure into something worth showing a user.
+///
+/// Only the cases with a clear action are translated; the rest fall back to the
+/// error's own message, which for this crate is already user-readable.
+fn download_error(error: ic_llama::Error) -> String {
+    use ic_llama::Error;
+    match &error {
+        // Windows disk-full os errors: ERROR_DISK_FULL / ERROR_HANDLE_DISK_FULL.
+        Error::Io { source, .. } if matches!(source.raw_os_error(), Some(112 | 39)) => {
+            "Not enough disk space to finish the download.".to_string()
+        }
+        // `install` resolves the file on the hub before fetching, so a wrong repo
+        // or file name lands here rather than as a raw 404.
+        Error::HubResolve { .. } | Error::HttpStatus { status: 404, .. } => {
+            "That model was not found on HuggingFace — check the repo and file name.".to_string()
+        }
+        Error::ChecksumMismatch { .. } => {
+            "The download was corrupted. It resumes from where it left off next time.".to_string()
+        }
+        _ => format!("Download failed: {error}"),
+    }
+}
+
+/// A model already in the store, for the download panel.
+#[derive(Serialize)]
+struct UiInstalledModel {
+    /// The id, which is the file stem.
+    id: String,
+    /// Size on disk, in MiB.
+    size_mb: u64,
+    /// Why it is not auto-loaded, if it is suspect.
+    suspect: Option<String>,
+}
+
+/// The models the download panel suggests.
+#[tauri::command]
+fn recommended_models() -> Vec<ic_widget::model_catalog::RecommendedModel> {
+    ic_widget::model_catalog::recommended()
+}
+
+/// The models already downloaded, newest listing rules aside — sorted by id, as
+/// the store returns them.
+#[tauri::command]
+async fn installed_models() -> Result<Vec<UiInstalledModel>, String> {
+    let root = llama_root()?;
+    let downloader = Downloader::new().map_err(download_error)?;
+    let store = ModelStore::new(&root, downloader);
+    let models = store.list().await.map_err(download_error)?;
+
+    let mut out = Vec::with_capacity(models.len());
+    for model in models {
+        // Size on disk, not the header's weight count: this is what the user is
+        // spending. A stat failure drops to 0 rather than failing the listing.
+        let size_mb = tokio::fs::metadata(&model.path)
+            .await
+            .map(|meta| meta.len() / (1024 * 1024))
+            .unwrap_or(0); // silent-ok: a missing size still lists the model
+        out.push(UiInstalledModel {
+            id: model.id.to_string(),
+            size_mb,
+            suspect: model.suspect,
+        });
+    }
+    Ok(out)
+}
+
+/// What the UI receives on `model://event` during a download.
+#[derive(Serialize, Clone)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ModelEvent {
+    /// Bytes have moved. `fraction` is `None` when the server sent no length.
+    Progress {
+        id: String,
+        downloaded: u64,
+        total: Option<u64>,
+        fraction: Option<f64>,
+    },
+    /// The download ended. Exactly one of the flags explains how.
+    Finished {
+        id: String,
+        ok: bool,
+        cancelled: bool,
+        error: Option<String>,
+    },
+}
+
+/// Start downloading a model from HuggingFace, streaming progress to the UI.
+///
+/// Returns as soon as the transfer starts; progress and completion arrive on
+/// `model://event`. Only one download runs at a time. The digest is fetched from
+/// the hub, so no checksum need be supplied.
+#[tauri::command]
+async fn download_model(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    repo: String,
+    file: String,
+) -> Result<(), String> {
+    let model = HubModel::new(repo, file);
+    let id = model.model_id().map_err(download_error)?.to_string();
+
+    let mut slot = state.download.lock().await;
+    if let Some((_, handle)) = slot.as_ref()
+        && !handle.is_finished()
+    {
+        return Err("A download is already in progress.".to_string());
+    }
+
+    let root = llama_root()?;
+    let handle = tokio::spawn(run_download(app, root, model, id.clone()));
+    *slot = Some((id, handle));
+    Ok(())
+}
+
+/// Cancel the in-flight download. The partial file is kept and resumes on the
+/// next attempt.
+#[tauri::command]
+async fn cancel_download(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    if let Some((id, handle)) = state.download.lock().await.take()
+        && !handle.is_finished()
+    {
+        // Aborting drops the stream and the file handle mid-write. The `.part`
+        // survives; the final rename only happens after digest verification, so
+        // there is nothing half-installed to clean up.
+        handle.abort();
+        // The aborted task cannot emit its own terminal event, so report the
+        // cancellation here — otherwise the UI waits forever on a download that
+        // has stopped.
+        let _ = app.emit(
+            "model://event",
+            ModelEvent::Finished {
+                id,
+                ok: false,
+                cancelled: true,
+                error: None,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Delete an installed model.
+#[tauri::command]
+async fn remove_model(id: String) -> Result<(), String> {
+    let model_id = ModelId::new(id).map_err(download_error)?;
+    let root = llama_root()?;
+    let downloader = Downloader::new().map_err(download_error)?;
+    ModelStore::new(&root, downloader)
+        .remove(&model_id)
+        .await
+        .map_err(download_error)
+}
+
+/// The download task: fetch the model, emitting progress, then report the
+/// outcome. Runs until the transfer finishes, fails, or is aborted.
+async fn run_download(app: AppHandle, root: PathBuf, model: HubModel, id: String) {
+    let downloader = match Downloader::new() {
+        Ok(downloader) => downloader,
+        Err(error) => {
+            let _ = app.emit(
+                "model://event",
+                ModelEvent::Finished {
+                    id,
+                    ok: false,
+                    cancelled: false,
+                    error: Some(download_error(error)),
+                },
+            );
+            return;
+        }
+    };
+    let store = ModelStore::new(&root, downloader);
+
+    let progress: ProgressFn = {
+        let app = app.clone();
+        let id = id.clone();
+        Arc::new(move |snapshot: Progress| {
+            let _ = app.emit(
+                "model://event",
+                ModelEvent::Progress {
+                    id: id.clone(),
+                    downloaded: snapshot.downloaded,
+                    total: snapshot.total,
+                    fraction: snapshot.fraction(),
+                },
+            );
+        })
+    };
+
+    let event = match store.install(&model, Digest::FromHub, Some(progress)).await {
+        Ok(_) => ModelEvent::Finished {
+            id,
+            ok: true,
+            cancelled: false,
+            error: None,
+        },
+        Err(error) => ModelEvent::Finished {
+            id,
+            ok: false,
+            cancelled: false,
+            error: Some(download_error(error)),
+        },
+    };
+    let _ = app.emit("model://event", event);
 }
 
 #[tauri::command]
@@ -1057,6 +1273,11 @@ fn main() {
             set_provider_key,
             clear_provider_key,
             apply_provider,
+            recommended_models,
+            installed_models,
+            download_model,
+            cancel_download,
+            remove_model,
             open_dashboard,
         ])
         .setup(|app| {
@@ -1069,6 +1290,7 @@ fn main() {
                 job: Arc::clone(&job),
                 pump: Mutex::new(None),
                 local_llm: Mutex::new(None),
+                download: Mutex::new(None),
                 window_state: std::sync::Mutex::new(window_state),
                 window_store: store,
                 settings_store: SettingsStore::at(SettingsStore::default_path()?),

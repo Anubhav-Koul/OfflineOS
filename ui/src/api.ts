@@ -139,6 +139,36 @@ export interface ProviderSettings {
   providers: Provider[];
 }
 
+/** A downloadable model the panel suggests. */
+export interface RecommendedModel {
+  id: string;
+  name: string;
+  repo: string;
+  file: string;
+  params: string;
+  quant: string;
+  approx_gib: number;
+  note: string;
+}
+
+/** A model already on disk. `suspect` is the reason it is not auto-loaded. */
+export interface InstalledModel {
+  id: string;
+  size_mb: number;
+  suspect: string | null;
+}
+
+/** Emitted on `model://event` while a download runs. */
+export type ModelEvent =
+  | {
+      kind: "progress";
+      id: string;
+      downloaded: number;
+      total: number | null;
+      fraction: number | null;
+    }
+  | { kind: "finished"; id: string; ok: boolean; cancelled: boolean; error: string | null };
+
 export const api = {
   gatewayState: () => invoke<GatewayState>("gateway_state"),
   createThread: () => invoke<string>("create_thread"),
@@ -161,7 +191,18 @@ export const api = {
     invoke<void>("clear_provider_key", { providerId }),
   applyProvider: (selection: ProviderSelection) =>
     invoke<void>("apply_provider", { selection }),
+  recommendedModels: () => invoke<RecommendedModel[]>("recommended_models"),
+  installedModels: () => invoke<InstalledModel[]>("installed_models"),
+  downloadModel: (repo: string, file: string) =>
+    invoke<void>("download_model", { repo, file }),
+  cancelDownload: () => invoke<void>("cancel_download"),
+  removeModel: (id: string) => invoke<void>("remove_model", { id }),
 };
+
+/** Subscribe to model-download progress and completion. */
+export function onModelEvent(handler: (event: ModelEvent) => void): Promise<UnlistenFn> {
+  return listen<ModelEvent>("model://event", (event) => handler(event.payload));
+}
 
 /** Subscribe to gateway health transitions. */
 export function onGatewayState(handler: (state: GatewayState) => void): Promise<UnlistenFn> {

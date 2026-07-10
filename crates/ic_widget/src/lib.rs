@@ -18,6 +18,7 @@
 pub mod error;
 pub mod gateway_client;
 pub mod job_object;
+pub mod model_catalog;
 pub mod providers;
 pub mod secrets;
 pub mod settings;

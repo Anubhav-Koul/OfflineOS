@@ -5,12 +5,15 @@ import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import {
   api,
   onGatewayState,
+  onModelEvent,
   type Automation,
   type GatewayState,
+  type InstalledModel,
   type LocalModel,
   type Provider,
   type ProviderSelection,
   type ProviderSettings,
+  type RecommendedModel,
   type Thread,
 } from "./api";
 import "./styles.css";
@@ -96,6 +99,221 @@ function createValueData<T>(load: () => Promise<T>) {
   };
 
   return { value, error, loading, loaded, refresh };
+}
+
+/** An active download's live state. */
+interface ActiveDownload {
+  id: string;
+  downloaded: number;
+  total: number | null;
+  fraction: number | null;
+}
+
+/** Bytes as a compact GiB/MiB string. */
+function formatSize(bytes: number): string {
+  const gib = bytes / 1024 ** 3;
+  if (gib >= 1) return `${gib.toFixed(1)} GiB`;
+  return `${Math.round(bytes / 1024 ** 2)} MiB`;
+}
+
+/**
+ * Download and manage local GGUF models.
+ *
+ * Loads on its own — it reads the model store on disk, not the gateway. A
+ * download streams progress over `model://event`; only one runs at a time.
+ */
+function ModelsPanel() {
+  const [recommended, setRecommended] = createSignal<RecommendedModel[]>([]);
+  const installed = createPanelData<InstalledModel>(api.installedModels);
+  const [active, setActive] = createSignal<ActiveDownload | null>(null);
+  const [notice, setNotice] = createSignal<string | null>(null);
+  const [repo, setRepo] = createSignal("");
+  const [file, setFile] = createSignal("");
+
+  onMount(async () => {
+    try {
+      setRecommended(await api.recommendedModels());
+    } catch (reason) {
+      setNotice(String(reason));
+    }
+    void installed.refresh();
+
+    const unlisten = await onModelEvent((event) => {
+      if (event.kind === "progress") {
+        setActive({
+          id: event.id,
+          downloaded: event.downloaded,
+          total: event.total,
+          fraction: event.fraction,
+        });
+        return;
+      }
+      // finished
+      setActive(null);
+      if (event.cancelled) setNotice("Download cancelled.");
+      else if (!event.ok) setNotice(event.error ?? "Download failed.");
+      else setNotice(null);
+      void installed.refresh();
+    });
+    onCleanup(unlisten);
+  });
+
+  const isInstalled = (id: string) => installed.rows().some((model) => model.id === id);
+
+  const download = async (repoName: string, fileName: string) => {
+    setNotice(null);
+    // Show the transfer immediately; the id the backend derives is the file
+    // stem, and progress events refine the rest.
+    setActive({ id: fileName.replace(/\.gguf$/, ""), downloaded: 0, total: null, fraction: null });
+    try {
+      await api.downloadModel(repoName, fileName);
+    } catch (reason) {
+      setNotice(String(reason));
+      setActive(null);
+    }
+  };
+
+  const cancel = async () => {
+    try {
+      await api.cancelDownload();
+    } catch (reason) {
+      setNotice(String(reason));
+    }
+  };
+
+  const remove = async (id: string) => {
+    setNotice(null);
+    try {
+      await api.removeModel(id);
+      await installed.refresh();
+    } catch (reason) {
+      setNotice(String(reason));
+    }
+  };
+
+  const downloadCustom = () => {
+    const fileName = file().trim();
+    const repoName = repo().trim();
+    if (!repoName || !fileName) return;
+    void download(repoName, fileName);
+    setRepo("");
+    setFile("");
+  };
+
+  return (
+    <section>
+      <div class="panel-head">
+        <h2>Models</h2>
+        <button class="ghost" disabled={installed.loading()} onClick={() => void installed.refresh()}>
+          Refresh
+        </button>
+      </div>
+
+      <Show when={active()}>
+        {(dl) => (
+          <div class="download">
+            <div class="download-head">
+              <span class="row-title">Downloading {dl().id}</span>
+              <button class="ghost danger" onClick={() => void cancel()}>
+                Cancel
+              </button>
+            </div>
+            <div class="progress">
+              <div
+                class="progress-bar"
+                style={{ width: dl().fraction != null ? `${dl().fraction! * 100}%` : "100%" }}
+                classList={{ indeterminate: dl().fraction == null }}
+              />
+            </div>
+            <span class="row-meta">
+              {formatSize(dl().downloaded)}
+              {dl().total != null ? ` / ${formatSize(dl().total!)}` : ""}
+            </span>
+          </div>
+        )}
+      </Show>
+
+      <Show when={notice()}>
+        <p class="reason-inline">{notice()}</p>
+      </Show>
+
+      <h3 class="subhead">Suggested</h3>
+      <ul class="rows">
+        <For each={recommended()}>
+          {(model) => (
+            <li class="row model-card">
+              <div class="model-card-main">
+                <span class="row-title">{model.name}</span>
+                <span class="row-meta">
+                  {model.params} · {model.quant} · ~{model.approx_gib} GiB
+                </span>
+                <p class="provider-desc">{model.note}</p>
+              </div>
+              <button
+                disabled={active() != null || isInstalled(model.id)}
+                onClick={() => void download(model.repo, model.file)}
+              >
+                {isInstalled(model.id) ? "Installed" : "Download"}
+              </button>
+            </li>
+          )}
+        </For>
+      </ul>
+
+      <h3 class="subhead">Custom (any HuggingFace GGUF)</h3>
+      <div class="key-row custom-download">
+        <input
+          type="text"
+          placeholder="owner/repo"
+          value={repo()}
+          onInput={(event) => setRepo(event.currentTarget.value)}
+        />
+        <input
+          type="text"
+          placeholder="file.gguf"
+          value={file()}
+          onInput={(event) => setFile(event.currentTarget.value)}
+        />
+        <button disabled={active() != null || !repo().trim() || !file().trim()} onClick={downloadCustom}>
+          Download
+        </button>
+      </div>
+
+      <h3 class="subhead">Installed</h3>
+      <Show
+        when={!installed.error()}
+        fallback={<p class="reason-inline">{installed.error()}</p>}
+      >
+        <Show
+          when={installed.rows().length > 0}
+          fallback={<p class="muted">No models downloaded yet.</p>}
+        >
+          <ul class="rows">
+            <For each={installed.rows()}>
+              {(model) => (
+                <li class="row">
+                  <div class="model-card-main">
+                    <span class="row-title">{model.id}</span>
+                    <span class="row-meta">
+                      {model.size_mb >= 1024
+                        ? `${(model.size_mb / 1024).toFixed(1)} GiB`
+                        : `${model.size_mb} MiB`}
+                    </span>
+                    <Show when={model.suspect}>
+                      {(reason) => <p class="reason-inline">{reason()}</p>}
+                    </Show>
+                  </div>
+                  <button class="ghost danger" onClick={() => void remove(model.id)}>
+                    Remove
+                  </button>
+                </li>
+              )}
+            </For>
+          </ul>
+        </Show>
+      </Show>
+    </section>
+  );
 }
 
 /** Whether two selections name the same provider (model override aside). */
@@ -475,6 +693,8 @@ function Dashboard() {
           </Show>
         </Show>
       </section>
+
+      <ModelsPanel />
 
       <ProviderPanel />
 

@@ -370,3 +370,64 @@ button.ghost.danger {
   display: flex;
   justify-content: flex-end;
 }
+
+h3.subhead {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--muted);
+  margin: 16px 0 4px;
+}
+
+.row.model-card {
+  align-items: flex-start;
+}
+.model-card-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.custom-download {
+  margin-left: 0;
+}
+
+.download {
+  padding: 12px;
+  border-radius: 8px;
+  background: var(--panel);
+  border: 1px solid #2b2f38;
+  margin-bottom: 12px;
+}
+.download-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.progress {
+  height: 8px;
+  border-radius: 999px;
+  background: #12141a;
+  overflow: hidden;
+}
+.progress-bar {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 999px;
+  transition: width 0.2s ease;
+}
+.progress-bar.indeterminate {
+  width: 40% !important;
+  animation: slide 1.2s ease-in-out infinite;
+}
+@keyframes slide {
+  0% {
+    margin-left: -40%;
+  }
+  100% {
+    margin-left: 100%;
+  }
+}

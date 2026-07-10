@@ -320,6 +320,62 @@ it you get a warning and the tray still works; nothing else is affected.
 - **Nothing about the widget's own behavior is observable in that database.** Use
   the stderr log, not the DB, to check whether the UI is alive.
 
-Next: **Phase 2b — dashboard panels** (sessions, automations, model picker +
-GGUF/VRAM via `ic_llama`, provider keys), then **Phase 3 — animated character
-companion** (Live2D, `ren_en/` model), then **Phase 4 — browser automation**.
+## Phase 2b notes — dashboard panels + LLM wiring (in progress, recorded 2026-07-10)
+
+`crates/ic_widget` + `ui/` + `crates/ic_llama` (+
+`docs/desktop/llm-provider-selection.md`). No IronClaw core crate was touched.
+The interactive panels are done; **GGUF download UI and tokens/sec are the
+explicitly-deferred follow-ups**, and a **live smoke run with a real GGUF is
+still pending** (everything below is verified by build + fmt + scoped clippy +
+unit/integration tests, not yet by launching the packaged app).
+
+### The seam that had to be closed first
+
+- **The widget never started a local model.** `ic_widget` depended on `ic_llama`
+  but `main.rs` used none of it: a launched app supervised the gateway with an
+  empty `llm_env`, so the agent had no LLM. Phase 1's round-trip only ran through
+  `ic_integration_tests`. `spawn_gateway` now brings up the model *before* the
+  gateway (which reads `LLM_BASE_URL` once at boot) and keeps the `LocalLlm` in
+  app state so its `Drop` stops the sidecar and proxy.
+- **The sidecar now dies with the widget under a hard kill.** This needed an
+  `ic_llama` addition: `SpawnHook`, an optional callback the sidecar runs against
+  its `llama-server` child on *every* (re)spawn. The widget passes one that
+  enlists the child in the same Windows Job Object the gateway rides in; a hook
+  error fails the spawn and kills the child. Without it, `TerminateProcess` of the
+  widget would orphan `llama-server` holding VRAM and a port. Pinned by
+  `the_spawn_hook_runs_on_every_spawn_including_restarts` and
+  `a_spawn_hook_error_fails_the_attempt_and_kills_the_child`.
+
+### Panels
+
+- **Sessions** (`GET /threads`) and **automations** (`GET /automations`) —
+  live routes. Automations are schedule entries, *not* run history; "Run history"
+  joins memory/skills/audit in the unavailable-with-reason list.
+- **Local model** — read-only: model id, backend, live sidecar state, GPU-layer
+  offload, estimated VRAM/RAM, placement warnings. `None` when running without
+  local inference. **tokens/sec is deferred** (needs live metrics polling, not the
+  static placement).
+- **Provider** — the active-provider switch and cloud key manager. See below.
+
+### Provider selection is single-valued, and failover is unbuilt
+
+- `LLM_BACKEND` holds one value, so the local sidecar and a cloud provider are
+  mutually exclusive. The dashboard drives a `ProviderSelection` (`Local` |
+  `Cloud{id, model}`) persisted in `settings.json`; `apply_provider` persists it,
+  tears down the running gateway + model, brings the gateway back up on the new
+  selection, and reloads the webviews so they re-establish their client and
+  thread. The provider list is read from the **same `providers.json` the gateway
+  resolves against** (`ic_widget::providers`), so the dashboard cannot drift from
+  the runtime; OAuth/subscription providers with no `api_key_env` are filtered
+  out of the key UI. Keys live in the credential store under
+  `provider-key/<id>`; `has_provider_key()` is the only thing the UI sees, never
+  the key.
+- **The v1 "cloud failover when a key is configured" promise is not implemented.**
+  `FailoverProvider` exists but is only ever constructed same-backend in one
+  production site. The three ways to close it (a core patch, a route-around in the
+  `ic_llama` SchemaProxy à la CP-3, or cutting the promise) are written up in
+  `docs/desktop/llm-provider-selection.md`. Decide before Phase 6.
+
+Next: finish 2b's deferred follow-ups (**GGUF download UI**, **tokens/sec**) and
+do the **manual smoke run**, then **Phase 3 — animated character companion**
+(Live2D, `ren_en/` model), then **Phase 4 — browser automation**.

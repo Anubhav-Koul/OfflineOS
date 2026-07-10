@@ -473,12 +473,27 @@ fn unique_temp_path(
 }
 
 async fn sync_parent_dir(virtual_path: &VirtualPath, parent: &Path) -> Result<(), FilesystemError> {
-    let dir = tokio::fs::File::open(parent)
-        .await
-        .map_err(|error| io_error(virtual_path.clone(), FilesystemOperation::WriteFile, error))?;
-    dir.sync_all()
-        .await
-        .map_err(|error| io_error(virtual_path.clone(), FilesystemOperation::WriteFile, error))
+    // core-patch (desktop fork): directory fsync is a POSIX durability step to
+    // flush a rename/create into the parent directory entry. Windows cannot flush
+    // a directory handle — `File::open(dir).sync_all()` becomes `FlushFileBuffers`
+    // on a handle opened without write access and returns ERROR_ACCESS_DENIED
+    // (io::ErrorKind::PermissionDenied). NTFS persists directory-entry changes for
+    // create/rename without an explicit directory flush, so this step is a no-op on
+    // Windows. See docs/desktop/core-patches.md (CP-1).
+    #[cfg(windows)]
+    {
+        let _ = (virtual_path, parent);
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let dir = tokio::fs::File::open(parent).await.map_err(|error| {
+            io_error(virtual_path.clone(), FilesystemOperation::WriteFile, error)
+        })?;
+        dir.sync_all()
+            .await
+            .map_err(|error| io_error(virtual_path.clone(), FilesystemOperation::WriteFile, error))
+    }
 }
 
 async fn ensure_existing_ancestor_contained(

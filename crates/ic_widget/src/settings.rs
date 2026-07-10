@@ -1,7 +1,7 @@
 //! User settings that outlive a launch.
 //!
-//! Just the active LLM provider today. Persisted as JSON beside the window
-//! state, with the same discipline: a missing file is first-run defaults, a
+//! The active LLM provider and the character choice. Persisted as JSON beside
+//! the window state, with the same discipline: a missing file is first-run defaults, a
 //! corrupt file is reported and replaced rather than failing the launch, and
 //! writes are atomic so a crash mid-write cannot truncate it.
 
@@ -46,6 +46,59 @@ pub struct Settings {
     /// The LLM the gateway starts with.
     #[serde(default)]
     pub active_provider: ProviderSelection,
+    /// Which character asset folder the widget renders, or `None` for the
+    /// default. A character is data (Phase 3): swapping folders needs no code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character: Option<CharacterId>,
+}
+
+/// A character asset folder's name, e.g. `hiyori`.
+///
+/// It becomes a URL path segment (`/characters/<id>/character.json`), so the
+/// alphabet is restricted at construction — see `.claude/rules/types.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String")]
+pub struct CharacterId(String);
+
+impl CharacterId {
+    fn validate(s: &str) -> std::result::Result<(), String> {
+        if s.is_empty() || s.len() > 64 {
+            return Err("a character id must be 1–64 characters".into());
+        }
+        if !s
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+        {
+            return Err("a character id may only use a–z, 0–9, '-' and '_'".into());
+        }
+        Ok(())
+    }
+
+    /// Validate and wrap a raw id.
+    pub fn new(raw: impl Into<String>) -> std::result::Result<Self, String> {
+        let s = raw.into();
+        Self::validate(&s)?;
+        Ok(Self(s))
+    }
+
+    /// The id as a path segment.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for CharacterId {
+    type Error = String;
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        Self::validate(&value)?;
+        Ok(Self(value))
+    }
+}
+
+impl std::fmt::Display for CharacterId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// Reads and writes [`Settings`] as JSON.
@@ -154,9 +207,36 @@ mod tests {
                 id: "anthropic".into(),
                 model: Some("claude-opus-4-8".into()),
             },
+            ..Default::default()
         };
         store.save(&settings).expect("save");
         assert_eq!(store.load().expect("load"), settings);
+    }
+
+    #[test]
+    fn a_character_choice_round_trips_and_an_absent_one_stays_default() {
+        let (_dir, store) = store();
+        assert_eq!(store.load().expect("load").character, None);
+
+        let settings = Settings {
+            character: Some(CharacterId::new("ren").expect("valid id")),
+            ..Default::default()
+        };
+        store.save(&settings).expect("save");
+        assert_eq!(store.load().expect("load"), settings);
+    }
+
+    #[test]
+    fn a_character_id_is_a_safe_path_segment_or_it_is_rejected() {
+        for good in ["hiyori", "ren", "my-model_2"] {
+            assert!(CharacterId::new(good).is_ok(), "{good}");
+        }
+        for bad in ["", "Ren", "a/b", "..", "a b", &"x".repeat(65)] {
+            assert!(CharacterId::new(bad).is_err(), "{bad:?}");
+        }
+        // Wire validation matches construction: a hostile settings file cannot
+        // smuggle a path traversal through serde.
+        assert!(serde_json::from_str::<CharacterId>(r#""../evil""#).is_err());
     }
 
     #[test]

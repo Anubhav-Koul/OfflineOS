@@ -29,7 +29,8 @@ use ic_widget::gateway_client::{
     ClientActionId, GateRef, GateResolution, GatewayClient, GatewayEvent, ProjectionItem, RunId,
     ThreadId,
 };
-use ic_widget::settings::{ProviderSelection, Settings, SettingsStore};
+use ic_widget::hit_test::HitMask;
+use ic_widget::settings::{CharacterId, ProviderSelection, SettingsStore};
 use ic_widget::supervisor::{GatewayConfig, GatewayState, GatewaySupervisor};
 use ic_widget::window_state::{LayoutHash, MonitorInfo, WindowPosition};
 use ic_widget::{ProcessJob, RunPhase, SecretStore, WindowState, WindowStateStore};
@@ -84,6 +85,12 @@ struct AppState {
     /// The character's animation inputs and last emitted state, so a `character://state`
     /// event fires only when the derived state actually changes.
     character: Mutex<CharacterTracker>,
+    /// The UI's latest click-through mask. `None` until the first push — the
+    /// window is then fully interactive, never stranded click-through.
+    ///
+    /// A `std` mutex: written from an IPC command, read by the cursor poller,
+    /// held only for a lookup — never across an await.
+    hit_mask: std::sync::Mutex<Option<HitMask>>,
 }
 
 /// The inputs the character state derives from, plus the last state emitted.
@@ -484,12 +491,17 @@ async fn apply_provider(
     state: tauri::State<'_, AppState>,
     selection: ProviderSelection,
 ) -> Result<(), String> {
+    // Load-modify-save: settings now carry more than the provider, and a
+    // rebuilt literal here would silently reset the rest.
+    let mut settings = state
+        .settings_store
+        .load()
+        .map_err(|error| error.to_string())?;
+    settings.active_provider = selection.clone();
     state
         .settings_store
-        .save(&Settings {
-            active_provider: selection.clone(),
-        })
-        .map_err(user_facing)?;
+        .save(&settings)
+        .map_err(|error| error.to_string())?;
 
     // Tell the UI we are restarting before the teardown, so the badge is honest
     // during the gap. The old run, if any, is gone with the old gateway.
@@ -761,6 +773,103 @@ async fn character_state(state: tauri::State<'_, AppState>) -> Result<CharacterS
         .unwrap_or_else(|| character::derive(&tracker.inputs)))
 }
 
+/// Set the Phase 5 hook signals from what the UI can observe today: `listening`
+/// follows composer focus, `speaking` is set while a reply is rendered. The
+/// voice pipeline replaces both sources without touching this seam.
+#[tauri::command]
+async fn set_character_signals(
+    app: AppHandle,
+    listening: Option<bool>,
+    speaking: Option<bool>,
+) -> Result<(), String> {
+    update_character(&app, |inputs| {
+        if let Some(listening) = listening {
+            inputs.listening = listening;
+        }
+        if let Some(speaking) = speaking {
+            inputs.speaking = speaking;
+        }
+    })
+    .await;
+    Ok(())
+}
+
+/// The active character: its id (for the dashboard picker) and its config URL
+/// (for the widget's renderer).
+#[derive(Serialize)]
+struct CharacterSettings {
+    active: String,
+    config_url: String,
+}
+
+#[tauri::command]
+fn character_settings(state: tauri::State<'_, AppState>) -> Result<CharacterSettings, String> {
+    let settings = state
+        .settings_store
+        .load()
+        .map_err(|error| error.to_string())?;
+    let active = settings
+        .character
+        .as_ref()
+        .map(CharacterId::as_str)
+        .unwrap_or("hiyori")
+        .to_string();
+    Ok(CharacterSettings {
+        config_url: format!("/characters/{active}/character.json"),
+        active,
+    })
+}
+
+/// Switch the character and reload the widget so its renderer remounts.
+///
+/// A character is an asset folder; if the id names a folder that is not
+/// bundled, the widget's own load-failure path falls back to the placeholder
+/// and logs why — the setting is not worth refusing.
+#[tauri::command]
+async fn set_character(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    let id = CharacterId::new(id)?;
+    let mut settings = state
+        .settings_store
+        .load()
+        .map_err(|error| error.to_string())?;
+    settings.character = Some(id);
+    state
+        .settings_store
+        .save(&settings)
+        .map_err(|error| error.to_string())?;
+    if let Some(window) = app.get_webview_window(WIDGET) {
+        let _ = window.eval("window.location.reload()");
+    }
+    Ok(())
+}
+
+/// Store the UI's click-through mask for the cursor poller.
+#[tauri::command]
+fn set_hit_mask(state: tauri::State<'_, AppState>, mask: HitMask) -> Result<(), String> {
+    if !mask.is_valid() || mask.cols.saturating_mul(mask.rows) > 1_000_000 {
+        return Err("rejected an inconsistent hit mask".into());
+    }
+    tracing::debug!(cols = mask.cols, rows = mask.rows, "hit mask updated");
+    if let Ok(mut slot) = state.hit_mask.lock() {
+        *slot = Some(mask);
+    }
+    Ok(())
+}
+
+/// Surface a frontend error on stderr, where the developer is already watching.
+///
+/// The webview's console is awkward to reach in a transparent borderless widget;
+/// this bridges the errors worth seeing (a failed character load, say) to the
+/// same log the gateway and sidecar write to.
+#[tauri::command]
+fn log_ui_error(message: String) {
+    tracing::error!(target: "ic_widget::ui", "{message}");
+}
+
 #[tauri::command]
 async fn open_dashboard(app: AppHandle) -> Result<(), String> {
     show_dashboard(&app).map_err(|error| error.to_string())
@@ -871,13 +980,176 @@ fn phase_name(phase: &RunPhase) -> String {
     .to_string()
 }
 
+// ------------------------------------------------------ desktop interaction
+
+/// How often the global cursor is sampled — matches the renderer's ~30 fps cap.
+/// `set_ignore_cursor_events` is only touched on transitions.
+const CURSOR_POLL: std::time::Duration = std::time::Duration::from_millis(33);
+/// How often the foreground window is checked for fullscreen. Slow-moving state.
+const FULLSCREEN_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Window-local cursor position, logical pixels, emitted on `cursor://pos`.
+#[derive(Serialize, Clone, Copy, PartialEq)]
+struct CursorPos {
+    x: f64,
+    y: f64,
+}
+
+/// Drive click-through, cursor-following, and the fullscreen pause from one
+/// global cursor poll.
+///
+/// The webview cannot own any of this: while `set_ignore_cursor_events(true)`
+/// is set it receives no mouse events at all, so the decision to become
+/// clickable again must come from outside it. The same poll feeds the
+/// character's eye tracking (`cursor://pos`) and, at a slower cadence, pauses
+/// animation while a fullscreen app is foreground (`character://active`) so the
+/// idle character never competes with a game — or llama.cpp — for the GPU.
+#[cfg(windows)]
+fn spawn_interaction_watch(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut poll = tokio::time::interval(CURSOR_POLL);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut ignoring = false;
+        let mut animating = true;
+        let mut last_cursor: Option<CursorPos> = None;
+        let mut fullscreen_checked = std::time::Instant::now() - FULLSCREEN_POLL;
+
+        loop {
+            poll.tick().await;
+            let Some(window) = app.get_webview_window(WIDGET) else {
+                continue;
+            };
+            if !window.is_visible().unwrap_or(false) {
+                continue;
+            }
+
+            if fullscreen_checked.elapsed() >= FULLSCREEN_POLL {
+                fullscreen_checked = std::time::Instant::now();
+                let active = !foreground_is_fullscreen();
+                if active != animating {
+                    animating = active;
+                    let _ = app.emit("character://active", animating);
+                }
+            }
+
+            let Some((cursor_x, cursor_y)) = cursor_position() else {
+                continue;
+            };
+            let (Ok(origin), Ok(size), Ok(scale)) = (
+                window.outer_position(),
+                window.outer_size(),
+                window.scale_factor(),
+            ) else {
+                continue;
+            };
+            let inside = cursor_x >= origin.x
+                && cursor_y >= origin.y
+                && cursor_x < origin.x + size.width as i32
+                && cursor_y < origin.y + size.height as i32;
+            let local = CursorPos {
+                x: f64::from(cursor_x - origin.x) / scale,
+                y: f64::from(cursor_y - origin.y) / scale,
+            };
+
+            // No mask yet (the UI is still booting): everything is clickable.
+            // Failing interactive can cost a stray click on empty space; failing
+            // click-through would strand a widget nothing can ever click again.
+            let solid = inside
+                && app
+                    .state::<AppState>()
+                    .hit_mask
+                    .lock()
+                    .map(|mask| {
+                        mask.as_ref()
+                            .is_none_or(|mask| mask.is_solid(local.x, local.y))
+                    })
+                    .unwrap_or(true);
+            let want_ignore = inside && !solid;
+            if want_ignore != ignoring && window.set_ignore_cursor_events(want_ignore).is_ok() {
+                ignoring = want_ignore;
+                tracing::debug!(click_through = ignoring, "cursor crossed a mask edge");
+            }
+
+            // Eye tracking: the character watches the cursor while it is over
+            // the window (clickable or not). Deduped — a resting cursor at
+            // 30 Hz would otherwise be pure IPC noise.
+            if inside && animating && last_cursor != Some(local) {
+                last_cursor = Some(local);
+                let _ = app.emit("cursor://pos", local);
+            }
+        }
+    });
+}
+
+/// The global cursor in screen (physical) coordinates.
+#[cfg(windows)]
+fn cursor_position() -> Option<(i32, i32)> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let mut point = POINT::default();
+    // SAFETY: `point` is a valid, writable POINT for the duration of the call.
+    unsafe { GetCursorPos(&mut point) }.ok()?;
+    Some((point.x, point.y))
+}
+
+/// Whether the foreground window covers its whole monitor.
+///
+/// The desktop shell itself (Progman/WorkerW) is fullscreen by geometry but
+/// means "nothing is focused" — a character that paused whenever the user
+/// clicked their wallpaper would look broken, so the shell classes are ignored.
+#[cfg(windows)]
+fn foreground_is_fullscreen() -> bool {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetForegroundWindow, GetWindowRect,
+    };
+
+    // SAFETY: no preconditions; may return a null handle.
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.is_invalid() {
+        return false;
+    }
+
+    let mut class = [0u16; 32];
+    // SAFETY: `class` is writable for its whole length.
+    let written = unsafe { GetClassNameW(foreground, &mut class) }.max(0) as usize;
+    let class = String::from_utf16_lossy(&class[..written.min(class.len())]);
+    if class == "Progman" || class == "WorkerW" {
+        return false;
+    }
+
+    let mut rect = RECT::default();
+    // SAFETY: `rect` is a valid, writable RECT.
+    if unsafe { GetWindowRect(foreground, &mut rect) }.is_err() {
+        return false;
+    }
+
+    // SAFETY: the handle came from GetForegroundWindow above; a stale handle
+    // yields a null monitor, which GetMonitorInfoW then rejects.
+    let monitor = unsafe { MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `info` is writable and `cbSize` is set as the API requires.
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return false;
+    }
+    let m = info.rcMonitor;
+    rect.left <= m.left && rect.top <= m.top && rect.right >= m.right && rect.bottom >= m.bottom
+}
+
 // ----------------------------------------------------------------- windows
 
 fn build_widget(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     WebviewWindowBuilder::new(app, WIDGET, WebviewUrl::App("index.html".into()))
         .title("IronClaw")
-        .inner_size(380.0, 540.0)
-        .min_inner_size(320.0, 360.0)
+        .inner_size(380.0, 680.0)
+        .min_inner_size(320.0, 420.0)
         .decorations(false)
         .transparent(true)
         .always_on_top(true)
@@ -1340,6 +1612,11 @@ fn main() {
             cancel_download,
             remove_model,
             character_state,
+            set_character_signals,
+            character_settings,
+            set_character,
+            set_hit_mask,
+            log_ui_error,
             open_dashboard,
         ])
         .setup(|app| {
@@ -1357,6 +1634,7 @@ fn main() {
                 window_store: store,
                 settings_store: SettingsStore::at(SettingsStore::default_path()?),
                 character: Mutex::new(CharacterTracker::default()),
+                hit_mask: std::sync::Mutex::new(None),
             });
 
             let handle = app.handle().clone();
@@ -1366,6 +1644,8 @@ fn main() {
 
             build_tray(&handle)?;
             register_summon_hotkey(&handle);
+            #[cfg(windows)]
+            spawn_interaction_watch(handle.clone());
             spawn_gateway(handle.clone());
 
             // Persist the widget's position whenever the user drags it.

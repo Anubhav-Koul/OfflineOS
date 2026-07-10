@@ -316,6 +316,86 @@ function ModelsPanel() {
   );
 }
 
+/** One bundled character, from `/characters/manifest.json`. */
+interface CharacterEntry {
+  id: string;
+  name: string;
+  note: string;
+}
+
+/**
+ * The character picker (Phase 3: character choice is a settings toggle).
+ *
+ * The available list comes from a static manifest bundled with the assets —
+ * the folders are embedded in the binary, so there is nothing to scan at
+ * runtime. Applying reloads the widget window, which remounts its renderer.
+ */
+function CharacterPanel() {
+  const [available, setAvailable] = createSignal<CharacterEntry[]>([]);
+  const [active, setActive] = createSignal<string | null>(null);
+  const [chosen, setChosen] = createSignal<string | null>(null);
+  const [notice, setNotice] = createSignal<string | null>(null);
+
+  onMount(async () => {
+    try {
+      const response = await fetch("/characters/manifest.json");
+      if (response.ok) {
+        const manifest = (await response.json()) as { characters: CharacterEntry[] };
+        setAvailable(manifest.characters);
+      }
+      const settings = await api.characterSettings();
+      setActive(settings.active);
+      setChosen(settings.active);
+    } catch (reason) {
+      setNotice(String(reason));
+    }
+  });
+
+  const apply = async () => {
+    const id = chosen();
+    if (!id) return;
+    setNotice(null);
+    try {
+      await api.setCharacter(id);
+      setActive(id);
+    } catch (reason) {
+      setNotice(String(reason));
+    }
+  };
+
+  return (
+    <section>
+      <h2>Character</h2>
+      <p class="muted small">
+        A character is an asset folder under <code>characters/</code>; switching
+        reloads the widget.
+      </p>
+      <For each={available()}>
+        {(entry) => (
+          <label class="provider-option">
+            <input
+              type="radio"
+              name="character"
+              checked={chosen() === entry.id}
+              onChange={() => setChosen(entry.id)}
+            />
+            <span class="provider-name">{entry.name}</span>
+            <span class="row-meta">{entry.note}</span>
+          </label>
+        )}
+      </For>
+      <Show when={notice()}>
+        <p class="reason-inline">{notice()}</p>
+      </Show>
+      <div class="apply-row">
+        <button disabled={!chosen() || chosen() === active()} onClick={() => void apply()}>
+          Apply
+        </button>
+      </div>
+    </section>
+  );
+}
+
 /** Whether two selections name the same provider (model override aside). */
 function selectionEquals(a: ProviderSelection, b: ProviderSelection): boolean {
   if (a.kind !== b.kind) return false;
@@ -695,6 +775,8 @@ function Dashboard() {
       </section>
 
       <ModelsPanel />
+
+      <CharacterPanel />
 
       <ProviderPanel />
 

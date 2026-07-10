@@ -1,0 +1,15 @@
+{
+  "name": "Hiyori",
+  "renderer": "live2d",
+  "model": "/characters/hiyori/live2d/Hiyori.model3.json",
+  "scale": 0.95,
+  "anchor": { "x": 0.5, "y": 1 },
+  "states": {
+    "idle": { "live2d": { "motion": "Idle" } },
+    "listening": { "live2d": { "motion": "Idle" } },
+    "thinking": { "live2d": { "motion": "Idle" } },
+    "speaking": { "live2d": { "motion": "TapBody" } },
+    "concerned": { "live2d": { "motion": "Idle" } },
+    "error": { "live2d": { "motion": "Idle" } }
+  }
+}

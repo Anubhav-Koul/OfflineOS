@@ -7,6 +7,7 @@
 //! | Module | Responsibility |
 //! |---|---|
 //! | [`gateway_client`] | The only place we talk to `ironclaw-reborn serve` |
+//! | [`hit_test`] | The click-through mask for the transparent window |
 //! | [`job_object`] | Making child processes die with us |
 //! | [`secrets`] | The bearer token, in the OS credential store |
 //! | [`supervisor`] | Keeping `ironclaw-reborn serve` alive |
@@ -18,6 +19,7 @@
 pub mod character;
 pub mod error;
 pub mod gateway_client;
+pub mod hit_test;
 pub mod job_object;
 pub mod model_catalog;
 pub mod providers;

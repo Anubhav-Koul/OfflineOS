@@ -1,0 +1,14 @@
+{
+  "characters": [
+    {
+      "id": "hiyori",
+      "name": "Hiyori",
+      "note": "Cubism 4 official sample — the working dev model"
+    },
+    {
+      "id": "ren",
+      "name": "Ren Foster",
+      "note": "Cubism 5.3 sample — misrenders through the Cubism 4 pipeline; kept for the framework-upgrade retest"
+    }
+  ]
+}

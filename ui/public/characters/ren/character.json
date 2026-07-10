@@ -2,8 +2,8 @@
   "name": "Ren",
   "renderer": "live2d",
   "model": "/characters/ren/live2d/ren.model3.json",
-  "scale": 0.9,
-  "anchor": { "x": 0.5, "y": 0.5 },
+  "scale": 0.95,
+  "anchor": { "x": 0.5, "y": 1 },
   "states": {
     "idle": { "live2d": { "expression": "exp_01", "motion": "Idle" } },
     "listening": { "live2d": { "expression": "exp_02" } },

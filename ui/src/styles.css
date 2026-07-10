@@ -22,19 +22,31 @@ body {
   color: var(--text);
 }
 
-/* The widget window is transparent and undecorated; only the card is painted. */
+/* The widget window is transparent and undecorated. The character stands on
+   the desktop at the bottom; the chat panel — the speech bubble — floats above
+   it and is the only painted surface. */
 body.widget-body {
   background: transparent;
+  overflow: hidden;
 }
 
 .widget {
   display: flex;
   flex-direction: column;
   height: 100vh;
+  background: transparent;
+}
+
+.bubble-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
   background: var(--bg);
   border: 1px solid #2b2f38;
   border-radius: 10px;
   overflow: hidden;
+  margin-bottom: 6px;
 }
 
 .widget-header {
@@ -87,17 +99,78 @@ button.ghost {
 
 .character {
   position: relative;
-  height: 220px;
+  height: 320px;
   display: flex;
   justify-content: center;
   align-items: flex-end;
-  padding: 10px 0 4px;
   user-select: none;
   flex: none;
+  /* Stays glued to the window's bottom edge when the panel is hidden, so the
+     character keeps standing in the same spot. */
+  margin-top: auto;
+  cursor: pointer;
+}
+.widget.panel-closed .character {
+  height: 100%;
 }
 .character canvas {
   position: absolute;
   inset: 0;
+}
+.character-sprite {
+  position: absolute;
+  bottom: 0;
+  left: 50%;
+  max-height: 100%;
+  max-width: 100%;
+  transform-origin: 50% 100%;
+  /* Cheap-puppet defaults; data-state below layers motion on top. */
+  transform: translateX(-50%);
+  user-select: none;
+  -webkit-user-drag: none;
+}
+.character-sprite[data-state="idle"],
+.character-sprite[data-state="listening"] {
+  animation: sprite-bob 3.2s ease-in-out infinite;
+}
+.character-sprite[data-state="thinking"] {
+  animation: sprite-tilt 1.6s ease-in-out infinite;
+}
+.character-sprite[data-state="speaking"] {
+  animation: sprite-squash 0.6s ease-in-out infinite;
+}
+.character-sprite[data-state="concerned"] {
+  animation: sprite-tilt 2.4s ease-in-out infinite;
+}
+.character-sprite[data-state="error"] {
+  animation: shake 0.4s ease-in-out infinite;
+}
+@keyframes sprite-bob {
+  0%,
+  100% {
+    transform: translateX(-50%) translateY(0);
+  }
+  50% {
+    transform: translateX(-50%) translateY(-5px);
+  }
+}
+@keyframes sprite-tilt {
+  0%,
+  100% {
+    transform: translateX(-50%) rotate(-2deg);
+  }
+  50% {
+    transform: translateX(-50%) rotate(2.5deg);
+  }
+}
+@keyframes sprite-squash {
+  0%,
+  100% {
+    transform: translateX(-50%) scale(1, 1);
+  }
+  50% {
+    transform: translateX(-50%) scale(1.02, 0.97);
+  }
 }
 .character-face {
   font-size: 52px;

@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 /**
  * The typed edge of the Rust bridge.
@@ -181,6 +182,29 @@ export type CharacterState =
   | "concerned"
   | "error";
 
+/** The active character, for the dashboard picker and the widget's renderer. */
+export interface CharacterSettings {
+  active: string;
+  config_url: string;
+}
+
+/**
+ * The click-through mask: a row-major LSB-first bitset of `cell`-sized squares
+ * over the widget window, in logical pixels. Mirrors `ic_widget::hit_test`.
+ */
+export interface HitMask {
+  cell: number;
+  cols: number;
+  rows: number;
+  bits: number[];
+}
+
+/** Window-local cursor position (logical px), emitted while over the window. */
+export interface CursorPos {
+  x: number;
+  y: number;
+}
+
 export const api = {
   gatewayState: () => invoke<GatewayState>("gateway_state"),
   createThread: () => invoke<string>("create_thread"),
@@ -210,6 +234,14 @@ export const api = {
   cancelDownload: () => invoke<void>("cancel_download"),
   removeModel: (id: string) => invoke<void>("remove_model", { id }),
   characterState: () => invoke<CharacterState>("character_state"),
+  characterSettings: () => invoke<CharacterSettings>("character_settings"),
+  setCharacter: (id: string) => invoke<void>("set_character", { id }),
+  setCharacterSignals: (signals: { listening?: boolean; speaking?: boolean }) =>
+    invoke<void>("set_character_signals", signals),
+  setHitMask: (mask: HitMask) => invoke<void>("set_hit_mask", { mask }),
+  /** Begin an OS window drag — the character's body is the drag handle. */
+  startDragging: () => getCurrentWindow().startDragging(),
+  logUiError: (message: string) => invoke<void>("log_ui_error", { message }),
 };
 
 /** Subscribe to model-download progress and completion. */
@@ -230,4 +262,21 @@ export function onGatewayState(handler: (state: GatewayState) => void): Promise<
 /** Subscribe to the chat event pump for the active thread. */
 export function onChatEvent(handler: (event: ChatEvent) => void): Promise<UnlistenFn> {
   return listen<ChatEvent>("chat://event", (event) => handler(event.payload));
+}
+
+/**
+ * Subscribe to the global cursor while it is over the widget window. This is
+ * how eye tracking works even when the window is click-through: the webview
+ * receives no mouse events then, so Rust polls the cursor and reports it here.
+ */
+export function onCursorPos(handler: (pos: CursorPos) => void): Promise<UnlistenFn> {
+  return listen<CursorPos>("cursor://pos", (event) => handler(event.payload));
+}
+
+/**
+ * Subscribe to the animation gate: `false` while a fullscreen app is
+ * foreground, so the idle character never competes with it for the GPU.
+ */
+export function onCharacterActive(handler: (active: boolean) => void): Promise<UnlistenFn> {
+  return listen<boolean>("character://active", (event) => handler(event.payload));
 }

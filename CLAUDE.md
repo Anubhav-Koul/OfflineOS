@@ -85,7 +85,7 @@ Phase 2b scope:
 3. Tool-approval prompts surfaced from the safety layer (also mirrored in the speech bubble).
 4. Keep the speech-bubble chat UI as the Phase 2 face of the app — the character lands in Phase 3. Transparency, undecorated frame, and always-on-top landed in 2a (`WebviewWindowBuilder` in `crates/ic_widget/src/main.rs`). **Per-pixel hit testing did not** — clicks do not yet pass through the transparent regions. Build that plumbing in 2b or at the start of Phase 3.
 
-### Phase 3 — Animated character companion (in `ui/`)
+### Phase 3 — Animated character companion (in `ui/`) ✅ (see notes below; pipeline doc: `docs/desktop/character-pipeline.md`)
 
 The widget becomes an **animated anime-style character** standing on the desktop; the Phase 2 speech bubble anchors beside it.
 
@@ -381,3 +381,53 @@ but not feature-complete.
 Next: finish 2b's deferred follow-ups (**GGUF download UI**, **tokens/sec**) and
 do the **manual smoke run**, then **Phase 3 — animated character companion**
 (Live2D, `ren_en/` model), then **Phase 4 — browser automation**.
+
+## Phase 3 notes — animated character companion (done, recorded 2026-07-11)
+
+`crates/ic_widget` (`character.rs`, `hit_test.rs`, `settings.rs`, `main.rs`) +
+`ui/` (+ `docs/desktop/character-pipeline.md`, which holds the full pipeline
+architecture, the licensing gates for Phase 6, and the open follow-ups). No
+IronClaw core crate was touched.
+
+- **The Phase 3 compatibility check failed exactly as CLAUDE.md warned, but
+  one layer deeper than expected.** The Cubism 5 web core (SDK 5-r.5, core v6)
+  moved render orders from `drawables.renderOrders` to
+  `model.getRenderOrders()`; pixi-live2d-display 0.4.0 bundles the Cubism 4
+  framework, which reads the old field. The crash surfaced as ONE console
+  error and a forever-blank canvas, because a throw inside a Pixi ticker
+  callback ends the rAF chain — the render ticker died while the model's
+  updates kept ticking on the shared ticker. Fixed with a core API bridge plus
+  a guarded render loop (`ui/src/character.ts`); the earlier "WebView2 uploads
+  blank textures" theory was probably this bug wearing a costume (retest noted
+  in the pipeline doc). **Hiyori (Cubism 4) is the dev model and renders;
+  Ren (5.3, offscreen blending) stays parked until a Cubism 5 framework.**
+- **Per-pixel click-through is split across the IPC boundary** because a
+  click-through window's webview receives no mouse events at all: the UI
+  rasterizes the chat panel rect + the character's alpha silhouette (GPU
+  readback at one texel per 8-px cell, dilated) into `ic_widget::hit_test::
+  HitMask`; a Rust poller (`spawn_interaction_watch`) tests the global cursor
+  against it and flips `set_ignore_cursor_events`. No mask yet = fully
+  interactive (fail-safe). The same poll feeds eye tracking (`cursor://pos`)
+  and pauses animation while a fullscreen app is foreground
+  (`character://active`, with the Progman/WorkerW desktop-shell exclusion).
+- **Layout**: the character stands at the window's bottom edge over the
+  transparent desktop; the Phase 2 chat card became a collapsible bubble panel
+  above it. Head click (model hit areas, bounding-box top-third fallback)
+  toggles the panel; body drag moves the window; an incoming tool gate forces
+  the panel open alongside the `concerned` face.
+- **The state machine's Phase 5 hooks are live**: `set_character_signals`
+  drives `listening` (composer focus) and `speaking` (reply render, ended on a
+  reading-time estimate). Lip sync runs off a test-tone stub patched into
+  `motionManager.update` — the exact seam Phase 5's TTS amplitude replaces.
+  State-entry motions play at FORCE priority so transitions interrupt; idle is
+  the exception (the motion manager already loops it).
+- **Character choice is a settings toggle** (`settings.json` → `character`,
+  `CharacterId` newtype validates the path segment; dashboard picker reads the
+  bundled `characters/manifest.json`). `apply_provider` now load-modify-saves
+  settings — a rebuilt literal would have wiped the new field.
+- **Perf rules landed**: both tickers capped at 30 fps; animation pauses when
+  the window is hidden (WebView2 stops rAF) and under fullscreen apps.
+- `SpriteRenderer` (PNG poses + CSS cheap-puppet transforms) exists and ships
+  no art; the placeholder remains the no-assets fallback.
+
+Next: **Phase 4 — browser automation** (`crates/ic_browser_mcp`).

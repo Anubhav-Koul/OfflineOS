@@ -1,15 +1,26 @@
 /* @refresh reload */
 import { render } from "solid-js/web";
-import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import {
+  createEffect,
+  createSignal,
+  For,
+  on,
+  onCleanup,
+  onMount,
+  Show,
+} from "solid-js";
 
 import {
   api,
-  onChatEvent,
+  onCharacterActive,
   onCharacterState,
+  onChatEvent,
+  onCursorPos,
   onGatewayState,
   TERMINAL_PHASES,
   type ChatEvent,
   type GatewayState,
+  type HitMask,
   type Message,
   type RunPhase,
 } from "./api";
@@ -18,20 +29,61 @@ import {
   loadCharacterConfig,
   PLACEHOLDER_CONFIG,
   type CharacterRenderer,
+  type HitProfile,
 } from "./character";
 import "./styles.css";
 
 /**
- * The always-on-top chat widget.
+ * Mirror console errors/warnings and unhandled failures to the backend log.
  *
- * The interesting part is how a reply arrives. The gateway's event stream never
- * carries assistant text — see `docs/desktop/chat-rendering.md`. So:
+ * Everything below the app — Pixi, pixi-live2d-display, the Cubism Framework —
+ * reports failures via `console.error`, which lands in the webview's console: an
+ * awkward place to reach in a transparent borderless widget. The stderr log is
+ * where the gateway and sidecar already report, so failures belong there too.
+ */
+function bridgeConsoleToLog() {
+  const render = (value: unknown): string => {
+    if (value instanceof Error) return value.stack ?? value.message;
+    if (typeof value === "string") return value;
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  };
+  for (const level of ["error", "warn"] as const) {
+    const original = console[level].bind(console);
+    console[level] = (...args: unknown[]) => {
+      original(...args);
+      const text = args.map(render).join(" ").slice(0, 1000);
+      void api.logUiError(`console.${level}: ${text}`).catch(() => undefined);
+    };
+  }
+  window.addEventListener("error", (event) =>
+    void api.logUiError(
+      `window.onerror: ${event.message} @${event.filename}:${event.lineno}:${event.colno}\n${
+        event.error instanceof Error ? (event.error.stack ?? "") : ""
+      }`,
+    ),
+  );
+  window.addEventListener("unhandledrejection", (event) =>
+    void api.logUiError(`unhandledrejection: ${render(event.reason)}`),
+  );
+}
+bridgeConsoleToLog();
+
+/**
+ * The desktop companion window: the character standing at the bottom, the chat
+ * panel — the Phase 2 speech bubble — anchored above it. Clicking the
+ * character's head toggles the panel; dragging its body moves the window;
+ * everything outside both passes through to the desktop (the hit mask below).
+ *
+ * How a reply arrives is unchanged from Phase 2a. The gateway's event stream
+ * never carries assistant text — see `docs/desktop/chat-rendering.md`. So:
  *
  *   1. send the message, remember the `run_id`
  *   2. watch `run_status` events until the run is terminal
  *   3. *then* fetch the timeline and render the assistant's message
- *
- * Everything before step 3 is status, not content.
  */
 
 interface Bubble {
@@ -46,6 +98,72 @@ interface Gate {
   body: string;
 }
 
+/** Cell size of the click-through mask, logical px. */
+const MASK_CELL = 8;
+
+/**
+ * Rasterize the solid parts of the window — the chat panel's DOM rect plus the
+ * character's silhouette — into the packed grid `ic_widget::hit_test` expects.
+ * Dilated by one cell: the silhouette moves between refreshes, and a click that
+ * grazes an edge should land on the character, not the desktop.
+ */
+function buildHitMask(profile: HitProfile | null, elements: HTMLElement[]): HitMask {
+  const cols = Math.max(1, Math.ceil(window.innerWidth / MASK_CELL));
+  const rows = Math.max(1, Math.ceil(window.innerHeight / MASK_CELL));
+  const grid = new Uint8Array(cols * rows);
+
+  const markRect = (left: number, top: number, width: number, height: number) => {
+    if (width <= 0 || height <= 0) return;
+    const c0 = Math.max(0, Math.floor(left / MASK_CELL));
+    const r0 = Math.max(0, Math.floor(top / MASK_CELL));
+    const c1 = Math.min(cols - 1, Math.floor((left + width - 1) / MASK_CELL));
+    const r1 = Math.min(rows - 1, Math.floor((top + height - 1) / MASK_CELL));
+    for (let r = r0; r <= r1; r++) {
+      for (let c = c0; c <= c1; c++) grid[r * cols + c] = 1;
+    }
+  };
+
+  for (const element of elements) {
+    const rect = element.getBoundingClientRect();
+    markRect(rect.left, rect.top, rect.width, rect.height);
+  }
+  if (profile?.kind === "rect") {
+    markRect(profile.left, profile.top, profile.width, profile.height);
+  } else if (profile) {
+    for (let r = 0; r < profile.rows; r++) {
+      for (let c = 0; c < profile.cols; c++) {
+        if (!profile.solid[r * profile.cols + c]) continue;
+        markRect(
+          profile.originX + c * profile.cell,
+          profile.originY + r * profile.cell,
+          profile.cell,
+          profile.cell,
+        );
+      }
+    }
+  }
+
+  const dilated = new Uint8Array(grid);
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      if (!grid[r * cols + c]) continue;
+      for (let dr = -1; dr <= 1; dr++) {
+        for (let dc = -1; dc <= 1; dc++) {
+          const rr = r + dr;
+          const cc = c + dc;
+          if (rr >= 0 && rr < rows && cc >= 0 && cc < cols) dilated[rr * cols + cc] = 1;
+        }
+      }
+    }
+  }
+
+  const bits = new Uint8Array(Math.ceil((cols * rows) / 8));
+  for (let i = 0; i < dilated.length; i++) {
+    if (dilated[i]) bits[i >> 3]! |= 1 << (i & 7);
+  }
+  return { cell: MASK_CELL, cols, rows, bits: Array.from(bits) };
+}
+
 function App() {
   const [threadId, setThreadId] = createSignal<string | null>(null);
   const [bubbles, setBubbles] = createSignal<Bubble[]>([]);
@@ -55,6 +173,7 @@ function App() {
   const [activity, setActivity] = createSignal<string | null>(null);
   const [gate, setGate] = createSignal<Gate | null>(null);
   const [gateway, setGateway] = createSignal<GatewayState>({ state: "starting" });
+  const [panelOpen, setPanelOpen] = createSignal(true);
 
   let transcript: HTMLDivElement | undefined;
   const scrollToEnd = () =>
@@ -63,6 +182,25 @@ function App() {
   const push = (bubble: Bubble) => {
     setBubbles((current) => [...current, bubble]);
     scrollToEnd();
+  };
+
+  /**
+   * The `speaking` signal's off-switch. The character speaks while a reply is
+   * rendered; with no TTS yet the window is a reading-time estimate, replaced
+   * by real playback in Phase 5.
+   */
+  let speakingTimer: ReturnType<typeof setTimeout> | undefined;
+  const setSpeaking = (text: string | null) => {
+    clearTimeout(speakingTimer);
+    if (text === null) {
+      void api.setCharacterSignals({ speaking: false }).catch(() => undefined);
+      return;
+    }
+    void api.setCharacterSignals({ speaking: true }).catch(() => undefined);
+    const readingMs = Math.min(2000 + text.length * 40, 10_000);
+    speakingTimer = setTimeout(() => {
+      void api.setCharacterSignals({ speaking: false }).catch(() => undefined);
+    }, readingMs);
   };
 
   /** The run finished. Its text is in the timeline, nowhere else. */
@@ -83,7 +221,10 @@ function App() {
       const reply = [...messages]
         .reverse()
         .find((message) => message.kind === "assistant" && message.content);
-      if (reply?.content) push({ role: "assistant", text: reply.content });
+      if (reply?.content) {
+        push({ role: "assistant", text: reply.content });
+        setSpeaking(reply.content);
+      }
     } catch (error) {
       push({ role: "error", text: `Could not load the reply: ${error}` });
     }
@@ -103,13 +244,16 @@ function App() {
         break;
       }
       case "gate":
-        // The agent wants to run a tool. It stays parked until answered.
+        // The agent wants to run a tool. It stays parked until answered — and
+        // the panel opens so the prompt is actually visible, mirroring the
+        // character's `concerned` face.
         setGate({
           runId: event.run_id,
           gateRef: event.gate_ref,
           headline: event.headline,
           body: event.body,
         });
+        setPanelOpen(true);
         break;
       case "activity":
         setActivity(event.status === "completed" ? null : event.capability_id);
@@ -152,6 +296,7 @@ function App() {
     onCleanup(() => {
       unlistenState();
       unlistenChat();
+      clearTimeout(speakingTimer);
     });
 
     try {
@@ -173,6 +318,7 @@ function App() {
     setDraft("");
     push({ role: "user", text });
     setPhase("queued");
+    setSpeaking(null);
     try {
       const { run_id } = await api.sendMessage(id, text);
       setActiveRun(run_id);
@@ -186,6 +332,7 @@ function App() {
     const id = threadId();
     const run = activeRun();
     if (!id || !run) return;
+    setSpeaking(null);
     try {
       // The Stop button races the answer; `already_terminal` means the reply
       // landed first, which is not a failure.
@@ -221,70 +368,93 @@ function App() {
   };
 
   return (
-    <div class="widget">
-      {/* Undecorated window: this strip is what the user drags. */}
-      <header class="widget-header" data-tauri-drag-region>
-        <span class="title" data-tauri-drag-region>
-          IronClaw
-        </span>
-        <HealthBadge state={gateway()} />
-        <button class="ghost" title="Dashboard" onClick={() => void api.openDashboard()}>
-          ⋯
-        </button>
-      </header>
-
-      <CharacterView />
-
-      <div class="transcript" ref={transcript}>
-        <For each={bubbles()}>
-          {(bubble) => <div class={`bubble ${bubble.role}`}>{bubble.text}</div>}
-        </For>
-
-        <Show when={statusLine()}>
-          {(line) => <div class="status">{line()}</div>}
-        </Show>
-
-        <Show when={gate()}>
-          {(pending) => (
-            <div class="gate">
-              <div class="gate-headline">{pending().headline}</div>
-              <pre class="gate-body">{pending().body}</pre>
-              <div class="gate-actions">
-                <button class="approve" onClick={() => void answerGate(true)}>
-                  Allow once
-                </button>
-                <button class="deny" onClick={() => void answerGate(false)}>
-                  Deny
-                </button>
-              </div>
-            </div>
-          )}
-        </Show>
-      </div>
-
-      <form class="composer" onSubmit={send}>
-        <input
-          type="text"
-          placeholder={busy() ? "Working…" : "Ask something"}
-          value={draft()}
-          disabled={busy() || gateway().state !== "ready"}
-          onInput={(event) => setDraft(event.currentTarget.value)}
-        />
-        <Show
-          when={busy()}
-          fallback={
-            <button type="submit" disabled={!draft().trim() || gateway().state !== "ready"}>
-              Send
+    <div class="widget" classList={{ "panel-closed": !panelOpen() }}>
+      <Show when={panelOpen()}>
+        <div class="bubble-panel">
+          {/* Undecorated window: this strip is what the user drags. */}
+          <header class="widget-header" data-tauri-drag-region>
+            <span class="title" data-tauri-drag-region>
+              IronClaw
+            </span>
+            <HealthBadge state={gateway()} />
+            <button
+              class="ghost"
+              title="Dashboard"
+              onClick={() => void api.openDashboard()}
+            >
+              ⋯
             </button>
-          }
-        >
-          {/* Always visible while a run is in flight, per the project's
-              runaway-loop guardrails. */}
-          <button type="button" class="stop" onClick={() => void stop()}>
-            Stop
-          </button>
-        </Show>
-      </form>
+            <button class="ghost" title="Hide chat" onClick={() => setPanelOpen(false)}>
+              ▾
+            </button>
+          </header>
+
+          <div class="transcript" ref={transcript}>
+            <For each={bubbles()}>
+              {(bubble) => <div class={`bubble ${bubble.role}`}>{bubble.text}</div>}
+            </For>
+
+            <Show when={statusLine()}>
+              {(line) => <div class="status">{line()}</div>}
+            </Show>
+
+            <Show when={gate()}>
+              {(pending) => (
+                <div class="gate">
+                  <div class="gate-headline">{pending().headline}</div>
+                  <pre class="gate-body">{pending().body}</pre>
+                  <div class="gate-actions">
+                    <button class="approve" onClick={() => void answerGate(true)}>
+                      Allow once
+                    </button>
+                    <button class="deny" onClick={() => void answerGate(false)}>
+                      Deny
+                    </button>
+                  </div>
+                </div>
+              )}
+            </Show>
+          </div>
+
+          <form class="composer" onSubmit={send}>
+            <input
+              type="text"
+              placeholder={busy() ? "Working…" : "Ask something"}
+              value={draft()}
+              disabled={busy() || gateway().state !== "ready"}
+              onInput={(event) => setDraft(event.currentTarget.value)}
+              onFocus={() =>
+                void api.setCharacterSignals({ listening: true }).catch(() => undefined)
+              }
+              onBlur={() =>
+                void api.setCharacterSignals({ listening: false }).catch(() => undefined)
+              }
+            />
+            <Show
+              when={busy()}
+              fallback={
+                <button
+                  type="submit"
+                  disabled={!draft().trim() || gateway().state !== "ready"}
+                >
+                  Send
+                </button>
+              }
+            >
+              {/* Always visible while a run is in flight, per the project's
+                  runaway-loop guardrails. */}
+              <button type="button" class="stop" onClick={() => void stop()}>
+                Stop
+              </button>
+            </Show>
+          </form>
+        </div>
+      </Show>
+
+      <CharacterView
+        panelOpen={panelOpen}
+        onHeadTap={() => setPanelOpen((open) => !open)}
+      />
     </div>
   );
 }
@@ -315,38 +485,86 @@ function HealthBadge(props: { state: GatewayState }) {
 }
 
 /**
- * The character. Owns a {@link CharacterRenderer} and drives it from
- * `character://state`, reading the current state on mount to cover the race
- * where it changed before we subscribed.
+ * The character. Owns a {@link CharacterRenderer}; drives it from
+ * `character://state` (reading the current state on mount to cover the race
+ * where it changed before we subscribed), from `cursor://pos` for eye tracking,
+ * and from `character://active` for the fullscreen pause. It also feeds the
+ * click-through mask: the panel's rect plus the character's silhouette, pushed
+ * whenever either can have changed.
  */
-const REN_CONFIG_URL = "/characters/ren/character.json";
-
-function CharacterView() {
+function CharacterView(props: { panelOpen: () => boolean; onHeadTap: () => void }) {
   let container: HTMLDivElement | undefined;
+
+  // Set once the renderer is mounted. The effect lives in the component body
+  // (an async onMount continuation has no Solid owner), and re-pushes the mask
+  // when the panel toggles — its rect just appeared or vanished.
+  const [maskPusher, setMaskPusher] = createSignal<(() => void) | null>(null);
+  createEffect(
+    on(
+      () => [props.panelOpen(), maskPusher()] as const,
+      ([, push]) => {
+        if (push) setTimeout(push, 60);
+      },
+      { defer: true },
+    ),
+  );
 
   onMount(async () => {
     if (!container) return;
 
-    // Try the Live2D character; on any failure — missing Core, a Cubism 5.3
-    // feature WebView2 will not render, a bad asset path — fall back to the
-    // placeholder so the character still reacts and the console carries the
-    // reason. This is the Phase 3 compatibility check in practice.
+    // Try the configured Live2D/sprite character; on any failure — missing
+    // Core, a bad asset path, an unreadable config — fall back to the
+    // placeholder so the character still reacts and the log carries the reason.
     let renderer: CharacterRenderer;
     try {
-      const config = await loadCharacterConfig(REN_CONFIG_URL);
+      const { config_url } = await api.characterSettings();
+      const config = await loadCharacterConfig(config_url);
       renderer = createRenderer(config);
       await renderer.mount(container);
     } catch (error) {
-      console.error("[character] Live2D failed to load; using placeholder", error);
+      const detail = `character: falling back to the placeholder (Live2DCubismCore ${
+        typeof (window as { Live2DCubismCore?: unknown }).Live2DCubismCore
+      }) — ${String(error)}`;
+      console.error(detail, error);
       renderer = createRenderer(PLACEHOLDER_CONFIG);
       await renderer.mount(container);
     }
 
-    const unlisten = await onCharacterState((state) => renderer.setState(state));
+    const unlistenState = await onCharacterState((state) => renderer.setState(state));
     renderer.setState(await api.characterState());
+    const unlistenCursor = await onCursorPos((pos) => renderer.focus?.(pos.x, pos.y));
+    const unlistenActive = await onCharacterActive(
+      (active) => renderer.setActive?.(active),
+    );
+
+    // Click head = summon/dismiss the chat panel; drag body = move the window.
+    const onPointerDown = (event: PointerEvent) => {
+      if (event.button !== 0) return;
+      const hit = renderer.hitAt?.(event.clientX, event.clientY);
+      if (hit === "head") props.onHeadTap();
+      if (hit === "body") void api.startDragging().catch(() => undefined);
+    };
+    container.addEventListener("pointerdown", onPointerDown);
+
+    // The click-through mask. Refreshed on a slow tick (the silhouette drifts
+    // with idle motion), and immediately when the panel toggles.
+    const pushMask = () => {
+      const profile = renderer.hitProfile?.(MASK_CELL) ?? null;
+      const solids = Array.from(
+        document.querySelectorAll<HTMLElement>(".bubble-panel"),
+      );
+      void api.setHitMask(buildHitMask(profile, solids)).catch(() => undefined);
+    };
+    pushMask();
+    const maskTimer = setInterval(pushMask, 700);
+    setMaskPusher(() => pushMask);
 
     onCleanup(() => {
-      unlisten();
+      clearInterval(maskTimer);
+      container?.removeEventListener("pointerdown", onPointerDown);
+      unlistenState();
+      unlistenCursor();
+      unlistenActive();
       renderer.destroy();
     });
   });

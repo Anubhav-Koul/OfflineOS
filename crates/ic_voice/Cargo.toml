@@ -1,0 +1,20 @@
+[package]
+name = "ic_voice"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Voice pipeline for the IronClaw desktop app: mic capture, wake word, VAD, whisper STT, Piper TTS, and lip-sync amplitude. A library linked into ic_widget."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+approx = "0.5"
+
+[lints]
+workspace = true

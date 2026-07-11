@@ -681,15 +681,30 @@ capability count) are the browser's, one more extension. `GatewayClient::install
 event before the shell's listener attaches) is covered by storing the last render in
 app state and having the shell fetch it via the `canvas_content` command on mount.
 
-### Voice — deferred, with corrections recorded
+### Voice — decisions made (2026-07-11), build in progress
 
-Voice is **not started**; the plan was pressure-tested and the corrections are in the
-Phase 5 spec above. The genuine decisions (wake-word engine; TTS approach; whether the
-GPL path is acceptable) are the user's and were not made unilaterally. The
-architecture that *is* settled: `crates/ic_voice` should be a **library crate linked
-into `ic_widget`** (it needs `AppHandle` for lip-sync events, the tray mute, and the
-existing `GatewayClient`) — voice is an alternate *input* to the same chat path, not a
-new gateway channel — with **only the TTS engine as a Job-Object-supervised
-subprocess**. `ic_llama::download::Downloader` and `SpawnHook` are directly reusable
-for voice models and the TTS child; `Sidecar`/`release.rs`/`ModelStore` are reusable
-blueprints, not code.
+The plan was pressure-tested and the user made the three genuine calls:
+
+- **Wake word: `rustpotter`** (MIT/Apache, pure Rust, **no ort/ONNX dependency**).
+  Ship our own reference models (trained from recordings of the wake phrase) so the
+  license is clean. openWakeWord is out (its pretrained models are CC-BY-NC).
+- **TTS: the archived `rhasspy/piper` MIT `piper.exe`** — a self-contained binary,
+  bundled and invoked as a Job-Object-supervised subprocess like `llama-server`. **Not**
+  `piper1-gpl` (no binary; GPL). Repo is archived/unmaintained but functional. Pin a
+  specific build and a **CC-BY-4.0 voice** (verify its MODEL_CARD; some voices are
+  non-commercial). Piper emits no timing → compute an **RMS envelope from the output
+  PCM** for lip sync.
+- **VAD: `voice_activity_detector`** (Silero v5 ONNX, MIT). This *does* pull in `ort`
+  even though rustpotter dropped it — so `ort` returns for VAD alone; bundle the ORT
+  DLL beside the exe (`copy-dylibs`) to dodge the System32 clash.
+- **STT: `whisper-rs`** 0.16 (MIT), `base.en` (q5_1), **CPU first** — Vulkan silently
+  no-ops on Windows static builds (whisper.cpp #3750).
+- **Sequencing: build voice fully now** (not a thin slice, not Phase 6 first).
+
+Settled architecture: `crates/ic_voice` is a **library crate linked into `ic_widget`**
+(needs `AppHandle` for lip-sync events, tray mute, and the existing `GatewayClient`) —
+voice is an alternate *input* to the same chat path, not a new gateway channel — with
+**only `piper.exe` as a supervised subprocess**. Reuse `ic_llama::download::Downloader`
+and `SpawnHook` directly for models + the TTS child; `Sidecar`/`release.rs`/`ModelStore`
+are blueprints. Device-change needs a hand-written `IMMNotificationClient` (cpal has no
+API for it). Capture is cpal + `rubato` (downmix mono, resample 48k→16k f32).

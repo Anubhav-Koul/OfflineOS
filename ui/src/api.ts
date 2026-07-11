@@ -239,10 +239,38 @@ export const api = {
   setCharacterSignals: (signals: { listening?: boolean; speaking?: boolean }) =>
     invoke<void>("set_character_signals", signals),
   setHitMask: (mask: HitMask) => invoke<void>("set_hit_mask", { mask }),
+  /** Answer a browser sensitive-fill approval request. */
+  answerBrowserFill: (id: number, approved: boolean) =>
+    invoke<void>("answer_browser_fill", { id, approved }),
   /** Begin an OS window drag — the character's body is the drag handle. */
   startDragging: () => getCurrentWindow().startDragging(),
   logUiError: (message: string) => invoke<void>("log_ui_error", { message }),
 };
+
+/**
+ * A request to type into a sensitive field, needing the user's OK first.
+ *
+ * Enforced in the browser sidecar — the runtime's own approval flow does not run
+ * (see `docs/desktop/core-patches.md`), so this is the real gate on the agent
+ * typing a password or card number. Shows what will be typed and where, because a
+ * consent prompt the user can't evaluate isn't consent.
+ */
+export interface BrowserApproval {
+  id: number;
+  url: string;
+  secure: boolean;
+  field: string;
+  selector: string;
+  value: string;
+  reason: string;
+}
+
+/** Subscribe to browser sensitive-fill approval requests. */
+export function onBrowserApproval(
+  handler: (request: BrowserApproval) => void,
+): Promise<UnlistenFn> {
+  return listen<BrowserApproval>("browser://approval", (event) => handler(event.payload));
+}
 
 /** Subscribe to model-download progress and completion. */
 export function onModelEvent(handler: (event: ModelEvent) => void): Promise<UnlistenFn> {

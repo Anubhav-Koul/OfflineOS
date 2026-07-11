@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use ironclaw_extensions::{
-    ExtensionPackage, ExtensionRuntime, ManifestSource, SharedExtensionRegistry,
+    ExtensionPackage, ExtensionRuntime, ManifestSource, SharedExtensionRegistry, is_loopback_url,
 };
 use ironclaw_host_api::{
     CapabilityId, ExtensionId, NetworkPolicy, NetworkScheme, NetworkTargetPattern,
@@ -104,6 +104,7 @@ impl McpHostHttpEgressPlanner for RegistryMcpEgressPlanner {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HostedMcpEndpoint {
+    scheme: NetworkScheme,
     host_pattern: String,
     port: Option<u16>,
     path: String,
@@ -112,8 +113,20 @@ pub(crate) struct HostedMcpEndpoint {
 impl HostedMcpEndpoint {
     fn parse(url: &str) -> Option<Self> {
         let parsed = url::Url::parse(url).ok()?;
-        if parsed.scheme() != "https"
-            || !parsed.username().is_empty()
+        // core-patch (desktop fork) CP-4: a hosted MCP provider may be a sidecar
+        // on this machine's loopback interface (the desktop fork's browser
+        // automation server). Such a server cannot present a publicly-trusted
+        // TLS certificate, so `https` is unreachable for it. `http` is accepted
+        // for, and only for, a literal loopback address; every remote provider
+        // is still forced onto `https`. A hostname is deliberately not enough —
+        // `is_loopback_url` requires a loopback IP literal, so a DNS name that
+        // could be rebound to a non-loopback address cannot slip through.
+        let scheme = match parsed.scheme() {
+            "https" => NetworkScheme::Https,
+            "http" if is_loopback_url(&parsed) => NetworkScheme::Http,
+            _ => return None,
+        };
+        if !parsed.username().is_empty()
             || parsed.password().is_some()
             || parsed.query().is_some()
             || parsed.fragment().is_some()
@@ -121,14 +134,21 @@ impl HostedMcpEndpoint {
             return None;
         }
         Some(Self {
+            scheme,
             host_pattern: parsed.host_str()?.to_ascii_lowercase(),
             port: parsed.port(),
             path: normalize_mcp_path(parsed.path()),
         })
     }
 
+    /// Whether this endpoint is the loopback exemption opened by CP-4, rather
+    /// than an ordinary remote `https` provider.
+    fn is_loopback(&self) -> bool {
+        self.scheme == NetworkScheme::Http
+    }
+
     fn allows_target(&self, target: &NetworkTargetPattern) -> bool {
-        target.scheme == Some(NetworkScheme::Https)
+        target.scheme == Some(self.scheme)
             && target.host_pattern.eq_ignore_ascii_case(&self.host_pattern)
             && target.port == self.port
     }
@@ -176,13 +196,20 @@ fn normalize_mcp_path(path: &str) -> String {
 fn hosted_mcp_network_policy(endpoint: &HostedMcpEndpoint) -> NetworkPolicy {
     NetworkPolicy {
         allowed_targets: vec![NetworkTargetPattern {
-            scheme: Some(NetworkScheme::Https),
+            scheme: Some(endpoint.scheme),
             host_pattern: endpoint.host_pattern.clone(),
             port: endpoint.port,
         }],
         // Matches the bundled manifest's deny_private_ip_ranges default.
         // Dispatcher would reject anyway, but the plan must agree.
-        deny_private_ip_ranges: true,
+        //
+        // core-patch (desktop fork) CP-4: a loopback endpoint IS a private
+        // address, so denying private ranges would deny the very target this
+        // plan just allowed. The exemption is narrow by construction — the
+        // allowlist holds exactly one target, and `HostedMcpEndpoint::parse`
+        // only produces `Http` for a loopback IP literal. A remote provider is
+        // still `Https` and still denied every private range.
+        deny_private_ip_ranges: !endpoint.is_loopback(),
         max_egress_bytes: Some(MCP_NETWORK_EGRESS_LIMIT),
     }
 }
@@ -404,6 +431,79 @@ mod tests {
         let endpoint = HostedMcpEndpoint::parse(NOTION_MCP_URL).unwrap();
         assert!(hosted_mcp_url_allowed(
             "https://mcp.notion.com/mcp/",
+            &endpoint
+        ));
+    }
+
+    // ── CP-4: the loopback exemption, and its fences ──────────────────────
+
+    #[test]
+    fn cp4_a_loopback_http_endpoint_is_accepted_and_waives_private_ip_denial() {
+        let endpoint = HostedMcpEndpoint::parse("http://127.0.0.1:8931/mcp")
+            .expect("a loopback http MCP sidecar is reachable under CP-4");
+        assert_eq!(endpoint.scheme, NetworkScheme::Http);
+        assert!(endpoint.is_loopback());
+
+        let policy = hosted_mcp_network_policy(&endpoint);
+        // Denying private ranges here would deny the one target we just allowed.
+        assert!(!policy.deny_private_ip_ranges);
+        assert_eq!(policy.allowed_targets.len(), 1);
+        assert_eq!(policy.allowed_targets[0].scheme, Some(NetworkScheme::Http));
+        assert_eq!(policy.allowed_targets[0].host_pattern, "127.0.0.1");
+        assert_eq!(policy.allowed_targets[0].port, Some(8931));
+    }
+
+    #[test]
+    fn cp4_ipv6_loopback_is_also_accepted() {
+        let endpoint =
+            HostedMcpEndpoint::parse("http://[::1]:8931/mcp").expect("::1 is loopback too");
+        assert!(endpoint.is_loopback());
+        assert!(!hosted_mcp_network_policy(&endpoint).deny_private_ip_ranges);
+    }
+
+    #[test]
+    fn cp4_http_is_refused_for_every_non_loopback_host() {
+        // The whole point of the patch: `http` buys nothing except loopback.
+        for url in [
+            "http://mcp.notion.com/mcp",     // a real remote provider
+            "http://192.168.1.10/mcp",       // private LAN, but not loopback
+            "http://10.0.0.5/mcp",           // ditto
+            "http://169.254.169.254/mcp",    // cloud metadata — the classic SSRF target
+            "http://localhost:8931/mcp",     // a DNS name, not an IP literal: rebindable
+            "http://127.0.0.1.evil.com/mcp", // a remote host that merely looks loopback
+        ] {
+            assert!(
+                HostedMcpEndpoint::parse(url).is_none(),
+                "CP-4 must not accept {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn cp4_a_remote_https_provider_still_denies_private_ranges() {
+        // Regression fence: the exemption must not leak into the remote lane.
+        let endpoint = HostedMcpEndpoint::parse(NOTION_MCP_URL).expect("parse");
+        assert!(!endpoint.is_loopback());
+        assert!(hosted_mcp_network_policy(&endpoint).deny_private_ip_ranges);
+    }
+
+    #[test]
+    fn cp4_a_loopback_endpoint_does_not_match_a_same_host_https_target() {
+        // Scheme is part of the endpoint identity, so an `http` loopback plan
+        // cannot be reused to authorize an `https` request to the same host:port
+        // (or the reverse).
+        let endpoint = HostedMcpEndpoint::parse("http://127.0.0.1:8931/mcp").expect("parse");
+        assert!(!hosted_mcp_url_allowed(
+            "https://127.0.0.1:8931/mcp",
+            &endpoint
+        ));
+        assert!(hosted_mcp_url_allowed(
+            "http://127.0.0.1:8931/mcp",
+            &endpoint
+        ));
+        // A different loopback port is a different endpoint.
+        assert!(!hosted_mcp_url_allowed(
+            "http://127.0.0.1:9999/mcp",
             &endpoint
         ));
     }

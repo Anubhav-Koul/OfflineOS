@@ -275,6 +275,45 @@ button.ghost {
   color: var(--text);
 }
 
+/* A sensitive-fill prompt is a stronger warning than a normal gate: it is the
+   only thing between the agent and the user's password. Red, not amber. */
+.gate-fill {
+  border-color: var(--danger, #d1524a);
+  background: rgba(209, 82, 74, 0.1);
+  margin-top: 8px;
+}
+.fill-row {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  margin-bottom: 4px;
+}
+.fill-label {
+  flex: 0 0 40px;
+  color: var(--muted);
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+.fill-value {
+  flex: 1 1 auto;
+  word-break: break-all;
+}
+.fill-value.fill-text {
+  font-family: ui-monospace, monospace;
+  background: rgba(0, 0, 0, 0.25);
+  padding: 1px 4px;
+  border-radius: 4px;
+}
+.fill-value.insecure {
+  color: var(--danger, #d1524a);
+}
+.fill-reason {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
 .composer {
   display: flex;
   gap: 8px;

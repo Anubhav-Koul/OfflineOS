@@ -413,7 +413,13 @@ pub use host_api::capability_provider::{
     CAPABILITY_PROVIDER_HOST_API_ID, CAPABILITY_PROVIDER_SECTION, CapabilityProviderHostApiContract,
 };
 pub use hosted_mcp_discovery::{
-    HostedMcpDiscoveredTool, HostedMcpDiscoveredToolAnnotations, is_hosted_http_mcp_package,
+    HostedMcpDiscoveredTool,
+    HostedMcpDiscoveredToolAnnotations,
+    is_hosted_http_mcp_package,
+    // core-patch (desktop fork) CP-4: shared with the composition layer so the
+    // discovery gate and the egress-planning gate cannot drift on what counts
+    // as loopback.
+    is_loopback_url,
     package_with_discovered_hosted_mcp_tools,
 };
 pub use v2::{

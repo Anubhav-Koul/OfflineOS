@@ -12,12 +12,14 @@ import {
 
 import {
   api,
+  onBrowserApproval,
   onCharacterActive,
   onCharacterState,
   onChatEvent,
   onCursorPos,
   onGatewayState,
   TERMINAL_PHASES,
+  type BrowserApproval,
   type ChatEvent,
   type GatewayState,
   type HitMask,
@@ -172,6 +174,9 @@ function App() {
   const [phase, setPhase] = createSignal<RunPhase | null>(null);
   const [activity, setActivity] = createSignal<string | null>(null);
   const [gate, setGate] = createSignal<Gate | null>(null);
+  // Sensitive-fill approvals queue: a page may ask for several in a row, and each
+  // must be answered explicitly, so they are not collapsed into one.
+  const [fills, setFills] = createSignal<BrowserApproval[]>([]);
   const [gateway, setGateway] = createSignal<GatewayState>({ state: "starting" });
   const [panelOpen, setPanelOpen] = createSignal(true);
 
@@ -293,9 +298,16 @@ function App() {
       void ensureThread(state);
     });
     const unlistenChat = await onChatEvent(handleChatEvent);
+    const unlistenFill = await onBrowserApproval((request) => {
+      // A sensitive fill needs a decision now; force the panel open so the prompt
+      // is visible even if the user had collapsed it, the same as a tool gate.
+      setFills((current) => [...current, request]);
+      setPanelOpen(true);
+    });
     onCleanup(() => {
       unlistenState();
       unlistenChat();
+      unlistenFill();
       clearTimeout(speakingTimer);
     });
 
@@ -350,6 +362,17 @@ function App() {
     setGate(null);
     try {
       await api.resolveGate(id, pending.runId, pending.gateRef, approved);
+    } catch (error) {
+      push({ role: "error", text: `Could not answer: ${error}` });
+    }
+  }
+
+  async function answerFill(request: BrowserApproval, approved: boolean) {
+    // Drop it from the queue first: the decision is made, and a double-click must
+    // not send two answers for one request.
+    setFills((current) => current.filter((pending) => pending.id !== request.id));
+    try {
+      await api.answerBrowserFill(request.id, approved);
     } catch (error) {
       push({ role: "error", text: `Could not answer: ${error}` });
     }
@@ -414,6 +437,47 @@ function App() {
                 </div>
               )}
             </Show>
+
+            {/*
+              Sensitive-fill approval. Shows what will be typed and where — a
+              consent prompt the user can't evaluate isn't consent. Default focus
+              is Deny: the safe answer should be the easy one.
+            */}
+            <For each={fills()}>
+              {(request) => (
+                <div class="gate gate-fill">
+                  <div class="gate-headline">The agent wants to type into a field</div>
+                  <div class="gate-body">
+                    <div class="fill-row">
+                      <span class="fill-label">Field</span>
+                      <span class="fill-value">{request.field}</span>
+                    </div>
+                    <div class="fill-row">
+                      <span class="fill-label">On</span>
+                      <span class="fill-value" classList={{ insecure: !request.secure }}>
+                        {request.url}
+                        {!request.secure ? " (not secure)" : ""}
+                      </span>
+                    </div>
+                    <div class="fill-row">
+                      <span class="fill-label">Text</span>
+                      <span class="fill-value fill-text">{request.value}</span>
+                    </div>
+                    <Show when={request.reason}>
+                      <div class="fill-reason">{request.reason}</div>
+                    </Show>
+                  </div>
+                  <div class="gate-actions">
+                    <button class="deny" onClick={() => void answerFill(request, false)}>
+                      Don't type
+                    </button>
+                    <button class="approve" onClick={() => void answerFill(request, true)}>
+                      Type it
+                    </button>
+                  </div>
+                </div>
+              )}
+            </For>
           </div>
 
           <form class="composer" onSubmit={send}>

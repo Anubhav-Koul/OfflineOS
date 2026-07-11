@@ -126,6 +126,93 @@ impl GatewayClient {
         Ok(response.automations)
     }
 
+    /// Install an extension the gateway found in its catalogue.
+    ///
+    /// The catalogue is scanned **once, at gateway boot**, so this only works for
+    /// a manifest that was already on disk when the process started. Installing
+    /// an extension that is already installed is not an error.
+    pub async fn install_extension(&self, id: &str) -> Result<()> {
+        let body = serde_json::json!({
+            "package_ref": { "kind": "extension", "id": id },
+        });
+        let _: serde_json::Value = self.post("/extensions/install", &body).await?;
+        Ok(())
+    }
+
+    /// Activate an installed extension, publishing its capabilities to the agent.
+    ///
+    /// For a hosted-MCP provider this is also **when tool discovery runs**: the
+    /// gateway calls the provider's `tools/list` and rebuilds its capabilities
+    /// from the result. So the provider must be reachable *now*.
+    ///
+    /// It must be called on every launch, not just the first. A gateway restart
+    /// republishes the *bundled manifest* — which for an MCP provider carries only
+    /// a capability template, not the discovered tools — so without re-activating,
+    /// the agent comes back up with no working tools.
+    ///
+    /// Returns whether the gateway reports the extension as activated. A discovery
+    /// failure is **not** an error here: the gateway silently falls back to the
+    /// bundled manifest and still answers `activated: true`. Confirm with
+    /// [`GatewayClient::extension_capabilities`] rather than trusting this alone.
+    pub async fn activate_extension(&self, id: &str) -> Result<bool> {
+        let response: serde_json::Value = self
+            .post(
+                &format!("/extensions/{id}/activate"),
+                &serde_json::json!({}),
+            )
+            .await?;
+        Ok(response
+            .get("activated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false))
+    }
+
+    /// The capability ids an installed extension currently exposes.
+    ///
+    /// This is the only honest check that discovery worked — see
+    /// [`GatewayClient::activate_extension`] for why a successful activation does
+    /// not imply the tools are there.
+    pub async fn extension_capabilities(&self, id: &str) -> Result<Vec<String>> {
+        let response: serde_json::Value = self.get("/extensions").await?;
+        let extensions = response
+            .get("extensions")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        let Some(extension) = extensions.into_iter().find(|extension| {
+            extension
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    extension
+                        .get("package_ref")
+                        .and_then(|package| package.get("id"))
+                        .and_then(serde_json::Value::as_str)
+                })
+                == Some(id)
+        }) else {
+            return Ok(Vec::new());
+        };
+
+        Ok(extension
+            .get("capabilities")
+            .and_then(serde_json::Value::as_array)
+            .map(|capabilities| {
+                capabilities
+                    .iter()
+                    .filter_map(|capability| {
+                        capability
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .or_else(|| capability.as_str())
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     /// Send a user message, starting a turn.
     ///
     /// `client_action_id` is the idempotency key: replaying the *same* id after

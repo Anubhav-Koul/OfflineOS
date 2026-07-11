@@ -33,7 +33,7 @@ use ic_widget::hit_test::HitMask;
 use ic_widget::settings::{CharacterId, ProviderSelection, SettingsStore};
 use ic_widget::supervisor::{GatewayConfig, GatewayState, GatewaySupervisor};
 use ic_widget::window_state::{LayoutHash, MonitorInfo, WindowPosition};
-use ic_widget::{ProcessJob, RunPhase, SecretStore, WindowState, WindowStateStore};
+use ic_widget::{BrowserSidecar, ProcessJob, RunPhase, SecretStore, WindowState, WindowStateStore};
 use serde::Serialize;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
@@ -73,6 +73,11 @@ struct AppState {
     /// inference. Held for its `Drop`, which stops the sidecar and its proxy;
     /// the sidecar also rides in `job`, so a hard kill takes it down too.
     local_llm: Mutex<Option<LocalLlm>>,
+    /// The browser MCP sidecar. `None` when no Chrome/Edge was found or the
+    /// sidecar failed to start — the agent then simply has no browser tools.
+    /// Held for its `Drop`; it also rides in `job`, so a hard kill of the widget
+    /// takes the sidecar *and* its automation browser down with it.
+    browser: Mutex<Option<BrowserSidecar>>,
     /// The in-flight model download, if any: its model id and task handle. One
     /// at a time. Aborting the handle stops the transfer; the partial `.part`
     /// file survives and resumes on the next attempt, so an abort is a safe
@@ -271,6 +276,27 @@ async fn resolve_gate(
         .resolve_gate(&thread_id, &run_id, &gate_ref, resolution)
         .await
         .map_err(user_facing)
+}
+
+/// Answer a browser sensitive-fill approval request.
+///
+/// The `id` comes from the `browser://approval` event. Clearing the character's
+/// concerned state here is optimistic — if more approvals are queued the next
+/// event re-sets it — but a single pending fill is by far the common case.
+#[tauri::command]
+async fn answer_browser_fill(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: u64,
+    approved: bool,
+) -> Result<(), String> {
+    let answered = match &*state.browser.lock().await {
+        Some(sidecar) => sidecar.answer_fill(id, approved).await,
+        // No sidecar means nothing is waiting; the fill already denied on timeout.
+        None => Ok(()),
+    };
+    update_character(&app, |inputs| inputs.browser_approval_pending = false).await;
+    answered
 }
 
 // ----------------------------------------------------------- dashboard panels
@@ -1448,6 +1474,31 @@ async fn bring_up_gateway(app: AppHandle, selection: ProviderSelection) {
     // and proxy on a graceful exit. Storing `None` drops any previous model.
     *app.state::<AppState>().local_llm.lock().await = local;
 
+    // The browser sidecar must come up BEFORE the gateway, for two reasons: the
+    // gateway scans its extension catalogue exactly once at boot, and the
+    // manifest we write carries the sidecar's live port. A manifest written after
+    // the gateway starts is invisible until the next restart.
+    //
+    // Best-effort: no browser on the machine means no browser tools, not a failed
+    // launch. Storing `None` drops any previous sidecar (and its Chrome).
+    if let Ok(home) = reborn_home() {
+        // Surface each sensitive-fill approval request to the UI. The character
+        // goes `concerned` alongside, the same as a tool gate.
+        let sink: ic_widget::browser::ApprovalSink = {
+            let handle = app.clone();
+            Arc::new(move |request| {
+                let _ = handle.emit("browser://approval", &request);
+                let handle = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    update_character(&handle, |inputs| inputs.browser_approval_pending = true)
+                        .await;
+                });
+            })
+        };
+        let sidecar = ic_widget::browser::start(job.clone(), &home, sink).await;
+        *app.state::<AppState>().browser.lock().await = sidecar;
+    }
+
     let started = async {
         let token = SecretStore::new()
             .gateway_token()
@@ -1464,6 +1515,14 @@ async fn bring_up_gateway(app: AppHandle, selection: ProviderSelection) {
     match started {
         Ok(gateway) => {
             tracing::info!(base_url = gateway.client().base_url(), "gateway is ready");
+
+            // Publish the browser tools to the agent. This has to happen against
+            // the *running* gateway and on *every* launch: activation is when the
+            // gateway calls the sidecar's `tools/list`, and a restart republishes
+            // only the bundled capability template, not the discovered tools.
+            if app.state::<AppState>().browser.lock().await.is_some() {
+                ic_widget::browser::register(gateway.client()).await;
+            }
 
             // Mirror every later transition onto the UI.
             let mut states = gateway.subscribe();
@@ -1599,6 +1658,7 @@ fn main() {
             cancel_run,
             fetch_timeline,
             resolve_gate,
+            answer_browser_fill,
             list_threads,
             list_automations,
             local_model_status,
@@ -1629,6 +1689,7 @@ fn main() {
                 job: Arc::clone(&job),
                 pump: Mutex::new(None),
                 local_llm: Mutex::new(None),
+                browser: Mutex::new(None),
                 download: Mutex::new(None),
                 window_state: std::sync::Mutex::new(window_state),
                 window_store: store,

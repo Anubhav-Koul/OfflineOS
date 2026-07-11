@@ -38,6 +38,9 @@ tauri-build = { version = "2", optional = true }
 
 [dependencies]
 ic_llama = { path = "../ic_llama" }
+# The browser sidecar: the widget spawns it, and shares its manifest/tool
+# catalogue so the extension id and tool names cannot drift between the two.
+ic_browser_mcp = { path = "../ic_browser_mcp" }
 
 tokio = { version = "1", features = [
     "fs",

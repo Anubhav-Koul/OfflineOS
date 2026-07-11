@@ -98,12 +98,37 @@ fn valid_hosted_mcp_url(url: &str) -> bool {
     let Ok(parsed) = url::Url::parse(url) else {
         return false;
     };
-    parsed.scheme() == "https"
+    valid_hosted_mcp_scheme(&parsed)
         && parsed.username().is_empty()
         && parsed.password().is_none()
         && parsed.host_str().is_some()
         && parsed.query().is_none()
         && parsed.fragment().is_none()
+}
+
+// core-patch (desktop fork) CP-4: a hosted MCP provider may also be a sidecar on
+// this machine's loopback interface. Such a server cannot present a
+// publicly-trusted TLS certificate, so `https` is impossible for it; requiring
+// it would make an on-device MCP provider unreachable. `http` is therefore
+// accepted for, and only for, a literal loopback address — every remote
+// provider is still forced onto `https`. A hostname is deliberately NOT
+// sufficient (`localhost` is a DNS name and could be rebound); the host must
+// parse as a loopback IP literal.
+fn valid_hosted_mcp_scheme(url: &url::Url) -> bool {
+    match url.scheme() {
+        "https" => true,
+        "http" => is_loopback_url(url),
+        _ => false,
+    }
+}
+
+/// Whether `url`'s host is a literal loopback IP (`127.0.0.0/8` or `::1`).
+pub fn is_loopback_url(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        _ => false,
+    }
 }
 
 fn hosted_mcp_capability_template(
@@ -218,6 +243,38 @@ fn discovered_tool_requires_external_write(
 
 fn invalid_hosted_mcp_manifest(reason: String) -> ExtensionError {
     ExtensionError::InvalidManifest { reason }
+}
+
+#[cfg(test)]
+mod cp4_loopback_tests {
+    use super::*;
+
+    #[test]
+    fn a_loopback_http_url_is_valid_and_a_remote_http_url_is_not() {
+        assert!(valid_hosted_mcp_url("http://127.0.0.1:8931/mcp"));
+        assert!(valid_hosted_mcp_url("http://[::1]:8931/mcp"));
+        assert!(valid_hosted_mcp_url("https://mcp.notion.com/mcp"));
+
+        // `http` buys nothing except loopback. `localhost` is a DNS name, not an
+        // IP literal, so it is refused: only an address that cannot be rebound
+        // qualifies.
+        for url in [
+            "http://mcp.notion.com/mcp",
+            "http://localhost:8931/mcp",
+            "http://192.168.1.10/mcp",
+            "http://169.254.169.254/mcp",
+            "ftp://127.0.0.1/mcp",
+        ] {
+            assert!(!valid_hosted_mcp_url(url), "must not accept {url}");
+        }
+    }
+
+    #[test]
+    fn a_loopback_url_still_rejects_credentials_and_extra_components() {
+        assert!(!valid_hosted_mcp_url("http://user@127.0.0.1:8931/mcp"));
+        assert!(!valid_hosted_mcp_url("http://127.0.0.1:8931/mcp?token=x"));
+        assert!(!valid_hosted_mcp_url("http://127.0.0.1:8931/mcp#frag"));
+    }
 }
 
 #[cfg(test)]

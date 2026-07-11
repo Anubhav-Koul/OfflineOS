@@ -100,10 +100,13 @@ The widget becomes an **animated anime-style character** standing on the desktop
 6. Performance: Ren is heavyweight (4096px texture, offscreen rendering). Cap FPS ~30, pause animation when hidden or a fullscreen app is foreground, measure GPU alongside llama.cpp on iGPU-only machines.
 7. Licensing gates before public release: verify Live2D Cubism Web SDK license tier for our distribution size; check any marketplace model's redistribution terms; drop dev-only sprite art.
 
-### Phase 4 — Browser automation (`crates/ic_browser_mcp`)
-1. Standalone MCP server (stdio) wrapping `chromiumoxide`: `browser_navigate`, `browser_get_text`, `browser_find`, `browser_fill`, `browser_click`, `browser_screenshot`.
-2. Launch a dedicated browser profile with `--remote-debugging-port` (probe registry: Chrome → Edge; Edge is guaranteed on Win10+). Never attach to the user's running profile by default.
-3. Register with IronClaw through its MCP config. Sensitive actions (fill on password/payment fields) must route through the approval flow.
+### Phase 4 — Browser automation (`crates/ic_browser_mcp`) ✅ (see notes below)
+
+⚠️ **Step 1 and step 3 below were wrong** — stdio MCP does not work against Reborn. Corrected in the Phase 4 notes at the bottom; read those, not this list.
+
+1. ~~Standalone MCP server (stdio)~~ → **streamable-HTTP MCP server on loopback** wrapping `chromiumoxide`: `browser_navigate`, `browser_get_text`, `browser_find`, `browser_fill`, `browser_click`, `browser_screenshot`.
+2. Launch a dedicated browser profile (probe registry: Chrome → Edge; Edge is guaranteed on Win10+). Never attach to the user's running profile by default.
+3. ~~Register with IronClaw through its MCP config.~~ → **host-bundled extension manifest + CP-4**. Sensitive actions route through the approval flow (every discovered MCP tool is `default_permission: Ask`, hardcoded upstream).
 4. CAPTCHAs/logins: pause, notify via widget (character `concerned` state), let user complete, resume. Selector failures: screenshot → vision-capable model fallback.
 
 ### Phase 5 — Voice (`crates/ic_voice`) + Canvas
@@ -431,3 +434,198 @@ IronClaw core crate was touched.
   no art; the placeholder remains the no-assets fallback.
 
 Next: **Phase 4 — browser automation** (`crates/ic_browser_mcp`).
+
+## Phase 4 notes — browser automation (done, recorded 2026-07-11)
+
+`crates/ic_browser_mcp` (new) + `crates/ic_widget` (`browser.rs`, `gateway_client`,
+`main.rs`) + **one core patch, CP-4** (`docs/desktop/core-patches.md`). Verified
+against real Chrome: navigate, read, find, click, screenshot, and a recoverable
+missing-selector error all round-trip through the MCP server.
+
+### The plan above was wrong: stdio MCP does not work in Reborn
+
+`ironclaw_mcp` **hard-rejects `transport = "stdio"`** — *"unsupported until
+process-level egress controls land"* — and spawns no processes at all. The stdio
+docs in `docs/capabilities/mcp.md` describe the **legacy v1 binary**, not Reborn.
+The trap is that a stdio manifest **parses, installs, and activates cleanly**, then
+fails at *every* `tools/call`. It looks wired, then dies at runtime.
+
+Loopback HTTP — the obvious fallback — was blocked too: the hosted-MCP lane forced
+`https` (impossible for a sidecar, which cannot hold a publicly-trusted cert) and
+planned egress with `deny_private_ip_ranges: true` (which denies `127.0.0.1`). No
+config, env var, or profile — **including `local-dev-yolo`** — relaxes either.
+
+So **some** core edit was unavoidable. Every alternative was measured first: a WASM
+shim hits the same wall one seam over (`extension_surface.rs` hardcodes the same
+flag for *every* extension capability — wider blast radius); a native first-party
+tool means patching `factory.rs` *and* `ironclaw_first_party_extensions` and pulling
+`chromiumoxide` into core; executing browser tools inside the `ic_llama` SchemaProxy
+(CP-3 style) would bypass the safety layer and approval flow entirely. **CP-4** is
+the smallest cut and lands on the lane upstream already supports: `http` is accepted
+for, and only for, a **literal loopback IP** (not `localhost` — a DNS name is
+rebindable), and private-range denial is waived for exactly that one endpoint.
+
+### What we got for free by riding the supported lane
+
+- **Schemas come from the live `tools/list`.** Reborn *discards* the manifest's
+  capability declarations and rebuilds every capability from our `inputSchema`
+  (`hosted_mcp_discovery.rs`). So `protocol::Tool::input_schema` **is** the
+  agent-facing tool signature, and there are no schema files to keep in sync.
+- **Approval gating is enforced in the sidecar, not the runtime.** The runtime's
+  own approval flow is a no-op — `default_permission: Ask` is hardcoded for every
+  discovered MCP tool and **nothing reads it** (see the security section below). So
+  `browser_fill` routes sensitive fields through a human via the sidecar's consent
+  gate. This is the one claim here that is *not* free from the hosted-MCP lane; we
+  built it.
+- **Annotations are load-bearing, not cosmetic.** `readOnlyHint`/`destructiveHint`
+  are what promote a tool to `EffectKind::ExternalWrite`. `browser_fill` and
+  `browser_click` are annotated destructive — that is what makes "submit this form"
+  a write effect rather than a read.
+
+### 🟠 SECURITY — Reborn has no tool-approval prompt; we gate in the sidecar (closed)
+
+**The runtime never prompts before a tool runs.** Left alone, `browser_fill` would
+type into password and payment fields with no user prompt, on the default profile,
+with nothing switched on. That would break Phase 4 step 3 ("sensitive actions must
+route through the approval flow"). **The gap is closed in the sidecar** — see "The
+consent gate" below — but the underlying runtime finding stands and is worth
+recording, because anything else we build on discovered MCP tools inherits it.
+Verified, not inferred:
+
+- `default_permission` is **never read** anywhere in the workspace. Every occurrence
+  is a manifest literal, a struct-literal write, a field-to-field copy, or a test
+  assertion. There is no `match`/`==`/`if` on it in any decision path.
+- `Decision::RequireApproval` has **zero production producers**. The only authorizer
+  wired into Reborn composition is `GrantAuthorizer` (`factory.rs:648`, and 4 more
+  sites), and it returns only `Allow` or `Deny` (`ironclaw_authorization/src/lib.rs`,
+  `authorize_from_grants_with_authority_ceiling`). `LeaseBackedAuthorizer` — the one
+  that *could* require approval — exists but is **never wired in**.
+- `ActiveExtensionCapability` (`extension_lifecycle.rs:54`) has **no
+  `default_permission` field at all**; `from_descriptor` discards it. Then
+  `extension_surface.rs:55` mints every active capability a standing grant with
+  `expires_at: None`, `max_invocations: None`, and `allowed_effects` = its own
+  declared effects. So `ExternalWrite` clears its own ceiling.
+
+The approval machinery downstream (`CapabilityHost`'s `RequireApproval` arm,
+`ironclaw_approvals`, `resolve_gate`) is fully built and simply **unreachable**. The
+gates the widget *does* handle are **auth** gates (product-auth / credential setup),
+not tool approvals — which is why this was easy to mistake for a working gate.
+
+So there is no "prompt fatigue" switch to worry about, because **there is no prompt
+to lose**, and no per-capability policy surface in which to pin one. `ExternalWrite`
+only widens the effect list; it forces nothing. `ironclaw_safety` contains no
+approval-forcing code. `local-dev-yolo` changes filesystem/network/secrets, not
+approvals — there are none to change.
+
+**Consequence for us:** the approval requirement cannot be met by riding the
+runtime — see the consent gate below for how it is met instead. And it was reported
+upstream (privately-first: [#6000](https://github.com/nearai/ironclaw/issues/6000)
+asks how to disclose, since the repo has no `SECURITY.md` and private reporting is
+disabled). If upstream wires `Decision::RequireApproval` for `Ask` capabilities, the
+sidecar gate becomes defence-in-depth rather than the only line.
+
+### The consent gate (how step 3 is actually met)
+
+`ic_browser_mcp::consent` + `::classify`. Sensitive fills route through a human
+**in the sidecar** — the last boundary the model cannot route around, because the
+sidecar decides, not the prompt (the same move as CP-3). Enforced in
+`BrowserSession::fill`: classify → ask → *then* type, so a denied fill never touches
+the page.
+
+- **Fail closed, everywhere.** The classifier has three outcomes, not two —
+  `Sensitive`, `Benign`, `Unknown` — and **both `Sensitive` and `Unknown` ask**.
+  Only a positively-ordinary field types without a prompt. A probe that throws, a
+  selector that matches nothing, a shadow-DOM/custom element, an unrecognised input
+  type, or a `type="text"` field inside a form that holds a password → all ask. An
+  unnecessary prompt is annoying; a missed one is the whole gap back. The hinge is
+  `Sensitivity::needs_approval` (`Unknown → true`); flipping it reopens the gap.
+- **The channel is the sidecar's stdout/stdin**, which the widget already owns as
+  the parent process — no new port, no auth to get wrong. `IC_BROWSER_MCP_APPROVAL`
+  out, `IC_BROWSER_MCP_DECISION` in. Every non-yes is a no: no channel (standalone
+  sidecar → `DenyAll`), timeout, closed pipe, malformed answer, answer for a
+  different request.
+- **The prompt shows what will be typed and where** (field label + URL + the value,
+  and flags non-HTTPS) — a consent prompt the user can't evaluate isn't consent. The
+  widget surfaces it as a red prompt distinct from a normal amber gate, defaulting to
+  the safe answer, and the character goes `concerned`.
+- **The value never reaches a log** (`FillApproval::redacted`).
+- Verified against real Chrome (`tests/real_browser.rs`, `--ignored`) *and* end to
+  end through the real sidecar binary's stdout/stdin channel: ordinary field silent,
+  password field prompts, deny types nothing, approve types.
+- A denial is a **recoverable** `isError`, not a crash — the agent reports it and
+  moves on.
+
+### Three timing rules, or you get an extension with no tools
+
+Each one is silent when violated. All three are encoded in `ic_widget::browser`:
+
+1. **The extension catalogue is scanned once, at `serve` boot.** The manifest must
+   be on disk *before* the gateway starts — so the sidecar launches first and its
+   live port is written into the manifest's `url`.
+2. **Discovery runs at *activation*, not at boot.** The gateway calls our
+   `tools/list` when the extension is activated, so the sidecar must be listening
+   then, and activation is driven against the **running** gateway.
+3. **A restart does not re-discover.** `restore_extension_lifecycle_state`
+   republishes the *bundled manifest*, which carries only a capability **template**
+   — not the six tools. So the widget re-activates on **every** launch.
+
+And a discovery failure makes the gateway **silently** fall back to that template
+*while still reporting `activated: true`*. So the widget verifies the capability
+count rather than trusting the activation response.
+
+### The bug every unit test passed
+
+The unit tests fill the `ToolExecutor` seam with a fake, so they exercise the MCP
+transport and never touch CDP. The CDP layer was dead on arrival against current
+Chrome: it emits events `chromiumoxide` 0.7 cannot deserialize, the event pump
+treated the first one as fatal and exited, the handler dropped — and every tool call
+failed with *"send failed because receiver is gone"*, ~60 ms after a launch that
+reported success. **A green suite and a browser that never worked.** The pump now
+logs an unparseable event and keeps pumping. Pinned by
+`tests/real_browser.rs` (`#[ignore]`d — run with `--ignored`; it needs a browser).
+
+### Other decisions worth keeping
+
+- **Screenshots are viewport JPEGs, not full-page PNGs.** The host caps an MCP
+  result at 1 MiB and base64 inflates by a third; a full-page PNG of a real site
+  blows the budget and fails with an opaque `response_error`. A q70 viewport JPEG of
+  example.com is ~15 KiB.
+- **A missing selector is a *recoverable* `isError` result, not a JSON-RPC error.**
+  The model must see it and try another selector; a JSON-RPC error fails the whole
+  capability. Only a genuinely broken browser is an error.
+- **The sidecar rides in the widget's Job Object**, so a hard kill takes the
+  automation browser down too — an orphaned Chrome would hold a profile lock and a
+  port. `BrowserSession`'s `Drop` deliberately does *not* call
+  `Browser::close()`/`kill()`: both are `async`, and the discarded future closed
+  nothing while reading like a graceful shutdown.
+- **The automation browser never touches the user's real profile** — a dedicated
+  user-data dir, so the agent only ever has access to what the user logs into inside
+  the automation window themselves.
+
+`cargo test -p ic_integration_tests --test browser_mcp_contract` is the gate: it
+drives the real sidecar over HTTP and feeds its `tools/list` through the runtime's
+**own** discovery code, so it fails if IronClaw would refuse us — rather than
+re-asserting our own beliefs about IronClaw back at ourselves.
+
+**Known-unrelated failures:** three `ironclaw_reborn_composition` tests
+(`local_yolo_policy_*`, `local_dev_yolo_shell_*`) fail on Windows with *"backslashes
+are not allowed"*. Pre-existing upstream bug, confirmed failing with our core changes
+stashed, and filed as
+**[nearai/ironclaw#5999](https://github.com/nearai/ironclaw/issues/5999)**. Not caused
+by CP-4. Root cause: `build_workspace_filesystems` passes a **host path** where a
+`MountAlias` (a `/`-rooted POSIX string) is expected — so it is not really a
+UNC/`\\?\` issue at all; a plain `C:\...` fails the same two checks. It bites only
+the yolo path, because the ambient alias is built only under `--confirm-host-access`.
+**`local-dev-yolo` is therefore completely unusable on Windows** (`ironclaw-reborn
+serve --confirm-host-access` fails during runtime assembly) — we don't use that
+profile, so it does not block us.
+
+### Upstream issues filed from this phase
+
+| Issue | What | Why we care |
+|---|---|---|
+| [#5998](https://github.com/nearai/ironclaw/issues/5998) | No transport for a local MCP server (stdio rejected, loopback denied) | **CP-4 gets deleted when this lands** — see `core-patches.md` |
+| [#5999](https://github.com/nearai/ironclaw/issues/5999) | `local-dev-yolo` can't start on Windows (host path used as `MountAlias`) | Explains 3 red tests in our baseline; not ours |
+
+Next: **Phase 5 — voice (`crates/ic_voice`) + canvas**. The Phase 3 lip-sync
+test-tone stub is still the seam TTS amplitude replaces.

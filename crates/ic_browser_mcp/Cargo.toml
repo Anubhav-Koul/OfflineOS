@@ -1,0 +1,54 @@
+[package]
+name = "ic_browser_mcp"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Browser automation sidecar for the IronClaw desktop app: drives Chrome/Edge over CDP and serves the six browser tools on a loopback socket."
+
+[[bin]]
+name = "ic-browser-mcp"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# CDP browser control. `tokio-runtime` selects the tokio async backend; no TLS
+# feature — CDP to a local browser is a plain loopback WebSocket.
+chromiumoxide = { version = "0.7", default-features = false, features = [
+    "tokio-runtime",
+] }
+# The MCP transport. Same major version the gateway already uses, so the
+# workspace resolves one axum.
+axum = "0.8"
+tokio = { version = "1", features = [
+    "io-std",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+futures-util = "0.3"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64 = "0.22"
+
+[target.'cfg(windows)'.dependencies]
+# Registry probe to locate an installed Chrome/Edge.
+winreg = "0.52"
+
+[dev-dependencies]
+tempfile = "3"
+# Drives the router in tests via `oneshot`, so the MCP contract is covered
+# without binding a socket or launching a browser.
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true

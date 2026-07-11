@@ -6,6 +6,7 @@
 //!
 //! | Module | Responsibility |
 //! |---|---|
+//! | [`browser`] | Supervising the browser MCP sidecar; registering its tools |
 //! | [`gateway_client`] | The only place we talk to `ironclaw-reborn serve` |
 //! | [`hit_test`] | The click-through mask for the transparent window |
 //! | [`job_object`] | Making child processes die with us |
@@ -16,6 +17,7 @@
 
 #![deny(missing_docs)]
 
+pub mod browser;
 pub mod character;
 pub mod error;
 pub mod gateway_client;
@@ -28,6 +30,7 @@ pub mod settings;
 pub mod supervisor;
 pub mod window_state;
 
+pub use browser::BrowserSidecar;
 pub use error::{Error, Result};
 pub use gateway_client::{GatewayClient, GatewayEvent, RunPhase, ThreadId};
 pub use job_object::ProcessJob;

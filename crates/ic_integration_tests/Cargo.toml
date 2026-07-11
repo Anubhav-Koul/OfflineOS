@@ -32,3 +32,16 @@ futures-util = "0.3"
 # Used only by `tests/local_model_roundtrip.rs`, which is `#[ignore]`d and needs
 # a real GGUF on disk. The harness in `src/lib.rs` does not depend on llama.cpp.
 ic_llama = { path = "../ic_llama" }
+
+# `tests/browser_mcp_contract.rs` — the Phase 4 gate. It drives the real browser
+# sidecar over HTTP and feeds its `tools/list` through the runtime's own
+# discovery code, so the core crates are dev-dependencies here on purpose: the
+# test must fail if IronClaw would refuse our manifest, not if our own
+# expectations of it drift.
+ic_browser_mcp = { path = "../ic_browser_mcp" }
+ironclaw_extensions = { path = "../ironclaw_extensions" }
+ironclaw_host_api = { path = "../ironclaw_host_api" }
+# For `default_host_port_catalog()` — the same catalog the runtime validates
+# manifests against, so the test cannot pass against a stub the real thing rejects.
+ironclaw_host_runtime = { path = "../ironclaw_host_runtime" }
+async-trait = "0.1"

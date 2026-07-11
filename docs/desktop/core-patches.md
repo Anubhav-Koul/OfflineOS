@@ -93,3 +93,111 @@ grep -rn "core-patch (desktop fork)" crates/
 - **Revisit when:** upstream raises `MAX_NUMBER_OF_REPETITIONS` or emits `char*`
   for bounds it cannot express. Then `proxy.rs` can be deleted and `LLM_BASE_URL`
   can point straight at the sidecar (`LlmEnv::for_sidecar` already does this).
+
+---
+
+## CP-4 — Reborn cannot reach an on-device MCP server (PATCHED)
+
+- **Files:**
+  - `crates/ironclaw_extensions/src/hosted_mcp_discovery.rs` — `valid_hosted_mcp_url`
+    (+ new `is_loopback_url`, re-exported from `lib.rs`)
+  - `crates/ironclaw_reborn_composition/src/mcp.rs` — `HostedMcpEndpoint::parse`,
+    `HostedMcpEndpoint::allows_target`, `hosted_mcp_network_policy`
+- **Why:** Phase 4 (browser automation) needs the agent to call tools that drive a
+  real browser over CDP — native host access that cannot live in the WASM sandbox.
+  `CLAUDE.md`'s Phase 4 plan assumed *"standalone MCP server (stdio), register
+  through IronClaw's MCP config"*. **That assumption is false for Reborn**, and it
+  fails in the worst possible way:
+  - **stdio is hard-rejected at dispatch.** `ironclaw_mcp/src/lib.rs` →
+    `if transport == "stdio" { return Err(ExternalStdioTransportUnsupported) }`
+    (*"unsupported until process-level egress controls land"*). The crate spawns no
+    processes at all. A stdio manifest still **parses, installs, and activates**
+    cleanly — then every `tools/call` dies. It looks wired, then fails at runtime.
+    The stdio docs in `docs/capabilities/mcp.md` describe the **legacy v1 binary**,
+    not Reborn.
+  - **Loopback HTTP was blocked too**, so the obvious fallback was also shut: the
+    hosted-MCP lane forced `scheme == "https"` (unreachable for a sidecar, which
+    cannot hold a publicly-trusted cert) *and* planned egress with
+    `deny_private_ip_ranges: true` (which denies `127.0.0.1` outright).
+- **Why a patch and not a route-around:** every alternative was measured first.
+  - A **WASM shim tool** hits the *same* wall one seam over —
+    `runtime/local_dev/extension_surface.rs` hardcodes `deny_private_ip_ranges: true`
+    for **every** extension capability. Same size of patch, but a far wider blast
+    radius (all extensions, not just this provider), plus a wasm32 toolchain and a
+    pointless proxy hop.
+  - A **native first-party capability** would mean editing `factory.rs` *and*
+    `ironclaw_first_party_extensions`, and dragging `chromiumoxide` into the core
+    dependency graph.
+  - Doing it **outside the agent loop** (e.g. executing browser tools inside the
+    `ic_llama` SchemaProxy, CP-3 style) would bypass the safety layer and the
+    approval flow entirely — a security regression, and forbidden by `CLAUDE.md`
+    ("Do not weaken any of it").
+
+  There is no config knob, env var, or profile — including `local-dev-yolo` — that
+  relaxes any of this. Some core edit is unavoidable; this is the smallest one, and
+  it lands on the lane upstream already supports.
+- **Fix:** allow a hosted MCP provider to be an **on-device sidecar**: accept `http`
+  for, and only for, a **literal loopback IP**, and waive private-range denial for
+  exactly that endpoint. Everything remote stays `https` + `deny_private_ip_ranges`.
+- **Blast radius — what the patch deliberately still refuses** (each pinned by a
+  `cp4_*` test):
+  - `http` to **any** non-loopback host — including `169.254.169.254` (cloud
+    metadata, the classic SSRF target) and private LAN ranges.
+  - **`localhost`** — a DNS *name*, not an IP literal, so it could be rebound.
+    `is_loopback_url` requires the host to parse as a loopback IP.
+  - Lookalike hosts such as `127.0.0.1.evil.com`.
+  - The waiver is scoped to a single endpoint: the plan's allowlist holds exactly
+    one target, and scheme is part of the endpoint's identity, so an `http`
+    loopback plan cannot authorize an `https` request to the same host:port.
+  - Remote providers (e.g. Notion) are untouched — `planner_denies_http_scheme_for_notion_provider`
+    and `cp4_a_remote_https_provider_still_denies_private_ranges` both still pass.
+  - `ManifestSource::HostBundled` is still required, so a user-installed extension
+    cannot mint a loopback endpoint for itself.
+- **Upstream candidate:** yes — filed as
+  **[nearai/ironclaw#5998](https://github.com/nearai/ironclaw/issues/5998)**
+  ("Reborn has no transport for a local (on-device) MCP server"). The error message
+  upstream already ships (*"unsupported until process-level egress controls land"*)
+  says they intend to solve it eventually.
+- **DELETE CP-4 WHEN #5998 LANDS.** Whichever way upstream fixes it:
+  - If they ship **stdio**, the sidecar drops its HTTP server entirely and speaks
+    stdio; `manifest.rs` loses the port and the whole timing dance around it (the
+    manifest no longer has to be written before the gateway boots, because there is
+    no port to bake in).
+  - If they take the **loopback-HTTP** option (proposed in the issue, and what CP-4
+    implements), the patch is simply upstreamed and deleted here.
+
+    Either way the `cp4_*` tests in both crates are the tripwire: they fail loudly
+    if the patch is lost, and they are the first thing to remove.
+
+### Related: the runtime approval flow is a no-op (not a patch — a route-around)
+
+CP-4 puts browser tools on the agent, and every discovered MCP tool is stamped
+`default_permission: Ask`. **That `Ask` is never enforced** — nothing in the
+workspace reads `default_permission`, no production authorizer returns
+`Decision::RequireApproval` (only `GrantAuthorizer` is wired into Reborn, and it
+returns only `Allow`/`Deny`), and every active capability gets a standing grant. So
+sensitive fills would run unprompted.
+
+We do **not** patch this — the fix is not a one-liner and the disagreement is ours to
+own at our boundary, not upstream's schema. Instead the browser sidecar enforces
+consent itself (`ic_browser_mcp::consent` + `::classify`), which the model cannot
+route around because the sidecar decides. Reported upstream for a disclosure channel:
+[#6000](https://github.com/nearai/ironclaw/issues/6000) (no `SECURITY.md`, GitHub
+private reporting disabled, so the issue asks *how* to report without disclosing the
+finding). If upstream later wires `RequireApproval` for `Ask` capabilities, the
+sidecar gate becomes defence-in-depth. Full write-up: `CLAUDE.md` Phase 4 notes,
+"SECURITY" section.
+- **Replay after merge:** grep `core-patch (desktop fork)` in both files. If an
+  upstream sync restores the bare `scheme() != "https"` check or flips
+  `deny_private_ip_ranges` back to an unconditional `true`, re-apply. The `cp4_*`
+  tests in both crates fail loudly if the patch is lost — that is the signal.
+- **Ordering consequences this creates** (they bite in `ic_widget`, not here):
+  - The extension catalog is scanned **once, at `serve` boot**, so the manifest must
+    be on disk *before* the gateway starts.
+  - `discover_hosted_mcp_package` runs at **activation**, not at boot — so the
+    sidecar must be **listening when the extension is activated**, and activation
+    must be driven against the **running** `serve` process. `restore_extension_lifecycle_state`
+    republishes the *bundled manifest* on restart, which carries only the capability
+    *template* — the six real tools come from the live `tools/list`. A transient
+    discovery failure **silently** falls back to that template, so the widget must
+    verify the discovered capability count rather than assume success.

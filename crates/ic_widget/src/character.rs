@@ -47,6 +47,10 @@ pub struct CharacterInputs {
     pub listening: bool,
     /// A reply is being rendered (TTS playback in Phase 5).
     pub speaking: bool,
+    /// The browser sidecar is waiting for the user to approve a sensitive fill.
+    /// Like a gateway gate, this makes the character `concerned` — but it is not a
+    /// gateway run, so it needs its own input.
+    pub browser_approval_pending: bool,
 }
 
 impl Default for CharacterInputs {
@@ -57,6 +61,7 @@ impl Default for CharacterInputs {
             run: None,
             listening: false,
             speaking: false,
+            browser_approval_pending: false,
         }
     }
 }
@@ -76,6 +81,12 @@ pub fn derive(inputs: &CharacterInputs) -> CharacterState {
         // in flight against a gateway that is not answering.
         GatewayState::Starting | GatewayState::Restarting { .. } => return CharacterState::Idle,
         GatewayState::Ready => {}
+    }
+
+    // A pending browser fill approval is a gate too: the user must act before the
+    // agent can type. It outranks in-flight work, the same as a gateway gate.
+    if inputs.browser_approval_pending {
+        return CharacterState::Concerned;
     }
 
     if let Some(run) = &inputs.run {
@@ -110,6 +121,7 @@ mod tests {
             run,
             listening: false,
             speaking: false,
+            browser_approval_pending: false,
         }
     }
 

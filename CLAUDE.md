@@ -109,11 +109,14 @@ The widget becomes an **animated anime-style character** standing on the desktop
 3. ~~Register with IronClaw through its MCP config.~~ → **host-bundled extension manifest + CP-4**. Sensitive actions route through the approval flow (every discovered MCP tool is `default_permission: Ask`, hardcoded upstream).
 4. CAPTCHAs/logins: pause, notify via widget (character `concerned` state), let user complete, resume. Selector failures: screenshot → vision-capable model fallback.
 
-### Phase 5 — Voice (`crates/ic_voice`) + Canvas
-1. Pipeline: `cpal` capture → ring buffer → wake word (openwakeword ONNX via `ort`) → silero VAD gate → `whisper-rs` transcribe → post to gateway → reply → Piper TTS playback (bundled [piper1-gpl](https://github.com/OHF-Voice/piper1-gpl) binary). Barge-in: stop TTS when VAD triggers.
-2. Wire TTS playback amplitude into `CharacterRenderer` lip sync (`ParamMouthOpenY`), replacing the Phase 3 test-tone stub; barge-in returns the character to `listening`.
-3. WASAPI device-change handling (re-open stream), mic-live indicator on the character/bubble, tray mute toggle, audio never written to disk.
-4. Canvas: dedicated Tauri window; agent emits HTML/SVG via a `canvas_render` tool (register as WASM tool or MCP); render in sandboxed iframe, sanitize output.
+### Phase 5 — Voice (`crates/ic_voice`) + Canvas — **Canvas ✅ (see notes below); Voice not started**
+
+⚠️ **The voice pipeline plan below has two dead ends and several Windows landmines — verified before any code. Read the Phase 5 notes at the bottom before building voice.**
+
+1. Pipeline: `cpal` capture → ring buffer → wake word (~~openwakeword ONNX via `ort`~~ — **models are CC-BY-NC, non-commercial; use `rustpotter` or self-trained**) → silero VAD gate (`voice_activity_detector`, MIT ✓) → `whisper-rs` transcribe (**CPU first — Vulkan silently no-ops on Windows static builds**) → post to gateway → reply → ~~Piper TTS playback (bundled piper1-gpl binary)~~ **the piper1-gpl binary no longer exists (it's a Python package now); use the archived MIT `rhasspy/piper` exe or run the VITS ONNX in-proc**. Barge-in: stop TTS when VAD triggers.
+2. Wire TTS playback amplitude into `CharacterRenderer` lip sync (`ParamMouthOpenY`), replacing the Phase 3 test-tone stub (the seam is `patchLipSync` in `ui/src/character.ts`; Piper emits no timing, so compute RMS from the PCM yourself); barge-in returns the character to `listening`.
+3. WASAPI device-change handling (**cpal exposes no device-change API — hand-write an `IMMNotificationClient` via the `windows` crate**), mic-live indicator on the character/bubble, tray mute toggle, audio never written to disk.
+4. ~~Canvas: dedicated Tauri window; agent emits HTML/SVG via a `canvas_render` tool (register as WASM tool or MCP); render in sandboxed iframe, sanitize output.~~ **✅ Done — see Phase 5 canvas notes. Route: in-process loopback MCP (reusing CP-4), not a WASM tool — WASM/first-party would strand the HTML in the wrong process behind a sanitizing, 16 KiB-capped channel.**
 
 ### Phase 6 — Packaging & hardening
 1. Single MSI (Tauri bundler): our app + `ironclaw-reborn` + llama.cpp binaries + Piper + bundled character assets. First-run wizard: GPU probe → model recommendation → provider keys → storage init (libSQL — no Postgres install!).
@@ -627,5 +630,66 @@ profile, so it does not block us.
 | [#5998](https://github.com/nearai/ironclaw/issues/5998) | No transport for a local MCP server (stdio rejected, loopback denied) | **CP-4 gets deleted when this lands** — see `core-patches.md` |
 | [#5999](https://github.com/nearai/ironclaw/issues/5999) | `local-dev-yolo` can't start on Windows (host path used as `MountAlias`) | Explains 3 red tests in our baseline; not ours |
 
-Next: **Phase 5 — voice (`crates/ic_voice`) + canvas**. The Phase 3 lip-sync
-test-tone stub is still the seam TTS amplitude replaces.
+Next: **Phase 5 — voice (`crates/ic_voice`)**. Canvas is done (below). The Phase 3
+lip-sync test-tone stub is still the seam TTS amplitude replaces.
+
+## Phase 5 notes — canvas (done, recorded 2026-07-11)
+
+`crates/ic_canvas_mcp` (new) + `crates/ic_widget` (`canvas.rs`, `main.rs`) + `ui/`
+(`canvas.tsx`, `canvas.html`). **No new core patch** — it reuses CP-4. Verified: the
+contract gate (`ic_integration_tests/tests/canvas_mcp_contract.rs`) drives the real
+canvas server through the runtime's own discovery code and confirms `canvas_render`
+becomes the capability `ic-canvas.canvas_render`.
+
+### The data path is the whole design
+
+The agent runs in `ironclaw-reborn serve`; the render must reach a Tauri window. The
+decisive fact: **every gateway→widget channel is content-hostile.** The SSE
+`CapabilityDisplayPreview` is `sanitize_text`'d and capped at 16 KiB
+(`ironclaw_reborn_composition/src/projection/display_preview.rs`), and a tool
+result in the timeline has `content: None`. So HTML routed back through the gateway
+would arrive corrupted and truncated. The only way to get raw markup to the window
+is to **produce it inside the widget process.**
+
+So `canvas_render` is served by an MCP server that runs **in-process in `ic_widget`**
+(not a child, unlike the browser sidecar). When the agent calls it, Reborn POSTs the
+arguments to the loopback URL (CP-4), the in-proc `tools/call` handler holds the raw
+HTML, and hands it to a `CanvasSink` → `app.emit("canvas://render", …)` to the canvas
+window. The markup never touches the gateway. A WASM tool or a native first-party
+tool would both strand the HTML in the *runtime* process and each need a new
+unsanitized projection channel — the exact core surface the fork avoids.
+
+### Rendering safety: isolation, not sanitization
+
+Agent markup is untrusted (a prompt-injected agent could emit hostile HTML). It
+renders in an iframe with an **empty `sandbox`** (no scripts, no same-origin, no
+forms, no navigation) under an injected `default-src 'none'` CSP (inline styles +
+`data:` images only). Static HTML and inline SVG render; scripts and every network
+fetch are inert. We deliberately do **not** strip-sanitize (ammonia/DOMPurify): the
+sandbox+CSP already bound what the content can do, and stripping would break
+legitimate inline SVG. The shell assigns `iframe.srcdoc`, never `innerHTML`, so the
+markup is always parsed as a separate isolated document. The global app CSP gained
+one token, `frame-src 'self'`, to permit the srcdoc frame (no other window uses
+frames, so the widening is inert for them).
+
+### Reused from Phase 4, exactly
+
+The `ic-canvas` manifest, install/activate, and the three timing rules (manifest on
+disk before boot; discovery at activation; re-activate every launch and verify the
+capability count) are the browser's, one more extension. `GatewayClient::install_extension`
+/`activate_extension`/`extension_capabilities` already existed. First-open race (an
+event before the shell's listener attaches) is covered by storing the last render in
+app state and having the shell fetch it via the `canvas_content` command on mount.
+
+### Voice — deferred, with corrections recorded
+
+Voice is **not started**; the plan was pressure-tested and the corrections are in the
+Phase 5 spec above. The genuine decisions (wake-word engine; TTS approach; whether the
+GPL path is acceptable) are the user's and were not made unilaterally. The
+architecture that *is* settled: `crates/ic_voice` should be a **library crate linked
+into `ic_widget`** (it needs `AppHandle` for lip-sync events, the tray mute, and the
+existing `GatewayClient`) — voice is an alternate *input* to the same chat path, not a
+new gateway channel — with **only the TTS engine as a Job-Object-supervised
+subprocess**. `ic_llama::download::Downloader` and `SpawnHook` are directly reusable
+for voice models and the TTS child; `Sidecar`/`release.rs`/`ModelStore` are reusable
+blueprints, not code.

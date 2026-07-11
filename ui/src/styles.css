@@ -593,3 +593,26 @@ h3.subhead {
     margin-left: 100%;
   }
 }
+
+/* ── canvas window ─────────────────────────────────────────────────────────── */
+.canvas-shell {
+  position: fixed;
+  inset: 0;
+  background: #1b1e24;
+  display: flex;
+}
+.canvas-frame {
+  flex: 1 1 auto;
+  border: 0;
+  width: 100%;
+  height: 100%;
+  background: #1b1e24;
+}
+.canvas-frame.hidden {
+  display: none;
+}
+.canvas-empty {
+  margin: auto;
+  color: var(--muted);
+  font-size: 13px;
+}

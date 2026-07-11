@@ -7,6 +7,7 @@
 //! | Module | Responsibility |
 //! |---|---|
 //! | [`browser`] | Supervising the browser MCP sidecar; registering its tools |
+//! | [`canvas`] | The in-process canvas MCP server; rendering agent HTML/SVG |
 //! | [`gateway_client`] | The only place we talk to `ironclaw-reborn serve` |
 //! | [`hit_test`] | The click-through mask for the transparent window |
 //! | [`job_object`] | Making child processes die with us |
@@ -18,6 +19,7 @@
 #![deny(missing_docs)]
 
 pub mod browser;
+pub mod canvas;
 pub mod character;
 pub mod error;
 pub mod gateway_client;

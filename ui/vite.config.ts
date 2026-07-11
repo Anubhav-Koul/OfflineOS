@@ -14,6 +14,7 @@ export default defineConfig({
       input: {
         widget: "index.html",
         dashboard: "dashboard.html",
+        canvas: "canvas.html",
       },
     },
   },

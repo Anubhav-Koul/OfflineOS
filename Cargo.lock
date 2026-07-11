@@ -4491,12 +4491,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "ic_canvas_mcp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum 0.8.9",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower 0.5.3",
+ "tracing",
+]
+
+[[package]]
 name = "ic_integration_tests"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures-util",
  "ic_browser_mcp",
+ "ic_canvas_mcp",
  "ic_llama",
  "ironclaw_extensions",
  "ironclaw_host_api",
@@ -4540,6 +4556,7 @@ dependencies = [
  "futures-util",
  "hex",
  "ic_browser_mcp",
+ "ic_canvas_mcp",
  "ic_integration_tests",
  "ic_llama",
  "keyring",

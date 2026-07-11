@@ -41,6 +41,8 @@ ic_llama = { path = "../ic_llama" }
 # The browser sidecar: the widget spawns it, and shares its manifest/tool
 # catalogue so the extension id and tool names cannot drift between the two.
 ic_browser_mcp = { path = "../ic_browser_mcp" }
+# The canvas tool: served in-process, so the widget links it directly.
+ic_canvas_mcp = { path = "../ic_canvas_mcp" }
 
 tokio = { version = "1", features = [
     "fs",

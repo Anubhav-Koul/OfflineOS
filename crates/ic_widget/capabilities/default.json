@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Everything the widget and dashboard windows are allowed to ask the shell for. Commands this crate defines itself are not gated here; this list only opens Tauri's own plugin surface, and it is deliberately small.",
-  "windows": ["widget", "dashboard"],
+  "description": "Everything the widget, dashboard, and canvas windows are allowed to ask the shell for. Commands this crate defines itself are not gated here; this list only opens Tauri's own plugin surface, and it is deliberately small. The canvas window's shell is trusted first-party code; the untrusted agent markup it displays is isolated in a sandboxed iframe with no same-origin access, so it never reaches this Tauri surface.",
+  "windows": ["widget", "dashboard", "canvas"],
   "permissions": [
     "core:default",
     "core:event:allow-listen",

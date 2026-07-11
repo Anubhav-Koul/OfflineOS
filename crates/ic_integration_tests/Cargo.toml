@@ -39,6 +39,7 @@ ic_llama = { path = "../ic_llama" }
 # test must fail if IronClaw would refuse our manifest, not if our own
 # expectations of it drift.
 ic_browser_mcp = { path = "../ic_browser_mcp" }
+ic_canvas_mcp = { path = "../ic_canvas_mcp" }
 ironclaw_extensions = { path = "../ironclaw_extensions" }
 ironclaw_host_api = { path = "../ironclaw_host_api" }
 # For `default_host_port_catalog()` — the same catalog the runtime validates

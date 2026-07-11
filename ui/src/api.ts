@@ -272,6 +272,24 @@ export function onBrowserApproval(
   return listen<BrowserApproval>("browser://approval", (event) => handler(event.payload));
 }
 
+/** Agent-authored markup for the canvas window. Untrusted — render only inside a
+ *  locked-down sandbox iframe. */
+export interface CanvasRender {
+  html: string;
+  title: string | null;
+}
+
+/** The latest canvas render, read on mount to cover the event-before-listener
+ *  race when the window first opens. */
+export function canvasContent(): Promise<CanvasRender | null> {
+  return invoke<CanvasRender | null>("canvas_content");
+}
+
+/** Subscribe to live canvas renders. */
+export function onCanvasRender(handler: (render: CanvasRender) => void): Promise<UnlistenFn> {
+  return listen<CanvasRender>("canvas://render", (event) => handler(event.payload));
+}
+
 /** Subscribe to model-download progress and completion. */
 export function onModelEvent(handler: (event: ModelEvent) => void): Promise<UnlistenFn> {
   return listen<ModelEvent>("model://event", (event) => handler(event.payload));

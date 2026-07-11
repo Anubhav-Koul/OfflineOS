@@ -23,6 +23,7 @@ use ic_llama::{
     Digest, HubModel, LocalLlm, LocalLlmOptions, ModelId, ModelStore, SidecarState, SpawnHook,
     Verdict,
 };
+use ic_widget::canvas::{CallbackSink, CanvasServer};
 use ic_widget::character::{self, CharacterInputs, CharacterState};
 use ic_widget::error::Error;
 use ic_widget::gateway_client::{
@@ -43,6 +44,7 @@ use tokio::sync::Mutex;
 
 const WIDGET: &str = "widget";
 const DASHBOARD: &str = "dashboard";
+const CANVAS: &str = "canvas";
 
 /// Ctrl+Alt+Space, chosen to dodge the common Windows and IDE bindings.
 fn summon_shortcut() -> Shortcut {
@@ -78,6 +80,16 @@ struct AppState {
     /// Held for its `Drop`; it also rides in `job`, so a hard kill of the widget
     /// takes the sidecar *and* its automation browser down with it.
     browser: Mutex<Option<BrowserSidecar>>,
+    /// The in-process canvas MCP server. `None` when its port could not be bound.
+    /// Held for its `Drop`, which aborts the serve task. It runs in-process (not a
+    /// child), so it needs no job enlistment.
+    canvas: Mutex<Option<CanvasServer>>,
+    /// The most recent canvas render, so the window can fetch it on mount. A
+    /// `canvas://render` event emitted while the shell is still loading would be
+    /// lost; the shell reads this once via `canvas_content`, then listens live. A
+    /// `std` mutex: written from a render, read from a command, never across an
+    /// await.
+    last_canvas: std::sync::Mutex<Option<ic_widget::canvas::RenderRequest>>,
     /// The in-flight model download, if any: its model id and task handle. One
     /// at a time. Aborting the handle stops the transfer; the partial `.part`
     /// file survives and resumes on the next attempt, so an abort is a safe
@@ -1197,6 +1209,58 @@ fn show_dashboard(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// Display agent-authored markup on the canvas window, creating it on first use.
+///
+/// The markup is put into a `canvas://render` event that the trusted `canvas.html`
+/// shell drops into a locked-down sandbox iframe (see the frontend). It is emitted
+/// only to the canvas window — never broadcast — so no other webview ever receives
+/// untrusted HTML. Returns an error string (surfaced to the agent as a recoverable
+/// tool error) only if the window cannot be created; a created-and-shown window is
+/// success even before the paint finishes.
+fn show_canvas(app: &AppHandle, request: ic_widget::canvas::RenderRequest) -> Result<(), String> {
+    let title = request
+        .title
+        .clone()
+        .unwrap_or_else(|| "IronClaw Canvas".to_string());
+
+    // Store before create/emit: the shell reads this on mount, which covers the
+    // race where the window is still loading when the event fires.
+    if let Ok(mut last) = app.state::<AppState>().last_canvas.lock() {
+        *last = Some(request.clone());
+    }
+
+    let window = match app.get_webview_window(CANVAS) {
+        Some(window) => window,
+        None => WebviewWindowBuilder::new(app, CANVAS, WebviewUrl::App("canvas.html".into()))
+            .title("IronClaw Canvas")
+            .inner_size(720.0, 560.0)
+            .build()
+            .map_err(|error| format!("could not open the canvas window: {error}"))?,
+    };
+    let _ = window.set_title(&title);
+    window
+        .show()
+        .map_err(|error| format!("could not show the canvas window: {error}"))?;
+
+    // Emit for the already-open case; a first-open shell picks it up via
+    // `canvas_content` on mount instead.
+    window
+        .emit("canvas://render", &request)
+        .map_err(|error| format!("could not send markup to the canvas: {error}"))
+}
+
+/// The latest canvas render, for the shell to fetch on mount.
+#[tauri::command]
+async fn canvas_content(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<ic_widget::canvas::RenderRequest>, String> {
+    Ok(state
+        .last_canvas
+        .lock()
+        .map(|last| last.clone())
+        .unwrap_or(None))
+}
+
 /// Toggle the widget. The global hotkey, the tray, and a second launch all land
 /// here.
 fn toggle_widget(app: &AppHandle) {
@@ -1497,6 +1561,18 @@ async fn bring_up_gateway(app: AppHandle, selection: ProviderSelection) {
         };
         let sidecar = ic_widget::browser::start(job.clone(), &home, sink).await;
         *app.state::<AppState>().browser.lock().await = sidecar;
+
+        // The canvas server is also before the gateway, for the same catalogue-scan
+        // reason. Its sink shows (and creates on first use) the canvas window and
+        // hands it the markup — the markup never crosses the gateway.
+        let render_sink = {
+            let handle = app.clone();
+            Arc::new(CallbackSink(
+                move |request: ic_widget::canvas::RenderRequest| show_canvas(&handle, request),
+            ))
+        };
+        let canvas = ic_widget::canvas::start(&home, render_sink).await;
+        *app.state::<AppState>().canvas.lock().await = canvas;
     }
 
     let started = async {
@@ -1522,6 +1598,9 @@ async fn bring_up_gateway(app: AppHandle, selection: ProviderSelection) {
             // only the bundled capability template, not the discovered tools.
             if app.state::<AppState>().browser.lock().await.is_some() {
                 ic_widget::browser::register(gateway.client()).await;
+            }
+            if app.state::<AppState>().canvas.lock().await.is_some() {
+                ic_widget::canvas::register(gateway.client()).await;
             }
 
             // Mirror every later transition onto the UI.
@@ -1659,6 +1738,7 @@ fn main() {
             fetch_timeline,
             resolve_gate,
             answer_browser_fill,
+            canvas_content,
             list_threads,
             list_automations,
             local_model_status,
@@ -1690,6 +1770,8 @@ fn main() {
                 pump: Mutex::new(None),
                 local_llm: Mutex::new(None),
                 browser: Mutex::new(None),
+                canvas: Mutex::new(None),
+                last_canvas: std::sync::Mutex::new(None),
                 download: Mutex::new(None),
                 window_state: std::sync::Mutex::new(window_state),
                 window_store: store,

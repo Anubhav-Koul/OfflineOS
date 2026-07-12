@@ -8,13 +8,51 @@ description = "Voice pipeline for the IronClaw desktop app: mic capture, wake wo
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Exposes the fake capture / stage implementations so other crates (and the
+# driver's own integration tests) can drive the pipeline with no audio hardware
+# and no models. Never enabled in a shipping build.
+test-support = []
+
 [dependencies]
+cpal = "0.18.1"
+# 0.16 for the `FftFixedIn` chunked API; 3.0/4.0 rewrote resampling around
+# audioadapters (`Fft` + `FixedSync`), a heavier surface we don't need.
+rubato = "0.16"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"
+tokio = { version = "1", features = ["rt", "sync", "process", "time", "io-util", "macros"] }
+# Vendored at crates-src/rustpotter (2.0.1, Apache-2.0): the classic correlation-
+# based wakeword spotter. `default-features = false` drops its `debug` feature.
+# See docs/desktop/voice-notes.md for why we carry the source rather than pin 3.x.
+rustpotter = { path = "../../crates-src/rustpotter", default-features = false }
+voice_activity_detector = "0.2"
+whisper-rs = "0.16"
+# Reuse ic_llama's resumable, digest-verified downloader and its Sha256Hex/ModelId
+# newtypes for provisioning the voice models (whisper, Piper voice + exe).
+ic_llama = { path = "../ic_llama" }
+# Extracting the Piper release archive (piper.exe + its DLLs), same pin as ic_llama.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(windows)'.dependencies]
+# WASAPI default-device-change notifications: cpal exposes no device-change API, so
+# we hand-write an IMMNotificationClient (matches ic_widget's windows 0.62 pin).
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_Media_Audio",
+    "Win32_Devices_FunctionDiscovery",
+] }
+# The `#[implement]` macro expands to code that names `windows_core` at the crate
+# root, so it must be a direct dependency (matching `windows` 0.62's internal pin).
+windows-core = "0.62"
 
 [dev-dependencies]
 approx = "0.5"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "process", "time", "io-util", "macros"] }
+# Reading WAV fixtures in the `#[ignore]`d real-asset tests (wake word, STT).
+hound = "3.5"
 
 [lints]
 workspace = true

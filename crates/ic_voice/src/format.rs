@@ -54,6 +54,18 @@ pub fn f32_to_i16(samples: &[f32]) -> Vec<i16> {
         .collect()
 }
 
+/// Decode raw little-endian 16-bit PCM bytes to `f32` in `[-1, 1]`.
+///
+/// This is what Piper writes to stdout under `--output-raw`: signed 16-bit mono
+/// samples, little-endian, no header. A trailing odd byte (a torn read) is dropped
+/// rather than misaligned into a garbage sample.
+pub fn pcm_i16le_to_f32(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(2)
+        .map(|pair| i16::from_le_bytes([pair[0], pair[1]]) as f32 / 32768.0)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,6 +112,16 @@ mod tests {
         // +1.0 to i16::MAX. The point of the test is that ±2.0 does not wrap.
         let converted = f32_to_i16(&[-2.0, 0.0, 2.0]);
         assert_eq!(converted, [-32767, 0, i16::MAX]);
+    }
+
+    #[test]
+    fn pcm_bytes_decode_little_endian_and_drop_a_torn_trailing_byte() {
+        // 0x0000 -> 0.0, 0x00FF? use known values: i16 256 = 0x0100 LE bytes [0x00,0x01].
+        let bytes = [0x00, 0x00, 0x00, 0x40, 0xFF]; // 0, 16384, then a lone byte
+        let decoded = pcm_i16le_to_f32(&bytes);
+        assert_eq!(decoded.len(), 2, "the torn trailing byte must be dropped");
+        assert_abs_diff_eq!(decoded[0], 0.0, epsilon = 1e-6);
+        assert_abs_diff_eq!(decoded[1], 16384.0 / 32768.0, epsilon = 1e-6);
     }
 
     #[test]

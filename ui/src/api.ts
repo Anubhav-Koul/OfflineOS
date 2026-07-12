@@ -251,6 +251,10 @@ export const api = {
   setVoiceMuted: (muted: boolean) => invoke<void>("set_voice_muted", { muted }),
   /** Turn voice on or off (enabling downloads the speech models on first run). */
   setVoiceEnabled: (enabled: boolean) => invoke<void>("set_voice_enabled", { enabled }),
+  /** Whether the first-run setup wizard should be shown. */
+  needsSetup: () => invoke<boolean>("needs_setup"),
+  /** Mark first-run setup complete. */
+  completeSetup: () => invoke<void>("complete_setup"),
 };
 
 /** The voice UI status (mirrors the Rust `VoiceStatus`). */

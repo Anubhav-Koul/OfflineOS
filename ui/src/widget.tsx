@@ -322,6 +322,11 @@ function App() {
     } catch (error) {
       push({ role: "error", text: `The agent is not reachable: ${error}` });
     }
+
+    // On a fresh install, open the dashboard so the first-run wizard is seen.
+    if (await api.needsSetup().catch(() => false)) {
+      void api.openDashboard().catch(() => undefined);
+    }
   });
 
   async function send(event: SubmitEvent) {

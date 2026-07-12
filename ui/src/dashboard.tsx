@@ -582,9 +582,75 @@ function ProviderRow(props: {
   );
 }
 
+/**
+ * The first-run wizard: a welcome overlay shown until setup is marked complete. It
+ * orients the user toward the model/provider panels already on the dashboard (rather
+ * than duplicating them), offers to enable voice, and on "Finish" persists the flag
+ * so it never shows again. Storage needs no step — the gateway initialises its
+ * libSQL store on boot (no Postgres).
+ */
+function SetupWizard(props: { onDone: () => void }) {
+  const [voiceOn, setVoiceOn] = createSignal(false);
+  const [busy, setBusy] = createSignal(false);
+
+  const finish = async () => {
+    setBusy(true);
+    try {
+      if (voiceOn()) {
+        // Enabling downloads the speech models in the background (~210 MB).
+        await api.setVoiceEnabled(true).catch(() => undefined);
+      }
+      await api.completeSetup();
+      props.onDone();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div class="wizard-overlay">
+      <div class="wizard-card">
+        <h1>Welcome to IronClaw Desktop</h1>
+        <p class="wizard-lead">
+          A character companion with a local AI agent. Two quick things to get set up
+          — everything else works out of the box, and your data stays on this machine.
+        </p>
+        <ol class="wizard-steps">
+          <li>
+            <strong>Pick a brain.</strong> Below, either download a recommended local
+            model (runs offline on your GPU) or add a cloud provider key. You can
+            change this any time.
+          </li>
+          <li>
+            <strong>Optional: talk to it.</strong>
+            <label class="wizard-voice">
+              <input
+                type="checkbox"
+                checked={voiceOn()}
+                onChange={(e) => setVoiceOn(e.currentTarget.checked)}
+              />
+              Enable voice (wake with the summon hotkey; downloads speech models on
+              first use)
+            </label>
+          </li>
+        </ol>
+        <div class="wizard-actions">
+          <button class="wizard-primary" disabled={busy()} onClick={() => void finish()}>
+            {busy() ? "Finishing…" : "Get started"}
+          </button>
+        </div>
+        <p class="wizard-note">
+          Storage sets itself up automatically — no database to install.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 function Dashboard() {
   const [gateway, setGateway] = createSignal<GatewayState>({ state: "starting" });
   const [log, setLog] = createSignal("");
+  const [showWizard, setShowWizard] = createSignal(false);
 
   const sessions = createPanelData<Thread>(api.listThreads);
   const automations = createPanelData<Automation>(api.listAutomations);
@@ -610,12 +676,18 @@ function Dashboard() {
     setGateway(current);
     setLog(await api.gatewayLog());
     if (current.state === "ready") loadAll();
+
+    // Show the first-run wizard until the user completes it.
+    setShowWizard(await api.needsSetup().catch(() => false));
   });
 
   const refreshLog = async () => setLog(await api.gatewayLog());
 
   return (
     <div class="dashboard">
+      <Show when={showWizard()}>
+        <SetupWizard onDone={() => setShowWizard(false)} />
+      </Show>
       <h1>IronClaw Desktop</h1>
 
       <section>

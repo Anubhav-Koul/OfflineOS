@@ -57,6 +57,10 @@ pub struct Settings {
     /// Whether the microphone starts muted when voice is enabled.
     #[serde(default)]
     pub voice_muted: bool,
+    /// Whether the first-run setup wizard has been completed. `false` on a fresh
+    /// install shows the wizard (pick a model / provider, optionally enable voice).
+    #[serde(default)]
+    pub setup_complete: bool,
 }
 
 /// A character asset folder's name, e.g. `hiyori`.

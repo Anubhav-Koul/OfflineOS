@@ -118,11 +118,52 @@ The widget becomes an **animated anime-style character** standing on the desktop
 3. WASAPI device-change handling (**cpal exposes no device-change API — hand-write an `IMMNotificationClient` via the `windows` crate**), mic-live indicator on the character/bubble, tray mute toggle, audio never written to disk.
 4. ~~Canvas: dedicated Tauri window; agent emits HTML/SVG via a `canvas_render` tool (register as WASM tool or MCP); render in sandboxed iframe, sanitize output.~~ **✅ Done — see Phase 5 canvas notes. Route: in-process loopback MCP (reusing CP-4), not a WASM tool — WASM/first-party would strand the HTML in the wrong process behind a sanitizing, 16 KiB-capped channel.**
 
-### Phase 6 — Packaging & hardening
+### Phase 6 — Packaging & hardening — **config + hardening ✅, real MSI build gated on external inputs (see notes below; full write-up: `docs/desktop/packaging.md`)**
 1. Single MSI (Tauri bundler): our app + `ironclaw-reborn` + llama.cpp binaries + Piper + bundled character assets. First-run wizard: GPU probe → model recommendation → provider keys → storage init (libSQL — no Postgres install!).
 2. Uninstaller must remove the Credential Manager entry ("IronClaw Desktop" / "gateway-token") and `%LOCALAPPDATA%\IronClaw Desktop\`.
 3. Tauri auto-updater; code-sign (unsigned + mic capture + child processes = SmartScreen/AV flags).
 4. Failure drills before ship: kill llama-server mid-generation; kill ironclaw-reborn mid-job; sleep/resume; monitor unplug; disk-full during GGUF download; occupied ports (ports are already dynamic — verify end to end).
+
+### Phase 6 — done to the limit of what the repo can hold (recorded 2026-07-13)
+
+`ic_widget` (`main.rs`, `secrets.rs`, `settings.rs`, `tauri.conf.json` +
+`tauri.release.conf.json` + `wix/uninstall-cleanup.wxs`) + `ui/`. **Full write-up:
+`docs/desktop/packaging.md`.** Everything buildable and verifiable *without a
+certificate, an updater keypair, or an update endpoint* is done; those three (plus
+the real MSI build, which needs WiX + the staged sidecar on a clean VM) are
+documented with config templates rather than committed as half-configs or secrets.
+
+- **Bundle config** (`tauri.conf.json`): MSI target, WebView2 `embedBootstrapper`
+  (offline), publisher/metadata, and the WiX uninstall fragment. `externalBin`
+  (the `ironclaw-reborn` sidecar) lives in a **release-only overlay**
+  (`tauri.release.conf.json`, applied via `cargo tauri build --config …`) because
+  tauri-build validates `externalBin` existence on *every* build — committing it in
+  the base config broke `cargo run`. Character assets ride in the embedded frontend,
+  so they need no resource bundling.
+- **Offline strategy:** ship the lean MSI (llama-server / models / Piper / whisper
+  download on first run — each runtime already prefers a present file, so a fully
+  offline MSI is a staging exercise, no code change) and gate the first launch behind
+  the wizard. `ironclaw-reborn` is the one binary that *must* ship (not downloadable).
+- **Uninstall cleanup:** `ic-widget.exe --uninstall-cleanup` (`SecretStore::clear_all`
+  + remove `%LOCALAPPDATA%\IronClaw Desktop\`), invoked by the WiX custom action.
+  Two real caveats (Tauri's main-exe `FileKey`; per-user data under a per-machine
+  MSI) are documented in the `.wxs` and packaging doc — they need the real generated
+  WiX to reconcile.
+- **First-run wizard:** `settings.setup_complete` + `needs_setup`/`complete_setup`
+  commands; a `SetupWizard` overlay in the dashboard (orients toward the existing
+  model/provider panels rather than duplicating them, offers a voice opt-in); the
+  widget opens the dashboard on first launch so it's seen. Storage is *not* a step —
+  the gateway inits libSQL on boot.
+- **Auto-updater + code-signing:** templated in the packaging doc (keypair gen, config
+  block, plugin registration; cert thumbprint + timestamp). **Not wired live** — a
+  placeholder pubkey would fail the build, and the repo must never carry a private key.
+- **Failure drills:** the checklist is in the packaging doc with each mode marked
+  covered-by-design / needs-manual-drill / gap. No known uncovered failure; the
+  manual pass runs on the first signed build on a clean VM.
+
+Next: obtain a code-signing cert + updater keypair + update endpoint, produce the
+first real MSI on a clean VM, reconcile the WiX caveats, run the manual drills, and
+record + bundle rustpotter wakeword models (then wake word replaces push-to-talk).
 
 ## Edge cases checklist (apply throughout)
 

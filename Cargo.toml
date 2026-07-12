@@ -20,6 +20,11 @@ exclude = [
     "tools-src/telegram",
     "fuzz",
     "crates/ironclaw_safety/fuzz",
+    # Vendored rustpotter 2.0.1 (Apache-2.0), the pure-DSP wakeword spotter for
+    # ic_voice. The only non-yanked crates.io release (3.0.2) pins a candle 0.2
+    # that no longer compiles; 2.x is yanked but sound, so we carry the source.
+    # Excluded (not a workspace member) so our lints/edition don't touch it.
+    "crates-src/rustpotter",
 ]
 
 # Maintainability guardrails against dead/speculative public API

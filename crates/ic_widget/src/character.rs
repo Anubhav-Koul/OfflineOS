@@ -37,16 +37,30 @@ pub enum CharacterState {
 }
 
 /// The signals the state is derived from.
+///
+/// The typed-chat signals (`listening`/`speaking`) and the voice pipeline's
+/// (`voice_*`) are **separate fields, OR-ed in [`derive`]** — deliberately. Both
+/// sources fire independently (a typed reply's reading-time window can overlap a
+/// spoken turn), and when they shared one pair, whichever wrote last clobbered the
+/// other: a stale typed timer would freeze the mouth mid-TTS by clearing the flag
+/// voice had set.
 #[derive(Debug, Clone)]
 pub struct CharacterInputs {
     /// The supervised gateway's health.
     pub gateway: GatewayState,
     /// The active run's phase, or `None` when no run is in flight.
     pub run: Option<RunPhase>,
-    /// The user is addressing the agent (input focus; wake word in Phase 5).
+    /// The user is addressing the agent by keyboard (composer focus).
     pub listening: bool,
-    /// A reply is being rendered (TTS playback in Phase 5).
+    /// A typed reply is being rendered (a reading-time window).
     pub speaking: bool,
+    /// The voice pipeline is capturing an utterance (wake word / push-to-talk).
+    pub voice_listening: bool,
+    /// The voice pipeline is transcribing or awaiting the gateway — thinking, even
+    /// though the run rides voice's own thread and never sets `run`.
+    pub voice_thinking: bool,
+    /// TTS playback is audible.
+    pub voice_speaking: bool,
     /// The browser sidecar is waiting for the user to approve a sensitive fill.
     /// Like a gateway gate, this makes the character `concerned` — but it is not a
     /// gateway run, so it needs its own input.
@@ -61,6 +75,9 @@ impl Default for CharacterInputs {
             run: None,
             listening: false,
             speaking: false,
+            voice_listening: false,
+            voice_thinking: false,
+            voice_speaking: false,
             browser_approval_pending: false,
         }
     }
@@ -101,11 +118,16 @@ pub fn derive(inputs: &CharacterInputs) -> CharacterState {
             return CharacterState::Thinking;
         }
     }
+    // A voice turn's run rides voice's own thread, so it never reaches `run`;
+    // its transcribing/awaiting window is thinking all the same.
+    if inputs.voice_thinking {
+        return CharacterState::Thinking;
+    }
 
-    if inputs.speaking {
+    if inputs.speaking || inputs.voice_speaking {
         return CharacterState::Speaking;
     }
-    if inputs.listening {
+    if inputs.listening || inputs.voice_listening {
         return CharacterState::Listening;
     }
     CharacterState::Idle
@@ -119,9 +141,7 @@ mod tests {
         CharacterInputs {
             gateway,
             run,
-            listening: false,
-            speaking: false,
-            browser_approval_pending: false,
+            ..CharacterInputs::default()
         }
     }
 
@@ -242,5 +262,36 @@ mod tests {
             derive(&inputs(GatewayState::Ready, None)),
             CharacterState::Idle
         );
+    }
+
+    /// The voice pipeline's signals are independent of the typed-chat pair: either
+    /// source alone paints the face, and a stale typed flag cannot cancel a live
+    /// voice one (the clobbering bug this split fixes).
+    #[test]
+    fn voice_signals_are_ord_with_the_typed_ones() {
+        let base = inputs(GatewayState::Ready, None);
+
+        let voice_speaking = CharacterInputs {
+            voice_speaking: true,
+            // The typed reading-time window just expired — irrelevant to TTS.
+            speaking: false,
+            ..base.clone()
+        };
+        assert_eq!(derive(&voice_speaking), CharacterState::Speaking);
+
+        let voice_listening = CharacterInputs {
+            voice_listening: true,
+            ..base.clone()
+        };
+        assert_eq!(derive(&voice_listening), CharacterState::Listening);
+
+        // A voice turn's transcribe/await window thinks, even with no `run`
+        // (voice rides its own thread, invisible to the typed pump).
+        let voice_thinking = CharacterInputs {
+            voice_thinking: true,
+            voice_speaking: true, // thinking outranks speaking, as for typed runs
+            ..base
+        };
+        assert_eq!(derive(&voice_thinking), CharacterState::Thinking);
     }
 }

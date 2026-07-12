@@ -141,6 +141,65 @@ test-tone stub. The stub is **kept as a fallback**: when no fresh amplitude has
 arrived (a *typed* reply with no TTS, or a stalled stream), the mouth falls back to
 the syllable test tone, so the character still moves its mouth while "speaking".
 
+## The hardening pass (2026-07-13)
+
+A dedicated bug-hunt (regression suites + two independent code reviews + running
+every stage against the **real** models and devices) found and fixed a cluster of
+real defects. The ones that reshape how the pipeline works:
+
+- **The default input device cannot be trusted.** On this machine the default is a
+  Bluetooth soundbar's "Headset" (HFP) endpoint that opens cleanly, reports
+  healthy, and delivers **zero samples forever** — voice was silently deaf.
+  `CpalCapture::start` now probes each device for actual audio flow (~500 ms
+  window) and falls back through the input list; verified live (it skipped the
+  soundbar and found the real mic in the smoke run). The driver also retries a
+  failed mic open every 3 s and replaces a stream that dies without a
+  device-change notification.
+- **The driver no longer blocks on the turn.** Whisper, the gateway round-trip,
+  and Piper each run in a spawned stage task reporting back through a channel;
+  mute/shutdown/device-change/push-to-talk are now instant in every state
+  (previously wedged for up to 120 s mid-turn, and `shutdown` could hang the
+  settings toggle). Stage results carry a **turn generation**, so a slow stale
+  synthesis can never speak into a later turn.
+- **Barge-in is the wake phrase or the summon hotkey — never raw VAD.** The mic
+  hears the character's own TTS through the speakers; a VAD-driven interrupt
+  self-triggers on that echo and turns speaker playback into a self-driving
+  conversation loop. The ring is also drained when playback starts, so speech from
+  the transcribe/await window cannot replay into the detector.
+- **Listening now times out** (no speech onset within `listen_timeout`, default
+  12 s → back to Idle) and the utterance buffer is hard-capped — a false wake used
+  to listen forever and grow ~230 MB/hour.
+- **Piper is fed exactly one line.** Multi-line replies deadlocked the pipes
+  (Piper synthesizes line 1 into a full stdout while we were still writing its
+  stdin). All whitespace runs collapse to single spaces; `speechify` in
+  `ic_widget::voice` additionally strips markdown (code fences → "code omitted",
+  emphasis/links dissolve) so Piper doesn't read asterisks aloud.
+- **`drive_turn` matches the `SubmitOutcome` variant.** `DeferredBusy` carries the
+  *previous* run's id — tracking it spoke the previous question's answer as if it
+  were the new one. Busy → stay quiet. A failed send drops the cached voice thread
+  and retries once on a fresh one.
+- **`start_voice` re-checks settings after provisioning** (minutes can pass):
+  disabling voice mid-download no longer leaves a hot mic behind a settings
+  toggle that says off, duplicate starts are discarded, and the mute state is
+  re-read at install time. All settings writes now go through one serialized
+  `update_settings` (concurrent commands were losing updates).
+- **Character signals split:** `CharacterInputs` gained `voice_listening/
+  voice_thinking/voice_speaking`, OR-ed with the typed pair — a stale typed
+  reading-time timer used to freeze the mouth mid-TTS by clearing the shared flag.
+  Voice transitions apply through one ordered consumer task (per-transition spawns
+  raced). A session-level guard makes a redundant mute/unmute a strict no-op (it
+  used to cancel an in-flight turn and orphan a live playback).
+- **UI:** Solid `onCleanup` after an `await` never registers (no owner) — both
+  `onMount`s now register cleanup synchronously and append teardown steps as they
+  create things. Playback completion is now gated on the audio callback's
+  progress, not the wall clock, so high-latency devices don't clip the reply tail.
+
+Real-asset verification (run with `--ignored`, assets under the session
+scratchpad): Piper synthesis (verifying `--output-raw` against the real binary),
+the **TTS → `Resampler` → whisper round trip** (`tests/real_voice_loop.rs` —
+transcribes back the exact sentence), live speaker playback with the amplitude
+tap, live mic capture through the fallback, and the WASAPI watcher registration.
+
 ## Follow-ups
 
 - **Record + train wake models** and bundle them under `voice-wakewords/`; until

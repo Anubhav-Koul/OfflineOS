@@ -113,6 +113,11 @@ struct AppState {
     /// its `Drop`, which stops the loop and releases the mic; Piper also rides in
     /// `job`, so a hard kill takes it down too.
     voice: Mutex<Option<ic_widget::voice::VoiceService>>,
+    /// Serialises every load-modify-save of `settings_store`: Tauri commands run
+    /// concurrently, and two unsynchronised saves interleave as lost updates (a
+    /// tray mute racing a dashboard toggle silently reverted one of them). A `std`
+    /// mutex, held only across synchronous file IO — never an await.
+    settings_write: std::sync::Mutex<()>,
 }
 
 /// The inputs the character state derives from, plus the last state emitted.
@@ -129,6 +134,25 @@ impl AppState {
             Some(gateway) => Ok(gateway.client().clone()),
             None => Err("The agent is still starting. Give it a moment.".into()),
         }
+    }
+
+    /// Atomically load-modify-save the settings, returning the saved copy. Every
+    /// mutation goes through here so concurrent commands can't clobber each
+    /// other's fields.
+    fn update_settings(
+        &self,
+        mutate: impl FnOnce(&mut ic_widget::settings::Settings),
+    ) -> Result<ic_widget::settings::Settings, String> {
+        let _guard = self
+            .settings_write
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut settings = self.settings_store.load().map_err(|e| e.to_string())?;
+        mutate(&mut settings);
+        self.settings_store
+            .save(&settings)
+            .map_err(|e| e.to_string())?;
+        Ok(settings)
     }
 }
 
@@ -534,17 +558,9 @@ async fn apply_provider(
     state: tauri::State<'_, AppState>,
     selection: ProviderSelection,
 ) -> Result<(), String> {
-    // Load-modify-save: settings now carry more than the provider, and a
+    // Load-modify-save (serialised): settings carry more than the provider, and a
     // rebuilt literal here would silently reset the rest.
-    let mut settings = state
-        .settings_store
-        .load()
-        .map_err(|error| error.to_string())?;
-    settings.active_provider = selection.clone();
-    state
-        .settings_store
-        .save(&settings)
-        .map_err(|error| error.to_string())?;
+    state.update_settings(|settings| settings.active_provider = selection.clone())?;
 
     // Tell the UI we are restarting before the teardown, so the badge is honest
     // during the gap. The old run, if any, is gone with the old gateway.
@@ -875,15 +891,7 @@ async fn set_character(
     id: String,
 ) -> Result<(), String> {
     let id = CharacterId::new(id)?;
-    let mut settings = state
-        .settings_store
-        .load()
-        .map_err(|error| error.to_string())?;
-    settings.character = Some(id);
-    state
-        .settings_store
-        .save(&settings)
-        .map_err(|error| error.to_string())?;
+    state.update_settings(|settings| settings.character = Some(id))?;
     if let Some(window) = app.get_webview_window(WIDGET) {
         let _ = window.eval("window.location.reload()");
     }
@@ -1669,14 +1677,19 @@ fn maybe_start_voice(app: AppHandle) {
             .load()
             .unwrap_or_default();
         if settings.voice_enabled {
-            start_voice(app, settings.voice_muted).await;
+            start_voice(app).await;
         }
     });
 }
 
 /// Build the pipeline's widget-side seams and start it, storing the service in app
 /// state. Best-effort: any failure leaves voice unavailable, never crashes the app.
-async fn start_voice(app: AppHandle, start_muted: bool) {
+///
+/// Reads `voice_muted` from settings itself — and re-checks `voice_enabled` after
+/// the (potentially minutes-long) model provisioning — because both can change
+/// while the download runs: capturing them at spawn time shipped a mic that opened
+/// unmuted after the user muted, and stayed hot after the user disabled voice.
+async fn start_voice(app: AppHandle) {
     let job = Arc::clone(&app.state::<AppState>().job);
     let models_root = match voice_root() {
         Ok(root) => root,
@@ -1703,22 +1716,33 @@ async fn start_voice(app: AppHandle, start_muted: bool) {
         })
     };
 
-    // Voice state → the mic indicator (a Tauri event) and the character (listening
-    // / speaking signals, re-derived by the character state machine).
-    let on_state: ic_voice::StateFn = {
+    // Voice state → the mic indicator (a Tauri event) and the character's voice_*
+    // signals (separate from the typed-chat pair — see `CharacterInputs`). One
+    // consumer task applies the transitions **in order**: spawning a task per
+    // transition raced them, and rapid Listening→Transcribing→Sending bursts could
+    // settle the character on a stale state.
+    let (state_tx, mut state_rx) = tokio::sync::mpsc::unbounded_channel::<ic_voice::VoiceState>();
+    {
         let app = app.clone();
-        Arc::new(move |voice_state: ic_voice::VoiceState| {
-            let _ = app.emit("voice://state", voice_state);
-            let app = app.clone();
-            tauri::async_runtime::spawn(async move {
+        tauri::async_runtime::spawn(async move {
+            while let Some(voice_state) = state_rx.recv().await {
+                let _ = app.emit("voice://state", voice_state);
                 update_character(&app, |inputs| {
-                    inputs.listening = matches!(voice_state, ic_voice::VoiceState::Listening);
-                    inputs.speaking = matches!(voice_state, ic_voice::VoiceState::Speaking);
+                    inputs.voice_listening = matches!(voice_state, ic_voice::VoiceState::Listening);
+                    inputs.voice_thinking = matches!(
+                        voice_state,
+                        ic_voice::VoiceState::Transcribing | ic_voice::VoiceState::Sending
+                    );
+                    inputs.voice_speaking = matches!(voice_state, ic_voice::VoiceState::Speaking);
                 })
                 .await;
-            });
-        })
-    };
+            }
+        });
+    }
+    let on_state: ic_voice::StateFn = Arc::new(move |voice_state: ic_voice::VoiceState| {
+        // Unbounded so a transition is never dropped; the consumer keeps order.
+        let _ = state_tx.send(voice_state);
+    });
 
     // TTS amplitude → the character's mouth (lip sync), replacing the Phase 3 stub.
     let amplitude: ic_voice::AmplitudeSink = {
@@ -1727,6 +1751,15 @@ async fn start_voice(app: AppHandle, start_muted: bool) {
             let _ = app.emit("voice://amplitude", level);
         })
     };
+
+    // Read the mute state NOW (post-provisioning it may be stale, so it is read
+    // again below — but the pipeline needs a value to start with).
+    let start_muted = app
+        .state::<AppState>()
+        .settings_store
+        .load()
+        .map(|s| s.voice_muted)
+        .unwrap_or(false);
 
     let service = ic_widget::voice::start(
         job,
@@ -1740,9 +1773,42 @@ async fn start_voice(app: AppHandle, start_muted: bool) {
     )
     .await;
 
-    if let Some(service) = service {
-        *app.state::<AppState>().voice.lock().await = Some(service);
-        tracing::info!("voice is ready");
+    let Some(service) = service else { return };
+
+    // Provisioning may have taken minutes; the user may have changed their mind.
+    // Re-read the settings and honour them before going live.
+    let settings = app
+        .state::<AppState>()
+        .settings_store
+        .load()
+        .unwrap_or_default();
+    if !settings.voice_enabled {
+        tracing::info!("voice was disabled while provisioning; not starting");
+        service.shutdown().await;
+        return;
+    }
+    if settings.voice_muted != start_muted {
+        service.set_muted(settings.voice_muted).await;
+    }
+
+    let state = app.state::<AppState>();
+    let duplicate = {
+        let mut slot = state.voice.lock().await;
+        if slot.is_some() {
+            // A concurrent start won the race (launch + a quick enable toggle both
+            // spawn one). Keep the installed pipeline; wind this one down.
+            Some(service)
+        } else {
+            *slot = Some(service);
+            None
+        }
+    };
+    match duplicate {
+        Some(service) => {
+            tracing::info!("a voice pipeline is already running; discarding the duplicate");
+            service.shutdown().await;
+        }
+        None => tracing::info!("voice is ready"),
     }
 }
 
@@ -1761,9 +1827,8 @@ fn toggle_voice_mute(app: &AppHandle) {
                 }
             }
         };
-        if let Ok(mut settings) = state.settings_store.load() {
-            settings.voice_muted = muted;
-            let _ = state.settings_store.save(&settings);
+        if let Err(error) = state.update_settings(|settings| settings.voice_muted = muted) {
+            tracing::warn!(%error, "could not persist the mute state");
         }
         tracing::info!(muted, "microphone toggled from the tray");
     });
@@ -1789,12 +1854,7 @@ async fn needs_setup(state: tauri::State<'_, AppState>) -> Result<bool, String> 
 /// Mark first-run setup done, so the wizard does not show again.
 #[tauri::command]
 async fn complete_setup(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let mut settings = state.settings_store.load().map_err(|e| e.to_string())?;
-    settings.setup_complete = true;
-    state
-        .settings_store
-        .save(&settings)
-        .map_err(|e| e.to_string())?;
+    state.update_settings(|settings| settings.setup_complete = true)?;
     Ok(())
 }
 
@@ -1824,12 +1884,7 @@ async fn voice_status(state: tauri::State<'_, AppState>) -> Result<VoiceStatus, 
 /// Mute or unmute the microphone, persisting the choice.
 #[tauri::command]
 async fn set_voice_muted(state: tauri::State<'_, AppState>, muted: bool) -> Result<(), String> {
-    let mut settings = state.settings_store.load().map_err(|e| e.to_string())?;
-    settings.voice_muted = muted;
-    state
-        .settings_store
-        .save(&settings)
-        .map_err(|e| e.to_string())?;
+    state.update_settings(|settings| settings.voice_muted = muted)?;
     if let Some(service) = state.voice.lock().await.as_ref() {
         service.set_muted(muted).await;
     }
@@ -1837,33 +1892,31 @@ async fn set_voice_muted(state: tauri::State<'_, AppState>, muted: bool) -> Resu
 }
 
 /// Turn voice on or off, persisting the choice. Enabling provisions and starts it
-/// in the background (a first-run download does not block this call).
+/// in the background (a first-run download does not block this call). Disabling
+/// winds the pipeline down in the background too: `VoiceService::shutdown` waits
+/// for the driver task, and holding this command (and the `state.voice` lock) on
+/// that would freeze the settings toggle.
 #[tauri::command]
 async fn set_voice_enabled(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
-    let mut settings = state.settings_store.load().map_err(|e| e.to_string())?;
-    settings.voice_enabled = enabled;
-    let start_muted = settings.voice_muted;
-    state
-        .settings_store
-        .save(&settings)
-        .map_err(|e| e.to_string())?;
+    state.update_settings(|settings| settings.voice_enabled = enabled)?;
 
     match enabled {
         // Provision + start in the background (a first-run download must not block
-        // this call). Already running → nothing to do.
+        // this call). Already running → nothing to do; start_voice itself re-checks
+        // the settings after provisioning and discards duplicates.
         true => {
             if state.voice.lock().await.is_none() {
                 let app = app.clone();
-                tauri::async_runtime::spawn(async move { start_voice(app, start_muted).await });
+                tauri::async_runtime::spawn(async move { start_voice(app).await });
             }
         }
         false => {
             if let Some(service) = state.voice.lock().await.take() {
-                service.shutdown().await;
+                tauri::async_runtime::spawn(async move { service.shutdown().await });
             }
         }
     }
@@ -2063,6 +2116,7 @@ fn main() {
                 character: Mutex::new(CharacterTracker::default()),
                 hit_mask: std::sync::Mutex::new(None),
                 voice: Mutex::new(None),
+                settings_write: std::sync::Mutex::new(()),
             });
 
             let handle = app.handle().clone();

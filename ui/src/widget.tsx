@@ -295,38 +295,49 @@ function App() {
     }
   }
 
-  onMount(async () => {
-    const unlistenState = await onGatewayState((state) => {
-      setGateway(state);
-      void ensureThread(state);
-    });
-    const unlistenChat = await onChatEvent(handleChatEvent);
-    const unlistenFill = await onBrowserApproval((request) => {
-      // A sensitive fill needs a decision now; force the panel open so the prompt
-      // is visible even if the user had collapsed it, the same as a tool gate.
-      setFills((current) => [...current, request]);
-      setPanelOpen(true);
-    });
+  onMount(() => {
+    // onCleanup must register SYNCHRONOUSLY inside onMount: after the first
+    // `await` in an async closure the Solid owner is gone, and a late onCleanup
+    // silently never registers — leaking every listener on unmount. The cleanups
+    // are collected into a list the async work appends to.
+    const cleanups: (() => void)[] = [];
     onCleanup(() => {
-      unlistenState();
-      unlistenChat();
-      unlistenFill();
+      cleanups.forEach((fn) => fn());
       clearTimeout(speakingTimer);
     });
 
-    try {
-      // Covers the race where the gateway became ready before we subscribed.
-      const initial = await api.gatewayState();
-      setGateway(initial);
-      await ensureThread(initial);
-    } catch (error) {
-      push({ role: "error", text: `The agent is not reachable: ${error}` });
-    }
+    void (async () => {
+      cleanups.push(
+        await onGatewayState((state) => {
+          setGateway(state);
+          void ensureThread(state);
+        }),
+      );
+      cleanups.push(await onChatEvent(handleChatEvent));
+      cleanups.push(
+        await onBrowserApproval((request) => {
+          // A sensitive fill needs a decision now; force the panel open so the
+          // prompt is visible even if the user had collapsed it, the same as a
+          // tool gate.
+          setFills((current) => [...current, request]);
+          setPanelOpen(true);
+        }),
+      );
 
-    // On a fresh install, open the dashboard so the first-run wizard is seen.
-    if (await api.needsSetup().catch(() => false)) {
-      void api.openDashboard().catch(() => undefined);
-    }
+      try {
+        // Covers the race where the gateway became ready before we subscribed.
+        const initial = await api.gatewayState();
+        setGateway(initial);
+        await ensureThread(initial);
+      } catch (error) {
+        push({ role: "error", text: `The agent is not reachable: ${error}` });
+      }
+
+      // On a fresh install, open the dashboard so the first-run wizard is seen.
+      if (await api.needsSetup().catch(() => false)) {
+        void api.openDashboard().catch(() => undefined);
+      }
+    })();
   });
 
   async function send(event: SubmitEvent) {
@@ -584,72 +595,73 @@ function CharacterView(props: { panelOpen: () => boolean; onHeadTap: () => void 
     ),
   );
 
-  onMount(async () => {
+  onMount(() => {
     if (!container) return;
 
-    // Try the configured Live2D/sprite character; on any failure — missing
-    // Core, a bad asset path, an unreadable config — fall back to the
-    // placeholder so the character still reacts and the log carries the reason.
-    let renderer: CharacterRenderer;
-    try {
-      const { config_url } = await api.characterSettings();
-      const config = await loadCharacterConfig(config_url);
-      renderer = createRenderer(config);
-      await renderer.mount(container);
-    } catch (error) {
-      const detail = `character: falling back to the placeholder (Live2DCubismCore ${
-        typeof (window as { Live2DCubismCore?: unknown }).Live2DCubismCore
-      }) — ${String(error)}`;
-      console.error(detail, error);
-      renderer = createRenderer(PLACEHOLDER_CONFIG);
-      await renderer.mount(container);
-    }
+    // onCleanup must register SYNCHRONOUSLY (after an `await` the Solid owner is
+    // gone and it silently never registers); the async work below appends its
+    // teardown steps to this list as it creates things.
+    const cleanups: (() => void)[] = [];
+    onCleanup(() => cleanups.forEach((fn) => fn()));
 
-    const unlistenState = await onCharacterState((state) => renderer.setState(state));
-    renderer.setState(await api.characterState());
-    const unlistenCursor = await onCursorPos((pos) => renderer.focus?.(pos.x, pos.y));
-    const unlistenActive = await onCharacterActive(
-      (active) => renderer.setActive?.(active),
-    );
-    // Real TTS amplitude → the character's mouth (replaces the Phase 3 test tone).
-    const unlistenAmplitude = await onVoiceAmplitude(
-      (level) => renderer.setMouthOpen?.(level),
-    );
-    // Voice-loop state → the mic-live indicator.
-    const unlistenVoice = await onVoiceState((state) => setVoiceState(state));
+    void (async () => {
+      // Try the configured Live2D/sprite character; on any failure — missing
+      // Core, a bad asset path, an unreadable config — fall back to the
+      // placeholder so the character still reacts and the log carries the reason.
+      let renderer: CharacterRenderer;
+      try {
+        const { config_url } = await api.characterSettings();
+        const config = await loadCharacterConfig(config_url);
+        renderer = createRenderer(config);
+        await renderer.mount(container);
+      } catch (error) {
+        const detail = `character: falling back to the placeholder (Live2DCubismCore ${
+          typeof (window as { Live2DCubismCore?: unknown }).Live2DCubismCore
+        }) — ${String(error)}`;
+        console.error(detail, error);
+        renderer = createRenderer(PLACEHOLDER_CONFIG);
+        await renderer.mount(container);
+      }
+      cleanups.push(() => renderer.destroy());
 
-    // Click head = summon/dismiss the chat panel; drag body = move the window.
-    const onPointerDown = (event: PointerEvent) => {
-      if (event.button !== 0) return;
-      const hit = renderer.hitAt?.(event.clientX, event.clientY);
-      if (hit === "head") props.onHeadTap();
-      if (hit === "body") void api.startDragging().catch(() => undefined);
-    };
-    container.addEventListener("pointerdown", onPointerDown);
-
-    // The click-through mask. Refreshed on a slow tick (the silhouette drifts
-    // with idle motion), and immediately when the panel toggles.
-    const pushMask = () => {
-      const profile = renderer.hitProfile?.(MASK_CELL) ?? null;
-      const solids = Array.from(
-        document.querySelectorAll<HTMLElement>(".bubble-panel"),
+      cleanups.push(await onCharacterState((state) => renderer.setState(state)));
+      renderer.setState(await api.characterState());
+      cleanups.push(await onCursorPos((pos) => renderer.focus?.(pos.x, pos.y)));
+      cleanups.push(
+        await onCharacterActive((active) => renderer.setActive?.(active)),
       );
-      void api.setHitMask(buildHitMask(profile, solids)).catch(() => undefined);
-    };
-    pushMask();
-    const maskTimer = setInterval(pushMask, 700);
-    setMaskPusher(() => pushMask);
+      // Real TTS amplitude → the character's mouth (replaces the Phase 3 test
+      // tone).
+      cleanups.push(
+        await onVoiceAmplitude((level) => renderer.setMouthOpen?.(level)),
+      );
+      // Voice-loop state → the mic-live indicator.
+      cleanups.push(await onVoiceState((state) => setVoiceState(state)));
 
-    onCleanup(() => {
-      clearInterval(maskTimer);
-      container?.removeEventListener("pointerdown", onPointerDown);
-      unlistenState();
-      unlistenCursor();
-      unlistenActive();
-      unlistenAmplitude();
-      unlistenVoice();
-      renderer.destroy();
-    });
+      // Click head = summon/dismiss the chat panel; drag body = move the window.
+      const onPointerDown = (event: PointerEvent) => {
+        if (event.button !== 0) return;
+        const hit = renderer.hitAt?.(event.clientX, event.clientY);
+        if (hit === "head") props.onHeadTap();
+        if (hit === "body") void api.startDragging().catch(() => undefined);
+      };
+      container.addEventListener("pointerdown", onPointerDown);
+      cleanups.push(() => container?.removeEventListener("pointerdown", onPointerDown));
+
+      // The click-through mask. Refreshed on a slow tick (the silhouette drifts
+      // with idle motion), and immediately when the panel toggles.
+      const pushMask = () => {
+        const profile = renderer.hitProfile?.(MASK_CELL) ?? null;
+        const solids = Array.from(
+          document.querySelectorAll<HTMLElement>(".bubble-panel"),
+        );
+        void api.setHitMask(buildHitMask(profile, solids)).catch(() => undefined);
+      };
+      pushMask();
+      const maskTimer = setInterval(pushMask, 700);
+      cleanups.push(() => clearInterval(maskTimer));
+      setMaskPusher(() => pushMask);
+    })();
   });
 
   // The mic-live indicator: a small dot on the character while the loop is active.

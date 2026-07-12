@@ -43,6 +43,10 @@ const RING_SECONDS: f32 = 12.0;
 /// How long to wait for a spoken turn's reply before giving up and staying quiet.
 const TURN_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How long Listening waits for a speech onset before giving up — a false wake or
+/// an abandoned push-to-talk must not leave the character "listening" forever.
+const LISTEN_TIMEOUT: Duration = Duration::from_secs(12);
+
 /// Yields a gateway client when the gateway is ready, or `None` while it is still
 /// starting. The widget implements this over its app state.
 pub type ClientProvider =
@@ -174,7 +178,9 @@ pub async fn start(
         Arc::new(|| CpalCapture::start(RING_SECONDS).map(|c| Box::new(c) as Box<dyn Capture>));
 
     // The reply path: transcript → gateway turn → spoken reply, on voice's own
-    // lazily-created thread.
+    // lazily-created thread. A send that fails (a wiped/lost thread after a
+    // user-initiated data reset) drops the cached thread and retries once on a
+    // fresh one, so voice recovers without an app restart.
     let thread: Arc<tokio::sync::Mutex<Option<ThreadId>>> = Arc::new(tokio::sync::Mutex::new(None));
     let reply: ic_voice::ReplyFn = {
         let provider = Arc::clone(&client_provider);
@@ -183,8 +189,22 @@ pub async fn start(
             let thread = Arc::clone(&thread);
             Box::pin(async move {
                 let client = provider().await?;
-                let thread_id = ensure_thread(&client, &thread).await?;
-                drive_turn(&client, &thread_id, &transcript).await
+                for attempt in 0..2 {
+                    let thread_id = ensure_thread(&client, &thread).await?;
+                    match drive_turn(&client, &thread_id, &transcript).await {
+                        TurnResult::Reply(text) => return Some(speechify(&text)),
+                        TurnResult::NothingToSpeak => return None,
+                        TurnResult::SendFailed => {
+                            // The cached thread may be gone (wiped data). Forget it
+                            // and try once on a fresh one.
+                            *thread.lock().await = None;
+                            if attempt == 1 {
+                                return None;
+                            }
+                        }
+                    }
+                }
+                None
             })
         })
     };
@@ -200,6 +220,7 @@ pub async fn start(
         on_state,
         amplitude,
         endpoint: ic_voice::EndpointConfig::default(),
+        listen_timeout: LISTEN_TIMEOUT,
         start_muted,
     };
 
@@ -247,18 +268,31 @@ async fn ensure_thread(
     }
 }
 
+/// How a spoken turn ended, distinguishing "the send itself failed" (retryable on
+/// a fresh thread) from "sent, but nothing to speak" (final).
+pub enum TurnResult {
+    /// The turn completed with this reply text.
+    Reply(String),
+    /// The turn happened but produced nothing speakable (failed run, timeout,
+    /// empty reply, or the thread was busy).
+    NothingToSpeak,
+    /// `send_message` itself failed — the thread may no longer exist.
+    SendFailed,
+}
+
 /// Drive one full turn to completion and return the assistant's reply.
 ///
 /// Sends the transcript, follows the run's status on the event stream until it is
 /// terminal, then reads the latest assistant message off the timeline — the same
 /// send → await-terminal → read-timeline dance the typed UI does, since the reply
-/// text never rides the event stream itself. `None` on a failed run, a timeout, or
-/// an empty reply.
+/// text never rides the event stream itself.
 pub async fn drive_turn(
     client: &GatewayClient,
     thread_id: &ThreadId,
     transcript: &str,
-) -> Option<String> {
+) -> TurnResult {
+    use crate::gateway_client::SubmitOutcome;
+
     let outcome = match client
         .send_message(thread_id, transcript, &ClientActionId::new())
         .await
@@ -266,10 +300,20 @@ pub async fn drive_turn(
         Ok(outcome) => outcome,
         Err(error) => {
             tracing::warn!(%error, "could not send the spoken transcript");
-            return None;
+            return TurnResult::SendFailed;
         }
     };
-    let run_id = outcome.run_id().clone();
+    let run_id = match outcome {
+        SubmitOutcome::Submitted { run_id } | SubmitOutcome::AlreadySubmitted { run_id } => run_id,
+        // The thread is busy with a PREVIOUS run; our message was accepted but has
+        // no run yet, and the `active_run_id` in this outcome is the old one.
+        // Tracking it would speak the previous question's answer as if it were
+        // ours — fail the turn instead (the reply will still land in the thread).
+        SubmitOutcome::DeferredBusy { .. } => {
+            tracing::info!("the voice thread is busy with an earlier turn; staying quiet");
+            return TurnResult::NothingToSpeak;
+        }
+    };
 
     let terminal_ok =
         tokio::time::timeout(TURN_TIMEOUT, async {
@@ -296,11 +340,11 @@ pub async fn drive_turn(
         Ok(true) => {}
         Ok(false) => {
             tracing::info!("spoken turn ended without a reply to speak");
-            return None;
+            return TurnResult::NothingToSpeak;
         }
         Err(_) => {
             tracing::warn!("spoken turn timed out waiting for a reply");
-            return None;
+            return TurnResult::NothingToSpeak;
         }
     }
 
@@ -308,10 +352,106 @@ pub async fn drive_turn(
         Ok(timeline) => timeline
             .latest_assistant_reply()
             .and_then(|message| message.content.clone())
-            .filter(|text| !text.trim().is_empty()),
+            .filter(|text| !text.trim().is_empty())
+            .map_or(TurnResult::NothingToSpeak, TurnResult::Reply),
         Err(error) => {
             tracing::warn!(%error, "could not read the spoken reply from the timeline");
-            None
+            TurnResult::NothingToSpeak
         }
+    }
+}
+
+/// Make an LLM reply listenable: drop the markup a voice should not read aloud.
+///
+/// Replies are markdown. Reading "asterisk asterisk" is worse than useless, and a
+/// fenced code block spoken character-by-character is minutes of noise. This is a
+/// light-touch text pass, not a markdown parser: fenced blocks become a short
+/// notice, and inline emphasis/backticks/link syntax dissolve into their text.
+pub fn speechify(markdown: &str) -> String {
+    let mut out = String::with_capacity(markdown.len());
+    let mut in_fence = false;
+    let mut skipped_code = false;
+    for line in markdown.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            if !in_fence {
+                skipped_code = true;
+            }
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if skipped_code {
+            out.push_str("(code omitted) ");
+            skipped_code = false;
+        }
+        // Headers and list bullets read fine as plain sentences.
+        let line = trimmed
+            .trim_start_matches('#')
+            .trim_start_matches(['-', '*', '>'])
+            .trim_start();
+        let mut chars = line.chars().peekable();
+        let mut link_text = false;
+        while let Some(c) = chars.next() {
+            match c {
+                // Emphasis and inline code markers dissolve.
+                '*' | '_' | '`' => {}
+                // [text](url) → text: keep the bracket contents, skip the url.
+                '[' => link_text = true,
+                ']' => {
+                    link_text = false;
+                    if chars.peek() == Some(&'(') {
+                        for next in chars.by_ref() {
+                            if next == ')' {
+                                break;
+                            }
+                        }
+                    }
+                }
+                _ => out.push(c),
+            }
+        }
+        let _ = link_text;
+        out.push(' ');
+    }
+    if skipped_code {
+        out.push_str("(code omitted)");
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::speechify;
+
+    #[test]
+    fn code_blocks_become_a_short_notice() {
+        let reply = "Here you go:\n```rust\nfn main() {}\n```\nDone.";
+        assert_eq!(speechify(reply), "Here you go: (code omitted) Done.");
+    }
+
+    #[test]
+    fn emphasis_backticks_and_links_dissolve_into_their_text() {
+        let reply = "**Bold** and _quiet_ with `inline` and [a link](https://example.com).";
+        assert_eq!(speechify(reply), "Bold and quiet with inline and a link.");
+    }
+
+    #[test]
+    fn headers_and_bullets_read_as_sentences() {
+        let reply = "## Plan\n- First thing\n- Second thing";
+        assert_eq!(speechify(reply), "Plan First thing Second thing");
+    }
+
+    #[test]
+    fn plain_text_passes_through() {
+        assert_eq!(speechify("It is noon."), "It is noon.");
+    }
+
+    #[test]
+    fn an_unterminated_fence_still_notes_the_code() {
+        let reply = "Look:\n```python\nprint('hi')";
+        assert_eq!(speechify(reply), "Look: (code omitted)");
     }
 }

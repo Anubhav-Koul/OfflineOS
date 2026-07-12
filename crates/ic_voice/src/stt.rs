@@ -95,21 +95,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_too_short_utterance_transcribes_to_nothing_without_a_model() {
-        // Below the minimum, transcribe short-circuits before touching whisper —
-        // so this needs no model file and no whisper build to run.
-        struct Bypass {
-            threads: i32,
-        }
-        impl Bypass {
-            fn transcribe(&self, samples: &[f32]) -> Option<String> {
-                (samples.len() < MIN_UTTERANCE_SAMPLES).then(String::new)
-            }
-        }
-        let bypass = Bypass { threads: 1 };
-        assert_eq!(bypass.transcribe(&[0.0; 100]), Some(String::new()));
-        assert_eq!(bypass.transcribe(&vec![0.0; MIN_UTTERANCE_SAMPLES]), None);
-        let _ = bypass.threads;
+    fn the_minimum_utterance_is_a_tenth_of_a_second() {
+        // The short-circuit threshold must track the sample rate — a hardcoded
+        // count that drifted from 16 kHz would silently skip real words.
+        assert_eq!(MIN_UTTERANCE_SAMPLES, SAMPLE_RATE as usize / 10);
     }
 
     /// Transcribe a real recording. Ignored: needs the bundled whisper model.

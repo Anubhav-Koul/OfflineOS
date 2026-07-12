@@ -45,9 +45,13 @@ mod imp {
         client: IMMNotificationClient,
     }
 
-    // The registered COM objects are MTA (created with `COINIT_MULTITHREADED`) and
-    // this value only ever touches them from `start` and `drop` on one thread; the
-    // callback it carries is itself `Send + Sync`. So it is safe to move and share.
+    // SAFETY of the impls below: the wrapped COM pointers are created in the MTA
+    // (we call `CoInitializeEx(COINIT_MULTITHREADED)` before creating them, and if
+    // that returns RPC_E_CHANGED_MODE the creating thread was an STA but the
+    // process still gains an implicit MTA). MTA COM interface pointers may be
+    // called from any thread, including whichever tokio worker eventually runs
+    // `Drop` — which is exactly what `Send`/`Sync` here permit. The value itself
+    // has no interior state beyond those pointers and a `Send + Sync` callback.
     unsafe impl Send for DeviceWatcher {}
     unsafe impl Sync for DeviceWatcher {}
 
@@ -57,8 +61,16 @@ mod imp {
         pub fn start(on_change: DeviceChangeFn) -> Result<Self> {
             unsafe {
                 // The widget's runtime may already have initialised COM on other
-                // threads; MTA here is fine and a "changed mode" result is benign.
-                let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+                // threads; MTA here is fine. A "changed mode" result means this
+                // thread was already an STA — notifications then depend on that
+                // thread pumping messages, so make it visible in the log.
+                let init = CoInitializeEx(None, COINIT_MULTITHREADED);
+                if init.is_err() {
+                    tracing::debug!(
+                        hresult = format!("{init:?}"),
+                        "COM already initialised in a different mode on this thread"
+                    );
+                }
 
                 let enumerator: IMMDeviceEnumerator =
                     CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|error| {

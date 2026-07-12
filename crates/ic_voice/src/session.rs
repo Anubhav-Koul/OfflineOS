@@ -65,6 +65,9 @@ pub enum VoiceEvent {
     WakeDetected,
     /// VAD saw the utterance end (a stretch of silence after speech).
     SpeechEnded,
+    /// Listening began but no speech onset arrived within the driver's timeout —
+    /// a false wake or an abandoned push-to-talk. Give up without transcribing.
+    ListenTimeout,
     /// Whisper produced a transcript. Empty means it heard nothing usable.
     Transcribed(String),
     /// The gateway returned a reply.
@@ -73,7 +76,10 @@ pub enum VoiceEvent {
     ReplyFailed,
     /// TTS playback finished on its own.
     SpeakingEnded,
-    /// VAD heard the user start speaking *while we were speaking* — barge-in.
+    /// The user cut in *while we were speaking* — the wake word fired or the
+    /// summon hotkey was pressed during playback. (Deliberately not raw VAD: the
+    /// microphone hears the character's own TTS through the speakers, and a
+    /// VAD-driven barge-in self-triggers on that echo.)
     BargeIn,
 }
 
@@ -125,8 +131,13 @@ impl VoiceSession {
     /// (the state is unchanged and the effect is `None`), so a late or duplicate
     /// event can't corrupt the flow.
     pub fn on(&mut self, event: VoiceEvent) -> VoiceEffect {
-        // Mute overrides everything, from any state.
+        // Mute overrides everything, from any state — but only a *change*. A
+        // redundant unmute (a tray double-toggle, a startup state sync) must not
+        // snap an in-flight turn back to Idle and orphan a live playback.
         if let VoiceEvent::MuteChanged(muted) = event {
+            if muted == (self.state == VoiceState::Muted) {
+                return VoiceEffect::None; // already in the requested state
+            }
             let was_speaking = self.state == VoiceState::Speaking;
             self.state = if muted {
                 VoiceState::Muted
@@ -153,6 +164,11 @@ impl VoiceSession {
             (VoiceState::Listening, VoiceEvent::SpeechEnded) => {
                 self.state = VoiceState::Transcribing;
                 VoiceEffect::BeginTranscription
+            }
+            (VoiceState::Listening, VoiceEvent::ListenTimeout) => {
+                // Nothing was said. Back to waiting for the wake word.
+                self.state = VoiceState::Idle;
+                VoiceEffect::None
             }
             (VoiceState::Transcribing, VoiceEvent::Transcribed(text)) => {
                 if text.trim().is_empty() {
@@ -282,6 +298,45 @@ mod tests {
         let mut session = VoiceSession::new();
         assert_eq!(session.on(VoiceEvent::MuteChanged(true)), VoiceEffect::None);
         assert_eq!(session.state(), VoiceState::Muted);
+    }
+
+    /// A redundant unmute (already unmuted) must be a no-op — snapping to Idle
+    /// mid-turn would abandon the utterance or orphan a live playback.
+    #[test]
+    fn a_redundant_unmute_does_not_cancel_an_in_flight_turn() {
+        let mut session = VoiceSession::new();
+        session.on(VoiceEvent::WakeDetected);
+        session.on(VoiceEvent::SpeechEnded);
+        session.on(VoiceEvent::Transcribed("hi".into()));
+        session.on(VoiceEvent::ReplyReceived("Hello!".into()));
+        assert_eq!(session.state(), VoiceState::Speaking);
+
+        // We are not muted; an unmute request changes nothing.
+        assert_eq!(
+            session.on(VoiceEvent::MuteChanged(false)),
+            VoiceEffect::None
+        );
+        assert_eq!(session.state(), VoiceState::Speaking);
+
+        // And a redundant mute while muted is equally inert.
+        session.on(VoiceEvent::MuteChanged(true));
+        assert_eq!(session.state(), VoiceState::Muted);
+        assert_eq!(session.on(VoiceEvent::MuteChanged(true)), VoiceEffect::None);
+        assert_eq!(session.state(), VoiceState::Muted);
+    }
+
+    /// A wake with no speech after it gives up via the driver's timeout, without
+    /// transcribing anything.
+    #[test]
+    fn a_listen_timeout_returns_to_idle_without_transcription() {
+        let mut session = VoiceSession::new();
+        session.on(VoiceEvent::WakeDetected);
+        assert_eq!(session.state(), VoiceState::Listening);
+        assert_eq!(session.on(VoiceEvent::ListenTimeout), VoiceEffect::None);
+        assert_eq!(session.state(), VoiceState::Idle);
+        // Outside Listening the event is meaningless and ignored.
+        assert_eq!(session.on(VoiceEvent::ListenTimeout), VoiceEffect::None);
+        assert_eq!(session.state(), VoiceState::Idle);
     }
 
     #[test]

@@ -1,10 +1,21 @@
 //! Microphone capture: cpal → downmix → resample → the shared ring.
 //!
-//! Opens the default WASAPI input device, and on every callback converts the
-//! device's format (any channel count, `f32` or `i16`, any rate) into 16 kHz mono
-//! `f32` and writes it to a [`SampleRing`] the wake-word / VAD / whisper stages
-//! read from. The callback does the minimum and never blocks — the ring absorbs
-//! bursts and the readers run elsewhere.
+//! Opens a WASAPI input device, and on every callback converts the device's format
+//! (any channel count, `f32` or `i16`, any rate) into 16 kHz mono `f32` and writes
+//! it to a [`SampleRing`] the wake-word / VAD / whisper stages read from. The
+//! callback does the minimum and never blocks — the ring absorbs bursts and the
+//! readers run elsewhere.
+//!
+//! **The default device cannot be trusted.** A paired Bluetooth speaker or soundbar
+//! registers a "Headset" (HFP) capture endpoint that Windows happily makes the
+//! default — and that endpoint opens cleanly, reports healthy, and then delivers
+//! **zero samples forever** unless the headset engages call mode (observed on real
+//! hardware: the default endpoint produced nothing while the actual microphone one
+//! device down worked perfectly). So [`CpalCapture::start`] *verifies audio
+//! actually flows* within a short probe window and falls back through the other
+//! input devices; only a machine where no device delivers is an error. Note that a
+//! live-but-quiet room still delivers callbacks (silence is samples), so "no
+//! callbacks" reliably means a dead endpoint, not a quiet one.
 //!
 //! Capture sits behind the [`Capture`] trait so the pipeline can be driven by a
 //! fake that plays canned audio into the ring, with no microphone. The cpal
@@ -12,6 +23,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -20,10 +32,22 @@ use crate::format::{self, SAMPLE_RATE};
 use crate::resample::Resampler;
 use crate::ring::SampleRing;
 
+/// How long a freshly-opened device gets to deliver its first samples before it is
+/// declared dead and the next device is tried. A live mic's first callback arrives
+/// within tens of milliseconds (plus one resampler chunk of buffering); half a
+/// second is generous.
+const PROBE_WINDOW: Duration = Duration::from_millis(500);
+
 /// A running microphone capture, writing 16 kHz mono into a ring.
 pub trait Capture: Send {
     /// The ring this capture writes into.
     fn ring(&self) -> SampleRing;
+    /// Whether the device is still delivering audio. `false` after a stream error
+    /// (device unplugged without a default-change notification); the driver drops
+    /// the capture and reopens. Defaults to healthy for fakes.
+    fn is_healthy(&self) -> bool {
+        true
+    }
     /// Stop capturing and release the device.
     fn stop(self: Box<Self>);
 }
@@ -37,18 +61,91 @@ pub struct CpalCapture {
 }
 
 impl CpalCapture {
-    /// Open the default input device and start capturing into a fresh ring sized
-    /// for `ring_seconds` of audio.
+    /// Start capturing into a fresh ring sized for `ring_seconds` of audio, from
+    /// the first input device that **actually delivers samples** — the default
+    /// device first, then every other input. A device that opens but produces
+    /// nothing within [`PROBE_WINDOW`] (the dead Bluetooth-headset-endpoint
+    /// failure mode) is skipped, not trusted.
+    ///
+    /// Blocks up to `PROBE_WINDOW` per dead device; the driver calls this off any
+    /// latency-sensitive path (startup, unmute, device change).
     pub fn start(ring_seconds: f32) -> Result<Self> {
         let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or_else(|| Error::NoDevice("no default input device".into()))?;
+        let ring = SampleRing::for_seconds(ring_seconds);
+
+        // Default first — it is usually right — then the rest, deduplicated by
+        // description (the default also appears in the enumeration).
+        let mut candidates: Vec<cpal::Device> = Vec::new();
+        candidates.extend(host.default_input_device());
+        match host.input_devices() {
+            Ok(devices) => candidates.extend(devices),
+            Err(error) => tracing::warn!(%error, "could not enumerate input devices"),
+        }
+
+        let mut tried: Vec<String> = Vec::new();
+        for device in candidates {
+            let label = device
+                .description()
+                .map(|d| d.to_string())
+                .unwrap_or_else(|_| "<unnamed input>".into());
+            if tried.contains(&label) {
+                continue;
+            }
+            tried.push(label.clone());
+
+            let capture = match Self::open(&device, ring.clone()) {
+                Ok(capture) => capture,
+                Err(error) => {
+                    tracing::warn!(device = %label, %error, "could not open an input device");
+                    continue;
+                }
+            };
+            if capture.delivers_audio(PROBE_WINDOW) {
+                tracing::info!(device = %label, "microphone capture started");
+                return Ok(capture);
+            }
+            // Opened cleanly, reported no error, delivered nothing: a dead
+            // endpoint (e.g. a Bluetooth speaker's idle HFP mic). Next.
+            tracing::warn!(
+                device = %label,
+                "input device delivered no audio; trying the next one"
+            );
+            drop(capture);
+        }
+
+        Err(Error::NoDevice(if tried.is_empty() {
+            "no input device present".into()
+        } else {
+            format!(
+                "no input device delivered audio (tried: {})",
+                tried.join(", ")
+            )
+        }))
+    }
+
+    /// Wait up to `window` for the first samples to land in the ring. A live mic
+    /// delivers callbacks even in a silent room, so an empty ring after the window
+    /// means the endpoint is dead.
+    fn delivers_audio(&self, window: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < window {
+            if !self.ring.is_empty() {
+                return true;
+            }
+            if !self.is_healthy() {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        false
+    }
+
+    /// Open a capture stream on `device`, writing 16 kHz mono into `ring`.
+    fn open(device: &cpal::Device, ring: SampleRing) -> Result<Self> {
         let config = device
             .default_input_config()
             .map_err(|error| Error::audio(format!("reading the input config: {error}")))?;
 
-        let ring = SampleRing::for_seconds(ring_seconds);
         let channels = config.channels() as usize;
         // cpal 0.18's `SampleRate` is a `u32` alias, not a newtype.
         let input_rate = config.sample_rate();
@@ -99,12 +196,12 @@ impl CpalCapture {
             .play()
             .map_err(|error| Error::audio(format!("starting the capture stream: {error}")))?;
 
-        tracing::info!(
+        tracing::debug!(
             input_rate,
             channels,
             ?sample_format,
             target_rate = SAMPLE_RATE,
-            "microphone capture started"
+            "capture stream opened; probing for audio"
         );
         Ok(Self {
             stream,
@@ -122,6 +219,10 @@ impl CpalCapture {
 impl Capture for CpalCapture {
     fn ring(&self) -> SampleRing {
         self.ring.clone()
+    }
+
+    fn is_healthy(&self) -> bool {
+        CpalCapture::is_healthy(self)
     }
 
     fn stop(self: Box<Self>) {

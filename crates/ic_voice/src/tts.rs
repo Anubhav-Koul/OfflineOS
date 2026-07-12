@@ -108,15 +108,22 @@ impl PiperTts {
             return Err(Error::io("enlisting Piper in the process job", source));
         }
 
-        // Piper reads one line per utterance; the newline commits it. Dropping
-        // stdin then signals end-of-input so the process finishes and exits.
+        // Piper reads ONE line per utterance; the newline commits it. The text must
+        // therefore be a single line — a multi-line reply would (a) be synthesized
+        // as N separate utterances and, worse, (b) deadlock the pipes: Piper starts
+        // writing line 1's PCM to a stdout nobody drains yet while we are still
+        // blocked writing the remaining lines into its full stdin. A single line is
+        // safe at any length, because Piper consumes stdin up to the newline before
+        // it produces any output. Dropping stdin then signals end-of-input so the
+        // process finishes and exits.
         {
+            let line = single_line(text);
             let mut stdin = child
                 .stdin
                 .take()
                 .ok_or_else(|| Error::Tts("Piper stdin was not piped".into()))?;
             stdin
-                .write_all(text.as_bytes())
+                .write_all(line.as_bytes())
                 .and_then(|()| stdin.write_all(b"\n"))
                 .map_err(|source| Error::io("writing text to Piper", source))?;
         }
@@ -154,6 +161,13 @@ impl Synthesizer for PiperTts {
             sample_rate: self.sample_rate,
         })
     }
+}
+
+/// Collapse all whitespace runs (including newlines) to single spaces, yielding the
+/// one line Piper expects per utterance. See the pipe-deadlock note in
+/// [`PiperTts::run`].
+fn single_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Read the `audio.sample_rate` from a Piper voice config that sits beside the
@@ -205,6 +219,18 @@ mod tests {
             parse_sample_rate("\"sample_rate\"   :\n   16000,"),
             Some(16_000)
         );
+    }
+
+    #[test]
+    fn multi_line_text_collapses_to_one_line_for_piper() {
+        // A multi-line LLM reply must become a single utterance line — newlines
+        // into Piper's stdin deadlock the pipes on long replies.
+        let reply = "First paragraph.\n\nSecond one,\r\nwith a wrapped   line.";
+        assert_eq!(
+            single_line(reply),
+            "First paragraph. Second one, with a wrapped line."
+        );
+        assert!(!single_line(reply).contains('\n'));
     }
 
     #[test]

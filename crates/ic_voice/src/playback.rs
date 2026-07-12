@@ -148,6 +148,11 @@ fn run_lip_sync_tap(
     amplitude: &AmplitudeSink,
 ) {
     let window = (device_rate as f32 * TAP_INTERVAL.as_secs_f32()).max(1.0) as usize;
+    let total = render.len();
+    let duration = total as f32 / device_rate.max(1) as f32;
+    // If the callback has not drained the clip well past its duration, the device
+    // died mid-clip; bail rather than spin forever.
+    let stall_deadline = Duration::from_secs_f32(duration * 1.5 + 1.0);
     let mut follower = EnvelopeFollower::new();
     let start = Instant::now();
     let mut next_tick = TAP_INTERVAL;
@@ -156,20 +161,25 @@ fn run_lip_sync_tap(
         if stopped.load(Ordering::SeqCst) {
             break;
         }
-        // Track playback position by wall-clock time so the mouth matches the ear.
-        let elapsed = start.elapsed();
-        let pos = (elapsed.as_secs_f32() * device_rate as f32) as usize;
-        if pos >= render.len() {
+        // The callback's own progress is the ground truth for *completion*: the
+        // wall clock runs ahead of the device (output latency), and exiting on it
+        // alone would drop the stream while the tail is still buffered — clipping
+        // the end of every reply on a high-latency device.
+        let done = played.load(Ordering::SeqCst);
+        if done >= total {
             break;
         }
-        let end = (pos + window).min(render.len());
+        let elapsed = start.elapsed();
+        if elapsed >= stall_deadline {
+            tracing::warn!("playback stalled; abandoning the clip");
+            break;
+        }
+        // The wall clock still *paces the mouth* (it tracks what the ear hears
+        // better than the callback's write-ahead position), clamped to the clip.
+        let pos = ((elapsed.as_secs_f32() * device_rate as f32) as usize).min(total - 1);
+        let end = (pos + window).min(total);
         let level = follower.push(&render[pos..end]);
         amplitude(level);
-
-        // Also stop promptly if the callback has drained everything.
-        if played.load(Ordering::SeqCst) >= render.len() {
-            break;
-        }
 
         // Sleep to the next tick relative to start, resisting drift.
         let now = start.elapsed();

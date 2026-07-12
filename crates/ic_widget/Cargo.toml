@@ -43,6 +43,10 @@ ic_llama = { path = "../ic_llama" }
 ic_browser_mcp = { path = "../ic_browser_mcp" }
 # The canvas tool: served in-process, so the widget links it directly.
 ic_canvas_mcp = { path = "../ic_canvas_mcp" }
+# The voice pipeline: a library linked in (not a child), because it needs the
+# AppHandle for lip-sync/state events and the tray mute, and the GatewayClient to
+# send transcripts down the same chat path.
+ic_voice = { path = "../ic_voice" }
 
 tokio = { version = "1", features = [
     "fs",

@@ -108,6 +108,11 @@ struct AppState {
     /// A `std` mutex: written from an IPC command, read by the cursor poller,
     /// held only for a lookup — never across an await.
     hit_mask: std::sync::Mutex<Option<HitMask>>,
+    /// The voice pipeline, when enabled and provisioned. `None` when voice is off,
+    /// still provisioning, or unavailable (no mic / failed model load). Held for
+    /// its `Drop`, which stops the loop and releases the mic; Piper also rides in
+    /// `job`, so a hard kill takes it down too.
+    voice: Mutex<Option<ic_widget::voice::VoiceService>>,
 }
 
 /// The inputs the character state derives from, plus the last state emitted.
@@ -1636,13 +1641,224 @@ async fn bring_up_gateway(app: AppHandle, selection: ProviderSelection) {
     }
 }
 
+// ---------------------------------------------------------------- voice
+
+/// Where the voice models (whisper, Piper voice + exe) live.
+fn voice_root() -> Result<PathBuf, String> {
+    dirs::data_local_dir()
+        .map(|base| base.join("IronClaw Desktop").join("voice"))
+        .ok_or_else(|| "could not locate the local application data directory".to_string())
+}
+
+/// The bundled directory of rustpotter wakeword models (`.rpw`). Empty until we
+/// ship recorded reference models — until then voice uses push-to-talk.
+fn voice_wake_dir(app: &AppHandle) -> PathBuf {
+    app.path()
+        .resource_dir()
+        .map(|dir| dir.join("voice-wakewords"))
+        .unwrap_or_else(|_| PathBuf::from("voice-wakewords"))
+}
+
+/// Start voice in the background if the user has enabled it. Provisioning may
+/// download the speech models on first run, so this never blocks the UI.
+fn maybe_start_voice(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let settings = app
+            .state::<AppState>()
+            .settings_store
+            .load()
+            .unwrap_or_default();
+        if settings.voice_enabled {
+            start_voice(app, settings.voice_muted).await;
+        }
+    });
+}
+
+/// Build the pipeline's widget-side seams and start it, storing the service in app
+/// state. Best-effort: any failure leaves voice unavailable, never crashes the app.
+async fn start_voice(app: AppHandle, start_muted: bool) {
+    let job = Arc::clone(&app.state::<AppState>().job);
+    let models_root = match voice_root() {
+        Ok(root) => root,
+        Err(error) => {
+            tracing::warn!(%error, "no voice model directory; voice disabled");
+            return;
+        }
+    };
+    let downloader = match Downloader::new() {
+        Ok(downloader) => downloader,
+        Err(error) => {
+            tracing::warn!(%error, "could not init the downloader; voice disabled");
+            return;
+        }
+    };
+    let wake_dir = voice_wake_dir(&app);
+
+    // A gateway client on demand — voice may be ready before the gateway is.
+    let provider: ic_widget::voice::ClientProvider = {
+        let app = app.clone();
+        Arc::new(move || {
+            let app = app.clone();
+            Box::pin(async move { app.state::<AppState>().client().await.ok() })
+        })
+    };
+
+    // Voice state → the mic indicator (a Tauri event) and the character (listening
+    // / speaking signals, re-derived by the character state machine).
+    let on_state: ic_voice::StateFn = {
+        let app = app.clone();
+        Arc::new(move |voice_state: ic_voice::VoiceState| {
+            let _ = app.emit("voice://state", voice_state);
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                update_character(&app, |inputs| {
+                    inputs.listening = matches!(voice_state, ic_voice::VoiceState::Listening);
+                    inputs.speaking = matches!(voice_state, ic_voice::VoiceState::Speaking);
+                })
+                .await;
+            });
+        })
+    };
+
+    // TTS amplitude → the character's mouth (lip sync), replacing the Phase 3 stub.
+    let amplitude: ic_voice::AmplitudeSink = {
+        let app = app.clone();
+        Arc::new(move |level: f32| {
+            let _ = app.emit("voice://amplitude", level);
+        })
+    };
+
+    let service = ic_widget::voice::start(
+        job,
+        models_root,
+        wake_dir,
+        downloader,
+        provider,
+        on_state,
+        amplitude,
+        start_muted,
+    )
+    .await;
+
+    if let Some(service) = service {
+        *app.state::<AppState>().voice.lock().await = Some(service);
+        tracing::info!("voice is ready");
+    }
+}
+
+/// Toggle the microphone from the tray, persisting the new state.
+fn toggle_voice_mute(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let muted = {
+            let voice = state.voice.lock().await;
+            match voice.as_ref() {
+                Some(service) => service.toggle_mute().await,
+                None => {
+                    tracing::info!("microphone toggle ignored: voice is not running");
+                    return;
+                }
+            }
+        };
+        if let Ok(mut settings) = state.settings_store.load() {
+            settings.voice_muted = muted;
+            let _ = state.settings_store.save(&settings);
+        }
+        tracing::info!(muted, "microphone toggled from the tray");
+    });
+}
+
+/// Start listening now, if voice is running and unmuted — the summon-hotkey path.
+fn trigger_voice_listen(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Some(service) = app.state::<AppState>().voice.lock().await.as_ref() {
+            service.trigger_listen().await;
+        }
+    });
+}
+
+/// The voice UI status: whether it is enabled, actually running, and muted.
+#[derive(Serialize)]
+struct VoiceStatus {
+    enabled: bool,
+    running: bool,
+    muted: bool,
+}
+
+#[tauri::command]
+async fn voice_status(state: tauri::State<'_, AppState>) -> Result<VoiceStatus, String> {
+    let settings = state.settings_store.load().map_err(|e| e.to_string())?;
+    let voice = state.voice.lock().await;
+    let (running, muted) = match voice.as_ref() {
+        Some(service) => (true, service.is_muted()),
+        None => (false, settings.voice_muted),
+    };
+    Ok(VoiceStatus {
+        enabled: settings.voice_enabled,
+        running,
+        muted,
+    })
+}
+
+/// Mute or unmute the microphone, persisting the choice.
+#[tauri::command]
+async fn set_voice_muted(state: tauri::State<'_, AppState>, muted: bool) -> Result<(), String> {
+    let mut settings = state.settings_store.load().map_err(|e| e.to_string())?;
+    settings.voice_muted = muted;
+    state
+        .settings_store
+        .save(&settings)
+        .map_err(|e| e.to_string())?;
+    if let Some(service) = state.voice.lock().await.as_ref() {
+        service.set_muted(muted).await;
+    }
+    Ok(())
+}
+
+/// Turn voice on or off, persisting the choice. Enabling provisions and starts it
+/// in the background (a first-run download does not block this call).
+#[tauri::command]
+async fn set_voice_enabled(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut settings = state.settings_store.load().map_err(|e| e.to_string())?;
+    settings.voice_enabled = enabled;
+    let start_muted = settings.voice_muted;
+    state
+        .settings_store
+        .save(&settings)
+        .map_err(|e| e.to_string())?;
+
+    match enabled {
+        // Provision + start in the background (a first-run download must not block
+        // this call). Already running → nothing to do.
+        true => {
+            if state.voice.lock().await.is_none() {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move { start_voice(app, start_muted).await });
+            }
+        }
+        false => {
+            if let Some(service) = state.voice.lock().await.take() {
+                service.shutdown().await;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let show = MenuItemBuilder::with_id("show", "Show / hide widget").build(app)?;
     let dashboard = MenuItemBuilder::with_id("dashboard", "Open dashboard").build(app)?;
+    let mic = MenuItemBuilder::with_id("voice_mute", "Toggle microphone").build(app)?;
     let reset = MenuItemBuilder::with_id("reset", "Reset widget position").build(app)?;
     let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
     let menu = MenuBuilder::new(app)
-        .items(&[&show, &dashboard, &reset, &quit])
+        .items(&[&show, &dashboard, &mic, &reset, &quit])
         .build()?;
 
     let Some(icon) = app.default_window_icon().cloned() else {
@@ -1662,6 +1878,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                     tracing::warn!(%error, "could not open the dashboard");
                 }
             }
+            "voice_mute" => toggle_voice_mute(app),
             "reset" => reset_widget_position(app),
             // Dropping the app drops the `ProcessJob`, which kills the gateway
             // and anything it spawned.
@@ -1695,6 +1912,9 @@ fn register_summon_hotkey(app: &AppHandle) {
             // Fire on press only; a release would toggle straight back.
             if event.state() == ShortcutState::Pressed {
                 toggle_widget(app);
+                // Summon doubles as push-to-talk: if voice is running, start
+                // listening. A no-op when voice is off.
+                trigger_voice_listen(app);
             }
         });
     if let Err(error) = result {
@@ -1758,6 +1978,9 @@ fn main() {
             set_hit_mask,
             log_ui_error,
             open_dashboard,
+            voice_status,
+            set_voice_muted,
+            set_voice_enabled,
         ])
         .setup(|app| {
             let store = WindowStateStore::at(WindowStateStore::default_path()?);
@@ -1778,6 +2001,7 @@ fn main() {
                 settings_store: SettingsStore::at(SettingsStore::default_path()?),
                 character: Mutex::new(CharacterTracker::default()),
                 hit_mask: std::sync::Mutex::new(None),
+                voice: Mutex::new(None),
             });
 
             let handle = app.handle().clone();
@@ -1790,6 +2014,7 @@ fn main() {
             #[cfg(windows)]
             spawn_interaction_watch(handle.clone());
             spawn_gateway(handle.clone());
+            maybe_start_voice(handle.clone());
 
             // Persist the widget's position whenever the user drags it.
             widget.on_window_event(move |event| {

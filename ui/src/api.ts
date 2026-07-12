@@ -245,7 +245,20 @@ export const api = {
   /** Begin an OS window drag — the character's body is the drag handle. */
   startDragging: () => getCurrentWindow().startDragging(),
   logUiError: (message: string) => invoke<void>("log_ui_error", { message }),
+  /** Whether voice is enabled, actually running, and muted. */
+  voiceStatus: () => invoke<VoiceStatus>("voice_status"),
+  /** Mute or unmute the microphone. */
+  setVoiceMuted: (muted: boolean) => invoke<void>("set_voice_muted", { muted }),
+  /** Turn voice on or off (enabling downloads the speech models on first run). */
+  setVoiceEnabled: (enabled: boolean) => invoke<void>("set_voice_enabled", { enabled }),
 };
+
+/** The voice UI status (mirrors the Rust `VoiceStatus`). */
+export interface VoiceStatus {
+  enabled: boolean;
+  running: boolean;
+  muted: boolean;
+}
 
 /**
  * A request to type into a sensitive field, needing the user's OK first.
@@ -325,4 +338,27 @@ export function onCursorPos(handler: (pos: CursorPos) => void): Promise<Unlisten
  */
 export function onCharacterActive(handler: (active: boolean) => void): Promise<UnlistenFn> {
   return listen<boolean>("character://active", (event) => handler(event.payload));
+}
+
+/** Where the voice loop is (mirrors `ic_voice::VoiceState`). */
+export type VoiceState =
+  | "muted"
+  | "idle"
+  | "listening"
+  | "transcribing"
+  | "sending"
+  | "speaking";
+
+/**
+ * Subscribe to the TTS playback amplitude (0..1) while the character speaks. The
+ * widget computes it from Piper's output RMS; the renderer drives `ParamMouthOpenY`
+ * from it for real lip sync.
+ */
+export function onVoiceAmplitude(handler: (level: number) => void): Promise<UnlistenFn> {
+  return listen<number>("voice://amplitude", (event) => handler(event.payload));
+}
+
+/** Subscribe to voice-loop state changes, for the mic-live indicator. */
+export function onVoiceState(handler: (state: VoiceState) => void): Promise<UnlistenFn> {
+  return listen<VoiceState>("voice://state", (event) => handler(event.payload));
 }

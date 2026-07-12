@@ -30,6 +30,7 @@ pub mod providers;
 pub mod secrets;
 pub mod settings;
 pub mod supervisor;
+pub mod voice;
 pub mod window_state;
 
 pub use browser::BrowserSidecar;

@@ -208,6 +208,8 @@ export interface CharacterRenderer {
   hitAt?(x: number, y: number): CharacterHit | null;
   /** The character's solid region for the click-through mask. */
   hitProfile?(cell: number): HitProfile | null;
+  /** Feed TTS playback amplitude (0..1) for lip sync. Optional. */
+  setMouthOpen?(value: number): void;
 }
 
 /** The built-in dev character, used until a real asset folder lands. */
@@ -372,6 +374,10 @@ export class Live2DRenderer implements CharacterRenderer {
   private model?: Live2DModel;
   /** `performance.now()` when speaking began, or `null` when not speaking. */
   private speakingSince: number | null = null;
+  /** Latest TTS playback amplitude (0..1), from `voice://amplitude`. */
+  private mouthOpen = 0;
+  /** `performance.now()` of the last amplitude, to detect a stalled stream. */
+  private mouthUpdatedAt = 0;
 
   constructor(config: CharacterConfig) {
     this.config = config;
@@ -463,14 +469,33 @@ export class Live2DRenderer implements CharacterRenderer {
     manager.update = (...args: unknown[]) => {
       const updated = original(...args);
       if (this.speakingSince === null) return updated;
-      // Test-tone stub: a syllable-ish envelope until Piper TTS supplies real
-      // playback amplitude (Phase 5 wires that into this same parameter).
-      const t = (performance.now() - this.speakingSince) / 1000;
-      const envelope = 0.55 + 0.45 * Math.sin(t * 1.9);
-      const syllables = Math.abs(Math.sin(t * 7.3));
-      core.setParameterValueById!(paramId, Math.min(1, syllables * envelope), 0.9);
+      // Prefer real Piper playback amplitude (Phase 5). If it is fresh, the mouth
+      // tracks the actual audio; if none has arrived recently — a typed reply with
+      // no TTS, or a stalled stream — fall back to the syllable-ish test tone so
+      // the character still moves its mouth while "speaking".
+      const now = performance.now();
+      let level: number;
+      if (now - this.mouthUpdatedAt < 200) {
+        level = this.mouthOpen;
+      } else {
+        const t = (now - this.speakingSince) / 1000;
+        const envelope = 0.55 + 0.45 * Math.sin(t * 1.9);
+        const syllables = Math.abs(Math.sin(t * 7.3));
+        level = Math.min(1, syllables * envelope);
+      }
+      core.setParameterValueById!(paramId, level, 0.9);
       return true;
     };
+  }
+
+  /**
+   * Feed the current TTS playback amplitude (0..1) for lip sync. Driven by the
+   * `voice://amplitude` event the widget forwards from Piper's output RMS; this is
+   * the real signal that replaces the Phase 3 test-tone stub while speaking.
+   */
+  setMouthOpen(value: number): void {
+    this.mouthOpen = Math.max(0, Math.min(1, value));
+    this.mouthUpdatedAt = performance.now();
   }
 
   setState(state: CharacterState): void {

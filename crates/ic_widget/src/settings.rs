@@ -50,6 +50,13 @@ pub struct Settings {
     /// default. A character is data (Phase 3): swapping folders needs no code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub character: Option<CharacterId>,
+    /// Whether the voice pipeline runs. Off by default: enabling it downloads the
+    /// speech models (~210 MB) on first use, so it is an explicit opt-in (Phase 5).
+    #[serde(default)]
+    pub voice_enabled: bool,
+    /// Whether the microphone starts muted when voice is enabled.
+    #[serde(default)]
+    pub voice_muted: bool,
 }
 
 /// A character asset folder's name, e.g. `hiyori`.

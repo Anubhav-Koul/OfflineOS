@@ -18,6 +18,8 @@ import {
   onChatEvent,
   onCursorPos,
   onGatewayState,
+  onVoiceAmplitude,
+  onVoiceState,
   TERMINAL_PHASES,
   type BrowserApproval,
   type ChatEvent,
@@ -25,6 +27,7 @@ import {
   type HitMask,
   type Message,
   type RunPhase,
+  type VoiceState,
 } from "./api";
 import {
   createRenderer,
@@ -559,6 +562,9 @@ function HealthBadge(props: { state: GatewayState }) {
 function CharacterView(props: { panelOpen: () => boolean; onHeadTap: () => void }) {
   let container: HTMLDivElement | undefined;
 
+  // The voice loop's state, for the mic-live indicator. `null` when voice is off.
+  const [voiceState, setVoiceState] = createSignal<VoiceState | null>(null);
+
   // Set once the renderer is mounted. The effect lives in the component body
   // (an async onMount continuation has no Solid owner), and re-pushes the mask
   // when the panel toggles — its rect just appeared or vanished.
@@ -600,6 +606,12 @@ function CharacterView(props: { panelOpen: () => boolean; onHeadTap: () => void 
     const unlistenActive = await onCharacterActive(
       (active) => renderer.setActive?.(active),
     );
+    // Real TTS amplitude → the character's mouth (replaces the Phase 3 test tone).
+    const unlistenAmplitude = await onVoiceAmplitude(
+      (level) => renderer.setMouthOpen?.(level),
+    );
+    // Voice-loop state → the mic-live indicator.
+    const unlistenVoice = await onVoiceState((state) => setVoiceState(state));
 
     // Click head = summon/dismiss the chat panel; drag body = move the window.
     const onPointerDown = (event: PointerEvent) => {
@@ -629,11 +641,41 @@ function CharacterView(props: { panelOpen: () => boolean; onHeadTap: () => void 
       unlistenState();
       unlistenCursor();
       unlistenActive();
+      unlistenAmplitude();
+      unlistenVoice();
       renderer.destroy();
     });
   });
 
-  return <div class="character" ref={container} />;
+  // The mic-live indicator: a small dot on the character while the loop is active.
+  // Hidden when voice is off, idle, or muted; it lights up while listening and
+  // pulses through the rest of a spoken turn.
+  const micLabel = (): string | null => {
+    switch (voiceState()) {
+      case "listening":
+        return "listening";
+      case "transcribing":
+      case "sending":
+        return "thinking";
+      case "speaking":
+        return "speaking";
+      default:
+        return null; // idle / muted / off
+    }
+  };
+
+  return (
+    <div class="character" ref={container}>
+      <Show when={micLabel()}>
+        {(label) => (
+          <div class="mic-indicator" data-voice={voiceState() ?? ""} title={`Voice: ${label()}`}>
+            <span class="mic-dot" />
+            <span class="mic-label">{label()}</span>
+          </div>
+        )}
+      </Show>
+    </div>
+  );
 }
 
 const root = document.getElementById("root");

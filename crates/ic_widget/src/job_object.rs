@@ -37,6 +37,13 @@ impl ProcessJob {
     pub fn assign(&self, child: &tokio::process::Child) -> Result<()> {
         self.0.assign(child)
     }
+
+    /// Enlist a synchronous [`std::process::Child`] — the shape `ic_voice`'s Piper
+    /// TTS spawns (a blocking subprocess), so it dies with us like the async
+    /// children do.
+    pub fn assign_std(&self, child: &std::process::Child) -> Result<()> {
+        self.0.assign_std(child)
+    }
 }
 
 #[cfg(windows)]
@@ -104,6 +111,16 @@ mod imp {
             unsafe { AssignProcessToJobObject(self.handle, HANDLE(raw)) }
                 .map_err(|error| job_error("assigning a child to the job object", &error))
         }
+
+        pub(super) fn assign_std(&self, child: &std::process::Child) -> Result<()> {
+            use std::os::windows::io::AsRawHandle;
+            // A live `std::process::Child` always has a handle (unlike tokio's,
+            // which is dropped on reap); we only read it for this call.
+            let raw = child.as_raw_handle();
+            // SAFETY: `raw` is the live process handle std owns for the child.
+            unsafe { AssignProcessToJobObject(self.handle, HANDLE(raw)) }
+                .map_err(|error| job_error("assigning a child to the job object", &error))
+        }
     }
 
     impl Drop for Job {
@@ -141,6 +158,10 @@ mod imp {
         pub(super) fn assign(&self, _child: &tokio::process::Child) -> Result<()> {
             Ok(())
         }
+
+        pub(super) fn assign_std(&self, _child: &std::process::Child) -> Result<()> {
+            Ok(())
+        }
     }
 }
 
@@ -148,12 +169,18 @@ mod imp {
 mod tests {
     use super::*;
 
-    /// A trivially long-lived child, without depending on any particular binary
-    /// being on PATH.
+    /// A trivially long-lived child.
+    ///
+    /// On Windows this deliberately avoids `ping` as the sleeper: `ping` touches the
+    /// network stack, and once this crate links ONNX Runtime (via `ic_voice`) the
+    /// loaded `onnxruntime.dll` perturbs the process enough that a spawned `ping`
+    /// fails immediately (exit 1) instead of sleeping — which would make the guard
+    /// below fire for the wrong reason. PowerShell `Start-Sleep` waits without any
+    /// network and does not need a console/stdin (unlike `timeout`).
     fn sleeper() -> tokio::process::Command {
         let mut command = if cfg!(windows) {
-            let mut command = tokio::process::Command::new("cmd");
-            command.args(["/C", "ping 127.0.0.1 -n 60 > nul"]);
+            let mut command = tokio::process::Command::new("powershell");
+            command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"]);
             command
         } else {
             let mut command = tokio::process::Command::new("sleep");

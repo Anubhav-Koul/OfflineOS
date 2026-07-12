@@ -117,6 +117,58 @@ button.ghost {
   position: absolute;
   inset: 0;
 }
+
+/* The mic-live indicator: a small pill near the character's feet, shown only
+   while the voice loop is active (listening / thinking / speaking). */
+.mic-indicator {
+  position: absolute;
+  bottom: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px 3px 7px;
+  border-radius: 999px;
+  background: rgba(20, 22, 28, 0.72);
+  color: #e8eaf0;
+  font-size: 11px;
+  line-height: 1;
+  pointer-events: none;
+  backdrop-filter: blur(4px);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+}
+.mic-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #4ade80;
+}
+/* Listening: a steady green light. Thinking: amber, slow pulse. Speaking: blue,
+   quicker pulse — mirroring the character's own states. */
+.mic-indicator[data-voice="listening"] .mic-dot {
+  background: #4ade80;
+  animation: mic-pulse 1.4s ease-in-out infinite;
+}
+.mic-indicator[data-voice="transcribing"] .mic-dot,
+.mic-indicator[data-voice="sending"] .mic-dot {
+  background: #fbbf24;
+  animation: mic-pulse 1.1s ease-in-out infinite;
+}
+.mic-indicator[data-voice="speaking"] .mic-dot {
+  background: #60a5fa;
+  animation: mic-pulse 0.7s ease-in-out infinite;
+}
+@keyframes mic-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 currentColor;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
 .character-sprite {
   position: absolute;
   bottom: 0;

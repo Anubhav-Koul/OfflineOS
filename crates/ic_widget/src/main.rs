@@ -1779,6 +1779,25 @@ fn trigger_voice_listen(app: &AppHandle) {
     });
 }
 
+/// Whether the first-run setup wizard should be shown (setup not yet completed).
+#[tauri::command]
+async fn needs_setup(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let settings = state.settings_store.load().map_err(|e| e.to_string())?;
+    Ok(!settings.setup_complete)
+}
+
+/// Mark first-run setup done, so the wizard does not show again.
+#[tauri::command]
+async fn complete_setup(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let mut settings = state.settings_store.load().map_err(|e| e.to_string())?;
+    settings.setup_complete = true;
+    state
+        .settings_store
+        .save(&settings)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// The voice UI status: whether it is enabled, actually running, and muted.
 #[derive(Serialize)]
 struct VoiceStatus {
@@ -1939,8 +1958,48 @@ fn init_logging() {
         .init();
 }
 
+/// `%LOCALAPPDATA%\IronClaw Desktop` — everything this app writes lives under here.
+fn data_root() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|base| base.join("IronClaw Desktop"))
+}
+
+/// Remove everything this app leaves on the machine: the Credential Manager entries
+/// and the per-user data directory (settings, models, libSQL store, browser
+/// profile). Invoked by the installer's uninstall custom action
+/// (`ic-widget.exe --uninstall-cleanup`), since an MSI removes neither on its own.
+///
+/// Best-effort and idempotent: a missing entry or directory is success, and a
+/// failure to clear one thing is logged but does not stop the rest — a half-finished
+/// cleanup is worse than a reported one.
+fn run_uninstall_cleanup() {
+    tracing::info!("uninstall cleanup: removing credentials and app data");
+    if let Err(error) = SecretStore::new().clear_all() {
+        tracing::warn!(%error, "uninstall cleanup: could not clear all credentials");
+    }
+    match data_root() {
+        Some(dir) if dir.exists() => match std::fs::remove_dir_all(&dir) {
+            Ok(()) => tracing::info!(dir = %dir.display(), "uninstall cleanup: removed app data"),
+            Err(error) => {
+                tracing::warn!(dir = %dir.display(), %error, "uninstall cleanup: could not remove app data")
+            }
+        },
+        Some(dir) => {
+            tracing::info!(dir = %dir.display(), "uninstall cleanup: no app data to remove")
+        }
+        None => tracing::warn!("uninstall cleanup: could not locate the app data directory"),
+    }
+}
+
 fn main() {
     init_logging();
+
+    // The installer's uninstall step runs us with this flag to clean up what the
+    // MSI cannot: our Credential Manager entries and per-user data directory. Do it
+    // and exit before touching Tauri — there is no UI to bring up.
+    if std::env::args().any(|arg| arg == "--uninstall-cleanup") {
+        run_uninstall_cleanup();
+        return;
+    }
 
     tauri::Builder::default()
         // A second launch focuses the widget rather than starting a second
@@ -1981,6 +2040,8 @@ fn main() {
             voice_status,
             set_voice_muted,
             set_voice_enabled,
+            needs_setup,
+            complete_setup,
         ])
         .setup(|app| {
             let store = WindowStateStore::at(WindowStateStore::default_path()?);

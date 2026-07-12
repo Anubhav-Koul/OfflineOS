@@ -102,6 +102,23 @@ impl SecretStore {
         Ok(())
     }
 
+    /// Remove every credential this app owns: the gateway token and each provider's
+    /// key. For uninstall cleanup — Windows never removes Credential Manager entries
+    /// on its own. Idempotent (a missing entry is not an error), and best-effort per
+    /// entry: one unreadable provider does not abort the rest.
+    pub fn clear_all(&self) -> Result<()> {
+        self.clear_gateway_token()?;
+        // The credential store cannot be enumerated, so we delete the known keys:
+        // one per provider in the catalog.
+        let providers = crate::providers::all().unwrap_or_default();
+        for provider in providers {
+            if let Err(error) = self.clear_provider_key(&provider) {
+                tracing::warn!(provider = %provider.id, %error, "could not clear a provider key");
+            }
+        }
+        Ok(())
+    }
+
     fn entry(&self, name: &str) -> Result<keyring::Entry> {
         keyring::Entry::new(SERVICE, name).map_err(|source| Error::Keyring {
             operation: "open",

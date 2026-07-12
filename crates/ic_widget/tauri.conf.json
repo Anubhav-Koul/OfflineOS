@@ -15,8 +15,21 @@
     }
   },
   "bundle": {
-    "active": false,
+    "active": true,
     "targets": ["msi"],
-    "icon": ["icons/icon.png", "icons/icon.ico"]
+    "icon": ["icons/icon.png", "icons/icon.ico"],
+    "publisher": "IronClaw",
+    "category": "Productivity",
+    "shortDescription": "An animated desktop companion with a local AI agent.",
+    "longDescription": "IronClaw Desktop is an animated character companion that runs a local AI agent (llama.cpp) alongside cloud LLMs, with browser automation, a canvas, and hands-free voice — all from a single offline install.",
+    "copyright": "© IronClaw. MIT OR Apache-2.0.",
+    "homepage": "https://github.com/nearai/ironclaw",
+    "windows": {
+      "webviewInstallMode": { "type": "embedBootstrapper" },
+      "wix": {
+        "language": ["en-US"],
+        "fragmentPaths": ["wix/uninstall-cleanup.wxs"]
+      }
+    }
   }
 }

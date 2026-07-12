@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Uninstall cleanup custom action.
+
+  An MSI removes the files it installed under Program Files, but it removes
+  neither of the two things IronClaw Desktop leaves elsewhere:
+
+    * the Windows Credential Manager entries under service "IronClaw Desktop"
+      (gateway-token, provider-key/<id>), and
+    * the per-user data directory %LOCALAPPDATA%\IronClaw Desktop\ (settings,
+      the libSQL store, downloaded models, the browser profile).
+
+  So on uninstall we run the installed widget with `--uninstall-cleanup`, which
+  clears both (see `run_uninstall_cleanup` in main.rs). It runs BEFORE
+  RemoveFiles so the exe still exists, only on a real uninstall (not an upgrade),
+  and impersonated so it touches the *invoking user's* credential store and
+  LOCALAPPDATA.
+
+  CAVEATS to reconcile when the MSI is first built (they need the real generated
+  WiX, so they are documented rather than guessed):
+
+    1. FileKey — this references the main executable's File element by Id.
+       Tauri v2 generates that Id in its main.wxs; if the built MSI errors with
+       "unresolved reference to File 'MainExecutable'", dump the generated wxs
+       (`cargo tauri build --verbose`, or target/.../wix/*.wxs) and set FileKey
+       to the actual main-exe File Id.
+    2. Per-user data in a per-machine install — if the app is installed
+       per-machine (Program Files) but uninstalled by a *different* user than the
+       one who ran it, that other user's LOCALAPPDATA/credentials are not the
+       ones cleaned. A per-user (perUser) install sidesteps this. For a
+       multi-user machine, prefer a perUser MSI or accept that cleanup covers the
+       uninstalling user only.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <CustomAction
+      Id="RunUninstallCleanup"
+      FileKey="MainExecutable"
+      ExeCommand="--uninstall-cleanup"
+      Execute="deferred"
+      Impersonate="yes"
+      Return="ignore" />
+
+    <InstallExecuteSequence>
+      <!-- Only on a genuine uninstall, and while the exe is still on disk. -->
+      <Custom Action="RunUninstallCleanup" Before="RemoveFiles">
+        REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE
+      </Custom>
+    </InstallExecuteSequence>
+  </Fragment>
+</Wix>

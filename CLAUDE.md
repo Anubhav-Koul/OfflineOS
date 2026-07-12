@@ -109,7 +109,7 @@ The widget becomes an **animated anime-style character** standing on the desktop
 3. ~~Register with IronClaw through its MCP config.~~ → **host-bundled extension manifest + CP-4**. Sensitive actions route through the approval flow (every discovered MCP tool is `default_permission: Ask`, hardcoded upstream).
 4. CAPTCHAs/logins: pause, notify via widget (character `concerned` state), let user complete, resume. Selector failures: screenshot → vision-capable model fallback.
 
-### Phase 5 — Voice (`crates/ic_voice`) + Canvas — **Canvas ✅ (see notes below); Voice not started**
+### Phase 5 — Voice (`crates/ic_voice`) + Canvas — **Canvas ✅, Voice ✅ (see notes below; full write-up: `docs/desktop/voice-notes.md`)**
 
 ⚠️ **The voice pipeline plan below has two dead ends and several Windows landmines — verified before any code. Read the Phase 5 notes at the bottom before building voice.**
 
@@ -708,3 +708,40 @@ voice is an alternate *input* to the same chat path, not a new gateway channel �
 and `SpawnHook` directly for models + the TTS child; `Sidecar`/`release.rs`/`ModelStore`
 are blueprints. Device-change needs a hand-written `IMMNotificationClient` (cpal has no
 API for it). Capture is cpal + `rubato` (downmix mono, resample 48k→16k f32).
+
+### Voice — done (recorded 2026-07-12)
+
+`crates/ic_voice` (new, 64 tests) + vendored `crates-src/rustpotter` + `ic_widget`
+(`voice.rs`, `job_object.rs`, `main.rs`, settings) + `ui/`. No IronClaw core crate
+touched. **Full write-up + every trap: `docs/desktop/voice-notes.md`** — read it
+before touching voice. The load-bearing surprises, in one breath:
+
+- **The wake-word library from the plan is unusable as published.** rustpotter's only
+  non-yanked crate (3.0.2) won't compile (candle 0.2 vs modern `rand`/`half`); every
+  2.x is yanked. **User's call: vendor rustpotter 2.0.1** (Apache-2.0, pure DSP, the
+  reference-model spotter we actually want) at `crates-src/rustpotter`, path-dep +
+  workspace-`exclude`d. No wake models are recorded yet → `NullWakeWord` + the
+  **summon hotkey as push-to-talk** until they are.
+- **STT now needs two build prerequisites: CMake + LLVM/libclang** (whisper.cpp build
+  + bindgen). `winget install Kitware.CMake LLVM.LLVM`; build with `LIBCLANG_PATH` set
+  and CMake on `PATH`. The `WHISPER_DONT_GENERATE_BINDINGS` shortcut is a dead end
+  (its committed bindings fail layout asserts). Users need neither — Phase 6 ships
+  built artifacts. This is the third build-env doc after `windows-build.md`.
+- **Pins the plan didn't foresee:** `rubato = 0.16` (3/4 rewrote the API), cpal 0.18's
+  `SampleRate` is a `u32` alias with by-value stream configs, `whisper-rs = 0.16` CPU.
+- **A regression the voice deps caused elsewhere:** linking ONNX Runtime made the
+  `job_object` kill-on-close test's `ping` sleeper fail (exit 1). Fixed by switching
+  the test sleeper to PowerShell `Start-Sleep` (network-free). Kill-on-close still
+  verified.
+- **Everything model/hardware-bound is behind a trait with a fake**, so the whole
+  loop — wake → VAD/endpoint → STT → gateway turn → TTS → playback, plus barge-in and
+  mute — is tested with no mic and no models. Real impls have `#[ignore]`d asset tests.
+- **The reply path reuses the typed chat exactly** (`voice::drive_turn`: send → await
+  terminal run → read timeline, since the reply text isn't on the event stream), on
+  voice's own thread. **Lip sync** feeds Piper's PCM RMS into `ParamMouthOpenY`
+  (`voice://amplitude` → `setMouthOpen`), with the Phase 3 test tone kept as the
+  no-audio fallback. Voice is **opt-in** (`settings.voice_enabled`, default off — first
+  enable downloads ~210 MB); tray mute + `voice_status`/`set_voice_*` commands exist.
+
+Next: **Phase 6 — packaging & hardening** (bundle piper/whisper/voice/ORT binaries,
+verify the amy voice licence, record + bundle wake models, first-run wizard).

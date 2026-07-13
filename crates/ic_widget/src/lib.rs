@@ -26,6 +26,7 @@ pub mod gateway_client;
 pub mod hit_test;
 pub mod job_object;
 pub mod model_catalog;
+pub mod persona;
 pub mod providers;
 pub mod secrets;
 pub mod settings;

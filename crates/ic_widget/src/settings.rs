@@ -40,9 +40,62 @@ impl Default for ProviderSelection {
     }
 }
 
+/// How a reply reaches the user.
+///
+/// The user may want to *read* the answer, *hear* it, or both. Before this,
+/// speech was unconditional whenever voice was enabled, so a user who only wanted
+/// a wake word had no way to stop the character talking back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplyMode {
+    /// Show the speech bubble; stay silent.
+    Read,
+    /// Speak the reply; no bubble.
+    Hear,
+    /// Both — the bubble is shown and the reply is spoken, with lip sync.
+    Both,
+}
+
+impl Default for ReplyMode {
+    /// Reading always works. Speaking needs voice enabled *and* the TTS models
+    /// downloaded, so it cannot be the default a fresh install lands on.
+    fn default() -> Self {
+        ReplyMode::Read
+    }
+}
+
+impl ReplyMode {
+    /// Whether a reply is shown in the speech bubble.
+    pub fn shows_bubble(self) -> bool {
+        matches!(self, ReplyMode::Read | ReplyMode::Both)
+    }
+
+    /// Whether a reply is spoken.
+    pub fn speaks(self) -> bool {
+        matches!(self, ReplyMode::Hear | ReplyMode::Both)
+    }
+}
+
 /// Everything persisted between launches.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
+    /// What the user is called. Empty until the setup wizard asks. Goes into the
+    /// agent's system prompt, so it is a fact the model actually knows rather than
+    /// a label the UI paints on.
+    #[serde(default)]
+    pub user_name: String,
+    /// What the assistant is called — its own name, and (once wake-word models are
+    /// recorded) the phrase that wakes it.
+    #[serde(default)]
+    pub assistant_name: String,
+    /// Whether a reply is read, heard, or both.
+    #[serde(default)]
+    pub reply_mode: ReplyMode,
+    /// The global summon / push-to-talk hotkey. `None` uses the default
+    /// (Ctrl+Alt+Space). Rebindable because the default is commonly taken — when it
+    /// is, registration fails and push-to-talk silently never fires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summon_hotkey: Option<String>,
     /// The LLM the gateway starts with.
     #[serde(default)]
     pub active_provider: ProviderSelection,

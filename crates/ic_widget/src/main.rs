@@ -31,7 +31,7 @@ use ic_widget::gateway_client::{
     ThreadId,
 };
 use ic_widget::hit_test::HitMask;
-use ic_widget::settings::{CharacterId, ProviderSelection, SettingsStore};
+use ic_widget::settings::{CharacterId, ProviderSelection, ReplyMode, SettingsStore};
 use ic_widget::supervisor::{GatewayConfig, GatewayState, GatewaySupervisor};
 use ic_widget::window_state::{LayoutHash, MonitorInfo, WindowPosition};
 use ic_widget::{BrowserSidecar, ProcessJob, RunPhase, SecretStore, WindowState, WindowStateStore};
@@ -1616,6 +1616,17 @@ async fn bring_up_gateway(app: AppHandle, selection: ProviderSelection) {
                 ic_widget::canvas::register(gateway.client()).await;
             }
 
+            // Teach the agent its name and the user's. This has to run *after* the
+            // gateway boots, because the runtime seeds the system-prompt file only
+            // when it is missing — writing it first would rob the agent of the
+            // runtime's own default instructions. The file is re-read every run, so
+            // no restart is needed for it to take.
+            if let Ok(home) = reborn_home()
+                && let Ok(settings) = app.state::<AppState>().settings_store.load()
+            {
+                ic_widget::persona::apply(&home, &settings);
+            }
+
             // Mirror every later transition onto the UI.
             let mut states = gateway.subscribe();
             let handle = app.clone();
@@ -1858,6 +1869,62 @@ async fn complete_setup(state: tauri::State<'_, AppState>) -> Result<(), String>
     Ok(())
 }
 
+/// The local profile: who the user is, what the assistant is called, and how it
+/// answers. There is no account here — this is a single-user desktop app, and
+/// these are the facts the agent is told about itself and the person it is
+/// talking to.
+#[derive(Clone, Serialize)]
+struct Profile {
+    user_name: String,
+    assistant_name: String,
+    reply_mode: ReplyMode,
+}
+
+#[tauri::command]
+async fn profile(state: tauri::State<'_, AppState>) -> Result<Profile, String> {
+    let settings = state.settings_store.load().map_err(|e| e.to_string())?;
+    Ok(Profile {
+        user_name: settings.user_name,
+        assistant_name: settings.assistant_name,
+        reply_mode: settings.reply_mode,
+    })
+}
+
+/// Save the profile and re-teach the agent its persona.
+///
+/// The persona lands in the gateway's system-prompt file, which the runtime
+/// re-reads on every run — so a rename takes effect on the *next turn*, with no
+/// gateway restart and no lost thread.
+#[tauri::command]
+async fn set_profile(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    user_name: String,
+    assistant_name: String,
+    reply_mode: ReplyMode,
+) -> Result<(), String> {
+    let settings = state.update_settings(|settings| {
+        settings.user_name = user_name.trim().to_string();
+        settings.assistant_name = assistant_name.trim().to_string();
+        settings.reply_mode = reply_mode;
+    })?;
+
+    if let Ok(home) = reborn_home() {
+        ic_widget::persona::apply(&home, &settings);
+    }
+    // The widget renders the name and obeys the reply mode, so tell it now rather
+    // than making it poll.
+    let _ = app.emit(
+        "profile://changed",
+        Profile {
+            user_name: settings.user_name.clone(),
+            assistant_name: settings.assistant_name.clone(),
+            reply_mode: settings.reply_mode,
+        },
+    );
+    Ok(())
+}
+
 /// The voice UI status: whether it is enabled, actually running, and muted.
 #[derive(Serialize)]
 struct VoiceStatus {
@@ -1977,22 +2044,118 @@ fn reset_widget_position(app: &AppHandle) {
     }
 }
 
-fn register_summon_hotkey(app: &AppHandle) {
-    let result = app
-        .global_shortcut()
-        .on_shortcut(summon_shortcut(), |app, _shortcut, event| {
-            // Fire on press only; a release would toggle straight back.
+/// Bindings to try, in order, when the user has not pinned one.
+///
+/// Ctrl+Alt+Space is commonly taken (it is a default in several IME and launcher
+/// tools), and a hotkey that fails to register is *silent*: the tray still works,
+/// so the app looks fine while push-to-talk never fires — which makes voice look
+/// broken rather than unbound. So we fall down a ladder until something sticks.
+const HOTKEY_LADDER: [&str; 4] = [
+    "Ctrl+Alt+Space",
+    "Ctrl+Shift+Space",
+    "Ctrl+Alt+A",
+    "Ctrl+Shift+A",
+];
+
+/// Register the summon hotkey, honoring the user's binding and falling back.
+///
+/// Returns the binding that actually took, or `None` if every candidate was
+/// occupied. The winner is persisted so the settings UI can show the truth rather
+/// than the intention.
+fn register_summon_hotkey(app: &AppHandle) -> Option<String> {
+    let configured = app
+        .state::<AppState>()
+        .settings_store
+        .load()
+        .ok()
+        .and_then(|settings| settings.summon_hotkey);
+
+    // The user's choice first (and *only*, if they made one — silently drifting off
+    // a hotkey someone deliberately picked would be worse than not binding it).
+    let candidates: Vec<String> = match configured {
+        Some(binding) => vec![binding],
+        None => HOTKEY_LADDER.iter().map(|s| s.to_string()).collect(),
+    };
+
+    for binding in candidates {
+        let Ok(shortcut) = binding.parse::<Shortcut>() else {
+            tracing::warn!(%binding, "not a valid hotkey");
+            continue;
+        };
+        let result = app
+            .global_shortcut()
+            .on_shortcut(shortcut, |app, _shortcut, event| {
+                // Fire on press only; a release would toggle straight back.
+                if event.state() == ShortcutState::Pressed {
+                    toggle_widget(app);
+                    // Summon doubles as push-to-talk: if voice is running, start
+                    // listening. A no-op when voice is off.
+                    trigger_voice_listen(app);
+                }
+            });
+        match result {
+            Ok(()) => {
+                tracing::info!(%binding, "the summon hotkey is live");
+                let _ = app
+                    .state::<AppState>()
+                    .update_settings(|settings| settings.summon_hotkey = Some(binding.clone()));
+                return Some(binding);
+            }
+            Err(error) => {
+                tracing::warn!(%binding, %error, "that hotkey is taken; trying the next one");
+            }
+        }
+    }
+
+    tracing::warn!(
+        "no summon hotkey could be registered; use the tray. Push-to-talk will not fire."
+    );
+    None
+}
+
+/// The hotkey currently bound, or `None` if none took.
+#[tauri::command]
+async fn summon_hotkey(state: tauri::State<'_, AppState>) -> Result<Option<String>, String> {
+    let settings = state.settings_store.load().map_err(|e| e.to_string())?;
+    Ok(settings.summon_hotkey)
+}
+
+/// Rebind the summon hotkey. Fails (leaving the old one bound) if the new binding
+/// is unparseable or already owned by another application — so the user gets told,
+/// rather than silently losing their hotkey.
+#[tauri::command]
+async fn set_summon_hotkey(app: AppHandle, binding: String) -> Result<(), String> {
+    let shortcut: Shortcut = binding
+        .parse()
+        .map_err(|_| format!("{binding:?} is not a valid hotkey"))?;
+
+    // Drop whatever we hold before claiming the new one; re-registering the same
+    // combination otherwise fails against ourselves.
+    let _ = app.global_shortcut().unregister_all();
+
+    app.global_shortcut()
+        .on_shortcut(shortcut, |app, _shortcut, event| {
             if event.state() == ShortcutState::Pressed {
                 toggle_widget(app);
-                // Summon doubles as push-to-talk: if voice is running, start
-                // listening. A no-op when voice is off.
                 trigger_voice_listen(app);
             }
-        });
-    if let Err(error) = result {
-        // Another application may already own Ctrl+Alt+Space. Not fatal.
-        tracing::warn!(%error, "could not register the summon hotkey; use the tray");
-    }
+        })
+        .map_err(|error| {
+            // We just gave up the old binding, so put *something* back rather than
+            // leaving the user with no hotkey at all.
+            let restored = register_summon_hotkey(&app);
+            match restored {
+                Some(binding) => {
+                    format!("{binding} is still bound — the new hotkey is taken ({error})")
+                }
+                None => format!("that hotkey is taken, and the old one could not be restored: {error}"),
+            }
+        })?;
+
+    app.state::<AppState>()
+        .update_settings(|settings| settings.summon_hotkey = Some(binding.clone()))?;
+    tracing::info!(%binding, "the summon hotkey was rebound");
+    Ok(())
 }
 
 /// Send `tracing` output to stderr.
@@ -2094,6 +2257,10 @@ fn main() {
             set_voice_muted,
             set_voice_enabled,
             needs_setup,
+            profile,
+            set_profile,
+            summon_hotkey,
+            set_summon_hotkey,
             complete_setup,
         ])
         .setup(|app| {

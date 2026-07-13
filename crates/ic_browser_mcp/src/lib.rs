@@ -52,7 +52,7 @@ pub mod manifest;
 pub mod protocol;
 pub mod server;
 
-pub use browser::{BrowserSession, LaunchOptions};
+pub use browser::{BrowserSession, LaunchOptions, LazyBrowser};
 pub use consent::{Approver, DenyAll, StdioApprover};
 pub use error::{Error, Result};
 pub use launcher::{BrowserExecutable, BrowserKind, find_browser};

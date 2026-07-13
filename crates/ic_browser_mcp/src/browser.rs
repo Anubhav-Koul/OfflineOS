@@ -399,6 +399,62 @@ impl ToolExecutor for BrowserSession {
     }
 }
 
+/// A [`ToolExecutor`] that launches the browser on the **first tool call**, not
+/// at startup.
+///
+/// Eager launch put a Chrome window on the user's desktop every time the app
+/// started, whether or not the agent ever browsed anything. Nothing in the MCP
+/// handshake needs a browser: `initialize` and `tools/list` are answered from the
+/// static catalogue, so discovery at extension-activation works with no browser
+/// running. Only `tools/call` needs the real thing.
+///
+/// A failed launch leaves the cell empty rather than poisoning it, so the next
+/// tool call tries again — a user who closes the automation window (or had no
+/// browser installed when the app booted) gets a fresh one on the next call
+/// instead of a sidecar that is dead for the rest of the session.
+pub struct LazyBrowser {
+    options: LaunchOptions,
+    approver: Arc<dyn Approver>,
+    session: tokio::sync::OnceCell<BrowserSession>,
+}
+
+impl LazyBrowser {
+    /// Hold the launch parameters; start nothing.
+    pub fn new(options: LaunchOptions, approver: Arc<dyn Approver>) -> Self {
+        Self {
+            options,
+            approver,
+            session: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// The live session, launching the browser if this is the first call.
+    /// Concurrent callers wait on the one launch rather than racing two Chromes.
+    async fn session(&self) -> Result<&BrowserSession> {
+        self.session
+            .get_or_try_init(|| async {
+                tracing::info!("first browser tool call; launching the browser");
+                let executable = launcher::find_browser()?;
+                let session = BrowserSession::launch_with(
+                    executable,
+                    self.options.clone(),
+                    Arc::clone(&self.approver),
+                )
+                .await?;
+                tracing::info!(browser = session.browser_kind(), "the browser is up");
+                Ok(session)
+            })
+            .await
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for LazyBrowser {
+    async fn call(&self, tool: Tool, arguments: serde_json::Value) -> Result<serde_json::Value> {
+        self.session().await?.call(tool, arguments).await
+    }
+}
+
 impl Drop for BrowserSession {
     fn drop(&mut self) {
         // Stop pumping CDP events. We deliberately do NOT try to close the

@@ -25,7 +25,8 @@ pub struct LocalLlmOptions {
     /// Which llama.cpp build to use. `None` picks one from the detected
     /// hardware.
     pub backend: Option<Backend>,
-    /// Context window. `None` uses the sidecar default of 4096.
+    /// Context window. `None` derives one from the model — see
+    /// [`agent_ctx_size`].
     pub ctx_size: Option<u32>,
     /// How aggressively to fill VRAM.
     pub policy: PlacementPolicy,
@@ -100,9 +101,9 @@ impl LocalLlm {
             model.path.clone(),
             model.id.clone(),
         )?;
-        if let Some(ctx_size) = options.ctx_size {
-            config.ctx_size = ctx_size;
-        }
+        config.ctx_size = options
+            .ctx_size
+            .unwrap_or_else(|| agent_ctx_size(model.gguf.context_length));
         config.on_spawn = options.on_sidecar_spawn;
 
         let placement = plan(PlacementRequest {
@@ -199,6 +200,38 @@ impl LocalLlm {
     }
 }
 
+/// The floor an agent turn needs. IronClaw's turn is a system prompt plus every
+/// tool schema plus the thread so far; a reasoning model then spends hundreds of
+/// tokens thinking before it emits its first word of `content`. Below this the
+/// prompt alone can exhaust the window, `llama-server` answers `400
+/// exceed_context_size_error`, and the run dies as a `driver_protocol_violation`
+/// — with no hint that the context was the problem.
+const MIN_AGENT_CTX: u32 = 16_384;
+
+/// The ceiling we default to. The KV cache grows linearly with the window (it is
+/// what [`crate::placement::plan`] budgets per layer), so defaulting to a model's
+/// full 128k+ would evict layers off the GPU to buy context nobody asked for.
+const MAX_DEFAULT_CTX: u32 = 32_768;
+
+/// The context window to run an agent model at, given what the GGUF says it was
+/// trained for.
+///
+/// The old default was a flat 4096, which is fine for a chat completion and far
+/// too small for an agent turn — see [`MIN_AGENT_CTX`]. A model trained for less
+/// than the floor gets its trained window: exceeding it degrades the model, and
+/// [`crate::placement::plan`] already warns when a caller asks for that anyway.
+fn agent_ctx_size(trained: Option<u32>) -> u32 {
+    match trained {
+        // Never above what it was trained for, never above our ceiling. A model
+        // trained below the floor simply gets its trained window — we cannot
+        // conjure context it does not have.
+        Some(trained) => trained.min(MAX_DEFAULT_CTX),
+        // No header field to read. The floor is the safer guess: too small is a
+        // dead agent, too large is only a slower one.
+        None => MIN_AGENT_CTX,
+    }
+}
+
 /// The adapter to offload to: the discrete GPU with the most headroom, or an
 /// integrated one if that is all there is. [`crate::placement::plan`] makes the
 /// final call on whether to actually use it.
@@ -233,4 +266,37 @@ fn watch_for_suspicion(
             return;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The regression these constants exist for: Qwen3-4B (trained 40960) ran at
+    /// the old flat 4096 default, and *every* agent turn failed — the prompt plus
+    /// the model's own reasoning tokens overran the window, `llama-server`
+    /// answered `400 exceed_context_size_error`, and the gateway reported a
+    /// `driver_protocol_violation` that never mentioned context.
+    #[test]
+    fn an_agent_model_gets_a_window_an_agent_turn_fits_in() {
+        assert_eq!(agent_ctx_size(Some(40_960)), 32_768);
+        assert!(agent_ctx_size(Some(40_960)) >= MIN_AGENT_CTX);
+    }
+
+    #[test]
+    fn a_huge_trained_window_is_capped_so_the_kv_cache_does_not_evict_layers() {
+        assert_eq!(agent_ctx_size(Some(131_072)), MAX_DEFAULT_CTX);
+    }
+
+    /// We cannot conjure context the model was not trained for; asking for more
+    /// degrades it. A small model runs small.
+    #[test]
+    fn a_model_trained_below_the_floor_gets_its_trained_window() {
+        assert_eq!(agent_ctx_size(Some(8_192)), 8_192);
+    }
+
+    #[test]
+    fn a_header_with_no_context_length_falls_back_to_the_floor() {
+        assert_eq!(agent_ctx_size(None), MIN_AGENT_CTX);
+    }
 }

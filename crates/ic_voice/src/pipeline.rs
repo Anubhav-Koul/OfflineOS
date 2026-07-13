@@ -454,10 +454,11 @@ impl Driver {
     fn begin_transcription(&mut self) {
         // SpeechEnded → BeginTranscription.
         self.step(VoiceEvent::SpeechEnded);
-        let mut utterance = std::mem::take(&mut self.utterance);
-        // Lift a quiet utterance to a level whisper transcribes well. A headset that
-        // delivers a normal voice at a peak of 0.03 is exactly where `base.en` starts
-        // guessing at similar-sounding words.
+        let utterance = std::mem::take(&mut self.utterance);
+        // Trim the silence, *then* lift the level. Whisper invents filler to explain
+        // leading silence ("No, what's 2 plus 2?" for a clip that opened with a
+        // pause), and it mishears quiet speech — so give it neither.
+        let mut utterance = crate::format::trim_silence(&utterance).to_vec();
         let gain = crate::format::normalize(&mut utterance);
         if gain > 1.0 {
             tracing::debug!(gain, "amplified a quiet utterance for transcription");

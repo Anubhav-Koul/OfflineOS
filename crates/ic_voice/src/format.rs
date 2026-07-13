@@ -85,6 +85,43 @@ const NOISE_FLOOR: f32 = 0.005;
 /// transcribes as confident nonsense.
 const MAX_GAIN: f32 = 20.0;
 
+/// Padding kept either side of the speech, in samples (~100 ms). Cutting hard on the
+/// first loud sample clips the attack of the first word.
+const TRIM_PADDING: usize = SAMPLE_RATE as usize / 10;
+
+/// Drop the silence either side of the speech.
+///
+/// Whisper *fills* leading silence with plausible filler: a push-to-talk clip that
+/// opens with a held breath and a pause comes back as "No," or "Thank you." prefixed
+/// onto the real sentence — confident, grammatical, and never said. (Observed: a
+/// half-second pause before "what's 2 plus 2" produced "No, what's 2 plus 2?".) The
+/// cure is not to give it silence to explain.
+///
+/// The threshold is relative to the utterance's own peak, so it works on a loud mic
+/// and a quiet one alike. An utterance with no speech in it is returned untouched —
+/// an empty transcript is the honest answer there, not a trimmed one.
+pub fn trim_silence(samples: &[f32]) -> &[f32] {
+    let peak = samples
+        .iter()
+        .fold(0.0_f32, |loudest, sample| loudest.max(sample.abs()));
+    if peak < NOISE_FLOOR {
+        return samples;
+    }
+    let gate = peak * 0.1;
+
+    let Some(first) = samples.iter().position(|sample| sample.abs() >= gate) else {
+        return samples;
+    };
+    let last = samples
+        .iter()
+        .rposition(|sample| sample.abs() >= gate)
+        .unwrap_or(samples.len() - 1);
+
+    let start = first.saturating_sub(TRIM_PADDING);
+    let end = (last + TRIM_PADDING).min(samples.len() - 1);
+    &samples[start..=end]
+}
+
 /// Normalize an utterance to a level Whisper transcribes well.
 ///
 /// Returns the gain applied (`1.0` = untouched), for logging.
@@ -173,6 +210,57 @@ mod tests {
 #[cfg(test)]
 mod normalize_tests {
     use super::*;
+
+    /// The regression: a push-to-talk clip that opens with a pause comes back with
+    /// filler bolted onto the front — "No, what's 2 plus 2?" for a clip whose speech
+    /// was only "what's 2 plus 2". Whisper explains silence rather than ignoring it,
+    /// so the silence must not reach it.
+    #[test]
+    fn leading_and_trailing_silence_are_trimmed_away() {
+        let silence = vec![0.0_f32; SAMPLE_RATE as usize]; // one second
+        let speech: Vec<f32> = (0..SAMPLE_RATE as usize / 2)
+            .map(|i| 0.4 * (i as f32 / 8.0).sin())
+            .collect();
+
+        let mut clip = silence.clone();
+        clip.extend_from_slice(&speech);
+        clip.extend_from_slice(&silence);
+
+        let trimmed = trim_silence(&clip);
+
+        // The speech survives, with padding either side — but the seconds of silence
+        // whisper would have narrated are gone.
+        assert!(trimmed.len() >= speech.len(), "the speech was cut");
+        assert!(
+            trimmed.len() <= speech.len() + 2 * TRIM_PADDING + 2,
+            "silence survived: {} samples for {} of speech",
+            trimmed.len(),
+            speech.len()
+        );
+    }
+
+    /// A clip with nothing in it must not be "trimmed" into a sliver that whisper
+    /// then invents words for. An empty transcript is the honest answer.
+    #[test]
+    fn a_silent_clip_is_left_alone() {
+        let quiet = vec![0.001_f32; 1000];
+        assert_eq!(trim_silence(&quiet).len(), quiet.len());
+    }
+
+    /// The attack of the first word must survive — cutting hard on the first loud
+    /// sample clips the consonant and whisper drops or mangles the word.
+    #[test]
+    fn padding_keeps_the_attack_of_the_first_word() {
+        let mut clip = vec![0.0_f32; SAMPLE_RATE as usize / 2];
+        clip.extend((0..1000).map(|i| 0.5 * (i as f32).sin()));
+
+        let trimmed = trim_silence(&clip);
+
+        assert!(
+            trimmed.len() > 1000,
+            "no padding was kept before the speech"
+        );
+    }
 
     /// The measured case: a Bluetooth headset delivers a normal speaking voice at a
     /// peak of ~0.03, and whisper mishears it ("Nova, can you search the internet?"

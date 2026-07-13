@@ -1,6 +1,6 @@
 /* @refresh reload */
 import { render } from "solid-js/web";
-import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 
 import {
   api,
@@ -14,8 +14,10 @@ import {
   type ProviderSelection,
   type ProviderSettings,
   type RecommendedModel,
+  type ReplyMode,
   type Thread,
 } from "./api";
+import { createChat } from "./chat";
 import "./styles.css";
 
 /**
@@ -647,6 +649,315 @@ function SetupWizard(props: { onDone: () => void }) {
   );
 }
 
+/**
+ * The conversation. This is where typing lives now — the widget is the character,
+ * and the character does not carry a text box.
+ *
+ * It shows the *same* thread the widget speaks from: the thread is owned by Rust
+ * (`api.currentThread()`), so both windows join one conversation rather than each
+ * creating their own.
+ */
+function ChatPane() {
+  const chat = createChat();
+  const [draft, setDraft] = createSignal("");
+  const [copied, setCopied] = createSignal<number | null>(null);
+  let transcript: HTMLDivElement | undefined;
+  let fileInput: HTMLInputElement | undefined;
+
+  const scrollToEnd = () =>
+    queueMicrotask(() => transcript?.scrollTo({ top: transcript.scrollHeight }));
+
+  createEffect(() => {
+    chat.bubbles();
+    scrollToEnd();
+  });
+
+  onMount(() => {
+    const cleanups: (() => void)[] = [];
+    onCleanup(() => cleanups.forEach((fn) => fn()));
+    void (async () => {
+      cleanups.push(await chat.start());
+    })();
+  });
+
+  const submit = () => {
+    const text = draft();
+    if (!text.trim() || chat.busy()) return;
+    setDraft("");
+    void chat.send(text);
+  };
+
+  const copy = async (text: string, index: number) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(index);
+      setTimeout(() => setCopied((current) => (current === index ? null : current)), 1200);
+    } catch {
+      /* silent-ok: clipboard denied; the text is still selectable */
+    }
+  };
+
+  /**
+   * Upload is *attach as text*, not a file transfer: the agent reads what it is
+   * given as part of the message. A binary file is refused rather than pasted in
+   * as mojibake, and a large one is truncated with a visible marker rather than
+   * silently cut — a model quietly fed half a document gives quietly wrong answers.
+   */
+  const MAX_ATTACH_BYTES = 128 * 1024;
+  const attach = async (file: File) => {
+    if (file.size > 8 * 1024 * 1024) {
+      setDraft((current) => `${current}\n[${file.name} is too large to attach]`);
+      return;
+    }
+    const text = await file.text();
+    // A crude but reliable binary sniff: NUL bytes do not occur in text.
+    if (text.includes(String.fromCharCode(0))) {
+      setDraft((current) => `${current}\n[${file.name} looks binary; not attached]`);
+      return;
+    }
+    const clipped =
+      text.length > MAX_ATTACH_BYTES
+        ? `${text.slice(0, MAX_ATTACH_BYTES)}\n… [truncated ${file.name}]`
+        : text;
+    setDraft(
+      (current) =>
+        `${current}${current ? "\n\n" : ""}--- ${file.name} ---\n${clipped}\n--- end ---\n\n`,
+    );
+  };
+
+  return (
+    <section class="chat-pane">
+      <h2>
+        Chat
+        <button class="ghost right" title="New session" onClick={() => void chat.newSession()}>
+          + New
+        </button>
+      </h2>
+
+      <div class="chat-transcript" ref={transcript}>
+        <Show when={chat.bubbles().length === 0}>
+          <p class="muted">Nothing yet. Say something.</p>
+        </Show>
+        <For each={chat.bubbles()}>
+          {(bubble, index) => (
+            <div class={`chat-line ${bubble.role}`}>
+              <div class="chat-text">{bubble.text}</div>
+              <button
+                class="ghost copy"
+                title="Copy"
+                onClick={() => void copy(bubble.text, index())}
+              >
+                {copied() === index() ? "copied" : "copy"}
+              </button>
+            </div>
+          )}
+        </For>
+        <Show when={chat.statusLine()}>
+          {(line) => <div class="chat-status">{line()}</div>}
+        </Show>
+      </div>
+
+      <form
+        class="chat-composer"
+        onSubmit={(event) => {
+          event.preventDefault();
+          submit();
+        }}
+      >
+        <textarea
+          rows="3"
+          placeholder={chat.busy() ? "Working…" : "Ask something"}
+          value={draft()}
+          disabled={!chat.ready()}
+          onInput={(event) => setDraft(event.currentTarget.value)}
+          onFocus={() => void api.setCharacterSignals({ listening: true }).catch(() => undefined)}
+          onBlur={() => void api.setCharacterSignals({ listening: false }).catch(() => undefined)}
+          onKeyDown={(event) => {
+            // Enter sends; Shift+Enter is a newline. A multi-line composer that
+            // sends on a bare Enter without this is unusable for pasting.
+            if (event.key === "Enter" && !event.shiftKey) {
+              event.preventDefault();
+              submit();
+            }
+          }}
+        />
+        <div class="chat-actions">
+          <input
+            type="file"
+            ref={fileInput}
+            style="display: none"
+            onChange={(event) => {
+              const file = event.currentTarget.files?.[0];
+              if (file) void attach(file);
+              event.currentTarget.value = "";
+            }}
+          />
+          <button
+            type="button"
+            class="ghost"
+            title="Attach a text file"
+            disabled={!chat.ready()}
+            onClick={() => fileInput?.click()}
+          >
+            Attach
+          </button>
+          <Show
+            when={chat.busy()}
+            fallback={
+              <button type="submit" disabled={!draft().trim() || !chat.ready()}>
+                Send
+              </button>
+            }
+          >
+            {/* Always visible while a run is in flight, per the runaway-loop guardrails. */}
+            <button type="button" class="stop" onClick={() => void chat.stop()}>
+              Stop
+            </button>
+          </Show>
+        </div>
+      </form>
+    </section>
+  );
+}
+
+/**
+ * Who the user is, what the assistant is called, and how it answers.
+ *
+ * The names are not decoration: they are written into the agent's system prompt,
+ * so the model actually knows them. There is no account here — this is a
+ * single-user desktop app, and this is the profile, not a login.
+ */
+function ProfilePanel() {
+  const [userName, setUserName] = createSignal("");
+  const [assistantName, setAssistantName] = createSignal("");
+  const [replyMode, setReplyMode] = createSignal<ReplyMode>("read");
+  const [hotkey, setHotkey] = createSignal<string | null>(null);
+  const [saved, setSaved] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+
+  onMount(async () => {
+    try {
+      const profile = await api.profile();
+      setUserName(profile.user_name);
+      setAssistantName(profile.assistant_name);
+      setReplyMode(profile.reply_mode);
+      setHotkey(await api.summonHotkey());
+    } catch (problem) {
+      setError(String(problem));
+    }
+  });
+
+  const save = async () => {
+    setError(null);
+    try {
+      await api.setProfile(userName(), assistantName(), replyMode());
+      setSaved(true);
+      setTimeout(() => setSaved(false), 1500);
+    } catch (problem) {
+      setError(String(problem));
+    }
+  };
+
+  const rebind = async (binding: string) => {
+    setError(null);
+    try {
+      await api.setSummonHotkey(binding);
+      setHotkey(binding);
+    } catch (problem) {
+      // The old binding is still live — say so, rather than leaving the user
+      // believing they have a hotkey they do not.
+      setError(String(problem));
+      setHotkey(await api.summonHotkey().catch(() => null));
+    }
+  };
+
+  const MODES: ReplyMode[] = ["read", "hear", "both"];
+  const describe = (mode: ReplyMode) =>
+    mode === "read"
+      ? "speech bubble only"
+      : mode === "hear"
+        ? "spoken aloud, no bubble"
+        : "bubble and spoken";
+
+  return (
+    <section>
+      <h2>You &amp; your assistant</h2>
+      <div class="profile-grid">
+        <label>
+          Your name
+          <input
+            type="text"
+            value={userName()}
+            placeholder="what should it call you?"
+            onInput={(event) => setUserName(event.currentTarget.value)}
+          />
+        </label>
+        <label>
+          Assistant&apos;s name
+          <input
+            type="text"
+            value={assistantName()}
+            placeholder="what do you call it?"
+            onInput={(event) => setAssistantName(event.currentTarget.value)}
+          />
+        </label>
+      </div>
+      <p class="muted small">
+        These go into the agent&apos;s system prompt — it genuinely knows them, and answers
+        to its name.
+      </p>
+
+      <h3>How it answers</h3>
+      <div class="reply-modes">
+        <For each={MODES}>
+          {(mode) => (
+            <label class="reply-mode" classList={{ active: replyMode() === mode }}>
+              <input
+                type="radio"
+                name="reply-mode"
+                checked={replyMode() === mode}
+                onChange={() => setReplyMode(mode)}
+              />
+              <strong>{mode === "read" ? "Read" : mode === "hear" ? "Hear" : "Both"}</strong>
+              <span class="muted small">{describe(mode)}</span>
+            </label>
+          )}
+        </For>
+      </div>
+      <p class="muted small">Hearing needs voice enabled, which downloads speech models.</p>
+
+      <h3>Summon hotkey</h3>
+      <p class="muted small">
+        Wakes the character, and while voice is on doubles as push-to-talk.
+        {hotkey() ? "" : " Nothing is bound — every candidate was taken."}
+      </p>
+      <div class="hotkey-row">
+        <For each={["Ctrl+Alt+Space", "Ctrl+Shift+Space", "Ctrl+Alt+A", "Ctrl+Shift+A"]}>
+          {(binding) => (
+            <button
+              class="ghost"
+              classList={{ active: hotkey() === binding }}
+              onClick={() => void rebind(binding)}
+            >
+              {binding}
+            </button>
+          )}
+        </For>
+      </div>
+
+      <div class="row">
+        <button onClick={() => void save()}>Save</button>
+        <Show when={saved()}>
+          <span class="muted small">saved</span>
+        </Show>
+      </div>
+      <Show when={error()}>
+        <p class="error">{error()}</p>
+      </Show>
+    </section>
+  );
+}
+
 function Dashboard() {
   const [gateway, setGateway] = createSignal<GatewayState>({ state: "starting" });
   const [log, setLog] = createSignal("");
@@ -689,6 +1000,9 @@ function Dashboard() {
         <SetupWizard onDone={() => setShowWizard(false)} />
       </Show>
       <h1>IronClaw Desktop</h1>
+
+      <ChatPane />
+      <ProfilePanel />
 
       <section>
         <h2>Gateway</h2>

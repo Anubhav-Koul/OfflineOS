@@ -205,9 +205,31 @@ export interface CursorPos {
   y: number;
 }
 
+/** The local profile: who the user is, what the assistant is called, how it answers. */
+export interface Profile {
+  user_name: string;
+  assistant_name: string;
+  reply_mode: ReplyMode;
+}
+
+/** Whether a reply is shown, spoken, or both. */
+export type ReplyMode = "read" | "hear" | "both";
+
 export const api = {
   gatewayState: () => invoke<GatewayState>("gateway_state"),
-  createThread: () => invoke<string>("create_thread"),
+  /** The conversation both windows share, created on first ask. */
+  currentThread: () => invoke<string>("current_thread"),
+  /** Start a fresh conversation, in both windows. */
+  newThread: () => invoke<string>("new_thread"),
+  profile: () => invoke<Profile>("profile"),
+  setProfile: (userName: string, assistantName: string, replyMode: ReplyMode) =>
+    invoke<void>("set_profile", {
+      userName,
+      assistantName,
+      replyMode,
+    }),
+  summonHotkey: () => invoke<string | null>("summon_hotkey"),
+  setSummonHotkey: (binding: string) => invoke<void>("set_summon_hotkey", { binding }),
   sendMessage: (threadId: string, content: string) =>
     invoke<SendResult>("send_message", { threadId, content }),
   cancelRun: (threadId: string, runId: string) =>
@@ -325,6 +347,20 @@ export function onGatewayState(handler: (state: GatewayState) => void): Promise<
 /** Subscribe to the chat event pump for the active thread. */
 export function onChatEvent(handler: (event: ChatEvent) => void): Promise<UnlistenFn> {
   return listen<ChatEvent>("chat://event", (event) => handler(event.payload));
+}
+
+/**
+ * The shared conversation was replaced (someone started a new session). Both
+ * windows follow it — otherwise the widget keeps bubbling replies from a thread
+ * the user has left.
+ */
+export function onThreadChanged(handler: (threadId: string) => void): Promise<UnlistenFn> {
+  return listen<string>("thread://changed", (event) => handler(event.payload));
+}
+
+/** The profile changed in the other window (name, or how replies are delivered). */
+export function onProfileChanged(handler: (profile: Profile) => void): Promise<UnlistenFn> {
+  return listen<Profile>("profile://changed", (event) => handler(event.payload));
 }
 
 /**

@@ -12,23 +12,18 @@ import {
 
 import {
   api,
-  onBrowserApproval,
   onCharacterActive,
   onCharacterState,
-  onChatEvent,
   onCursorPos,
-  onGatewayState,
+  onProfileChanged,
   onVoiceAmplitude,
   onVoiceState,
-  TERMINAL_PHASES,
-  type BrowserApproval,
-  type ChatEvent,
   type GatewayState,
   type HitMask,
-  type Message,
-  type RunPhase,
+  type Profile,
   type VoiceState,
 } from "./api";
+import { createChat } from "./chat";
 import {
   createRenderer,
   loadCharacterConfig,
@@ -78,30 +73,19 @@ function bridgeConsoleToLog() {
 bridgeConsoleToLog();
 
 /**
- * The desktop companion window: the character standing at the bottom, the chat
- * panel — the Phase 2 speech bubble — anchored above it. Clicking the
- * character's head toggles the panel; dragging its body moves the window;
- * everything outside both passes through to the desktop (the hit mask below).
+ * The desktop companion window: **the character, and nothing else.**
  *
- * How a reply arrives is unchanged from Phase 2a. The gateway's event stream
- * never carries assistant text — see `docs/desktop/chat-rendering.md`. So:
+ * There is no frame, no panel, and no composer here. The window is transparent
+ * and undecorated, and only two kinds of thing are ever drawn over it — speech
+ * (a balloon anchored to the character's head) and an interruption (an approval
+ * the parked run is waiting on). Both are transient. Everything durable —
+ * the transcript, typing, uploads, settings, sessions, models, avatars — lives in
+ * the dashboard, which the character's head opens.
  *
- *   1. send the message, remember the `run_id`
- *   2. watch `run_status` events until the run is terminal
- *   3. *then* fetch the timeline and render the assistant's message
+ * Clicking the head opens the dashboard; dragging the body moves the window;
+ * everything outside the character and its balloon passes through to the desktop
+ * (the hit mask below).
  */
-
-interface Bubble {
-  role: "user" | "assistant" | "error";
-  text: string;
-}
-
-interface Gate {
-  runId: string;
-  gateRef: string;
-  headline: string;
-  body: string;
-}
 
 /** Cell size of the click-through mask, logical px. */
 const MASK_CELL = 8;
@@ -170,169 +154,50 @@ function buildHitMask(profile: HitProfile | null, elements: HTMLElement[]): HitM
 }
 
 function App() {
-  const [threadId, setThreadId] = createSignal<string | null>(null);
-  const [bubbles, setBubbles] = createSignal<Bubble[]>([]);
-  const [draft, setDraft] = createSignal("");
-  const [activeRun, setActiveRun] = createSignal<string | null>(null);
-  const [phase, setPhase] = createSignal<RunPhase | null>(null);
-  const [activity, setActivity] = createSignal<string | null>(null);
-  const [gate, setGate] = createSignal<Gate | null>(null);
-  // Sensitive-fill approvals queue: a page may ask for several in a row, and each
-  // must be answered explicitly, so they are not collapsed into one.
-  const [fills, setFills] = createSignal<BrowserApproval[]>([]);
-  const [gateway, setGateway] = createSignal<GatewayState>({ state: "starting" });
-  const [panelOpen, setPanelOpen] = createSignal(true);
-
-  let transcript: HTMLDivElement | undefined;
-  const scrollToEnd = () =>
-    queueMicrotask(() => transcript?.scrollTo({ top: transcript.scrollHeight }));
-
-  const push = (bubble: Bubble) => {
-    setBubbles((current) => [...current, bubble]);
-    scrollToEnd();
-  };
+  const chat = createChat();
+  const [profile, setProfile] = createSignal<Profile>({
+    user_name: "",
+    assistant_name: "",
+    reply_mode: "read",
+  });
 
   /**
-   * The `speaking` signal's off-switch. The character speaks while a reply is
-   * rendered; with no TTS yet the window is a reading-time estimate, replaced
-   * by real playback in Phase 5.
+   * What the character is currently saying. Cleared on a reading-time estimate so
+   * the balloon does not hang over the desktop forever — the transcript in the
+   * dashboard is the durable record; this is speech, and speech ends.
    */
-  let speakingTimer: ReturnType<typeof setTimeout> | undefined;
-  const setSpeaking = (text: string | null) => {
-    clearTimeout(speakingTimer);
-    if (text === null) {
-      void api.setCharacterSignals({ speaking: false }).catch(() => undefined);
+  const [says, setSays] = createSignal<string | null>(null);
+  let saysTimer: ReturnType<typeof setTimeout> | undefined;
+
+  createEffect(() => {
+    const reply = chat.lastReply();
+    clearTimeout(saysTimer);
+    // `hear` means the reply is spoken and not shown; the balloon would be a
+    // second, redundant channel.
+    if (!reply || profile().reply_mode === "hear") {
+      setSays(null);
       return;
     }
-    void api.setCharacterSignals({ speaking: true }).catch(() => undefined);
-    const readingMs = Math.min(2000 + text.length * 40, 10_000);
-    speakingTimer = setTimeout(() => {
-      void api.setCharacterSignals({ speaking: false }).catch(() => undefined);
-    }, readingMs);
-  };
-
-  /** The run finished. Its text is in the timeline, nowhere else. */
-  async function collectReply(failureSummary: string | null) {
-    const id = threadId();
-    setActiveRun(null);
-    setActivity(null);
-    setGate(null);
-
-    if (failureSummary) {
-      push({ role: "error", text: failureSummary });
-      return;
-    }
-    if (!id) return;
-
-    try {
-      const messages: Message[] = await api.fetchTimeline(id);
-      const reply = [...messages]
-        .reverse()
-        .find((message) => message.kind === "assistant" && message.content);
-      if (reply?.content) {
-        push({ role: "assistant", text: reply.content });
-        setSpeaking(reply.content);
-      }
-    } catch (error) {
-      push({ role: "error", text: `Could not load the reply: ${error}` });
-    }
-  }
-
-  function handleChatEvent(event: ChatEvent) {
-    switch (event.kind) {
-      case "run_status": {
-        if (event.run_id !== activeRun()) return;
-        setPhase(event.phase);
-        if (TERMINAL_PHASES.has(event.phase)) {
-          const failed = event.phase === "failed" || event.phase === "killed";
-          void collectReply(
-            failed ? (event.failure_summary ?? "The turn failed.") : null,
-          );
-        }
-        break;
-      }
-      case "gate":
-        // The agent wants to run a tool. It stays parked until answered — and
-        // the panel opens so the prompt is actually visible, mirroring the
-        // character's `concerned` face.
-        setGate({
-          runId: event.run_id,
-          gateRef: event.gate_ref,
-          headline: event.headline,
-          body: event.body,
-        });
-        setPanelOpen(true);
-        break;
-      case "activity":
-        setActivity(event.status === "completed" ? null : event.capability_id);
-        break;
-      case "stream_error":
-        push({ role: "error", text: event.reason });
-        setActiveRun(null);
-        break;
-    }
-  }
-
-  /**
-   * Create the thread once, and only once the gateway is ready.
-   *
-   * The widget paints before the gateway finishes booting — a first run migrates
-   * the database and installs bundled skills. Creating the thread on mount would
-   * fail with "still starting" and never retry, so the thread is created on the
-   * first `ready` we observe, whether that arrives as an event or as the initial
-   * state we read below.
-   */
-  let creating = false;
-  async function ensureThread(state: GatewayState) {
-    if (state.state !== "ready" || threadId() || creating) return;
-    creating = true;
-    try {
-      setThreadId(await api.createThread());
-    } catch (error) {
-      push({ role: "error", text: `Could not start a conversation: ${error}` });
-    } finally {
-      creating = false;
-    }
-  }
+    setSays(reply);
+    const readingMs = Math.min(4000 + reply.length * 45, 20_000);
+    saysTimer = setTimeout(() => setSays(null), readingMs);
+  });
 
   onMount(() => {
-    // onCleanup must register SYNCHRONOUSLY inside onMount: after the first
-    // `await` in an async closure the Solid owner is gone, and a late onCleanup
-    // silently never registers — leaking every listener on unmount. The cleanups
-    // are collected into a list the async work appends to.
     const cleanups: (() => void)[] = [];
     onCleanup(() => {
       cleanups.forEach((fn) => fn());
-      clearTimeout(speakingTimer);
+      clearTimeout(saysTimer);
     });
 
     void (async () => {
-      cleanups.push(
-        await onGatewayState((state) => {
-          setGateway(state);
-          void ensureThread(state);
-        }),
-      );
-      cleanups.push(await onChatEvent(handleChatEvent));
-      cleanups.push(
-        await onBrowserApproval((request) => {
-          // A sensitive fill needs a decision now; force the panel open so the
-          // prompt is visible even if the user had collapsed it, the same as a
-          // tool gate.
-          setFills((current) => [...current, request]);
-          setPanelOpen(true);
-        }),
-      );
-
+      cleanups.push(await chat.start());
+      cleanups.push(await onProfileChanged(setProfile));
       try {
-        // Covers the race where the gateway became ready before we subscribed.
-        const initial = await api.gatewayState();
-        setGateway(initial);
-        await ensureThread(initial);
-      } catch (error) {
-        push({ role: "error", text: `The agent is not reachable: ${error}` });
+        setProfile(await api.profile());
+      } catch {
+        /* silent-ok: an unnamed assistant still works */
       }
-
       // On a fresh install, open the dashboard so the first-run wizard is seen.
       if (await api.needsSetup().catch(() => false)) {
         void api.openDashboard().catch(() => undefined);
@@ -340,203 +205,107 @@ function App() {
     })();
   });
 
-  async function send(event: SubmitEvent) {
-    event.preventDefault();
-    const text = draft().trim();
-    const id = threadId();
-    if (!text || !id || activeRun()) return;
-
-    setDraft("");
-    push({ role: "user", text });
-    setPhase("queued");
-    setSpeaking(null);
-    try {
-      const { run_id } = await api.sendMessage(id, text);
-      setActiveRun(run_id);
-    } catch (error) {
-      setPhase(null);
-      push({ role: "error", text: `Could not send: ${error}` });
-    }
-  }
-
-  async function stop() {
-    const id = threadId();
-    const run = activeRun();
-    if (!id || !run) return;
-    setSpeaking(null);
-    try {
-      // The Stop button races the answer; `already_terminal` means the reply
-      // landed first, which is not a failure.
-      const { already_terminal } = await api.cancelRun(id, run);
-      if (already_terminal) await collectReply(null);
-    } catch (error) {
-      push({ role: "error", text: `Could not stop: ${error}` });
-    }
-  }
-
-  async function answerGate(approved: boolean) {
-    const pending = gate();
-    const id = threadId();
-    if (!pending || !id) return;
-    setGate(null);
-    try {
-      await api.resolveGate(id, pending.runId, pending.gateRef, approved);
-    } catch (error) {
-      push({ role: "error", text: `Could not answer: ${error}` });
-    }
-  }
-
-  async function answerFill(request: BrowserApproval, approved: boolean) {
-    // Drop it from the queue first: the decision is made, and a double-click must
-    // not send two answers for one request.
-    setFills((current) => current.filter((pending) => pending.id !== request.id));
-    try {
-      await api.answerBrowserFill(request.id, approved);
-    } catch (error) {
-      push({ role: "error", text: `Could not answer: ${error}` });
-    }
-  }
-
-  const busy = () => activeRun() !== null;
-  const statusLine = () => {
-    const current = phase();
-    if (gate()) return "waiting for you";
-    if (activity()) return `running ${activity()}`;
-    if (!current || TERMINAL_PHASES.has(current)) return null;
-    if (current === "queued") return "queued";
-    if (current === "cancel_requested") return "stopping";
-    if (current.startsWith("blocked")) return "waiting for you";
-    return "thinking";
-  };
+  // A parked run needs an answer, and the dashboard may be closed — so approvals
+  // live on the character too. They are the one thing that interrupts.
+  const interrupting = () => chat.gate() !== null || chat.fills().length > 0;
 
   return (
-    <div class="widget" classList={{ "panel-closed": !panelOpen() }}>
-      <Show when={panelOpen()}>
-        <div class="bubble-panel">
-          {/* Undecorated window: this strip is what the user drags. */}
-          <header class="widget-header" data-tauri-drag-region>
-            <span class="title" data-tauri-drag-region>
-              IronClaw
-            </span>
-            <HealthBadge state={gateway()} />
-            <button
-              class="ghost"
-              title="Dashboard"
-              onClick={() => void api.openDashboard()}
-            >
-              ⋯
-            </button>
-            <button class="ghost" title="Hide chat" onClick={() => setPanelOpen(false)}>
-              ▾
-            </button>
-          </header>
+    <div class="widget">
+      {/*
+        The character *is* the window. There is no panel, no frame, and no
+        composer here: typing, history, and settings live in the dashboard, which
+        the character's head opens. Everything the widget shows is speech or an
+        interruption, and both are anchored to the character.
+      */}
+      <div class="stage">
+        <Show when={says() && !interrupting()}>
+          {(text) => (
+            <div class="say solid">
+              <div class="say-cloud">{text()}</div>
+              <div class="say-tail" />
+            </div>
+          )}
+        </Show>
 
-          <div class="transcript" ref={transcript}>
-            <For each={bubbles()}>
-              {(bubble) => <div class={`bubble ${bubble.role}`}>{bubble.text}</div>}
-            </For>
+        <Show when={!says() && chat.statusLine() && !interrupting()}>
+          {(line) => (
+            <div class="say say-thinking solid">
+              <div class="say-cloud">{line()}</div>
+              <div class="say-tail" />
+            </div>
+          )}
+        </Show>
 
-            <Show when={statusLine()}>
-              {(line) => <div class="status">{line()}</div>}
-            </Show>
-
-            <Show when={gate()}>
-              {(pending) => (
-                <div class="gate">
-                  <div class="gate-headline">{pending().headline}</div>
-                  <pre class="gate-body">{pending().body}</pre>
-                  <div class="gate-actions">
-                    <button class="approve" onClick={() => void answerGate(true)}>
-                      Allow once
-                    </button>
-                    <button class="deny" onClick={() => void answerGate(false)}>
-                      Deny
-                    </button>
-                  </div>
-                </div>
-              )}
-            </Show>
-
-            {/*
-              Sensitive-fill approval. Shows what will be typed and where — a
-              consent prompt the user can't evaluate isn't consent. Default focus
-              is Deny: the safe answer should be the easy one.
-            */}
-            <For each={fills()}>
-              {(request) => (
-                <div class="gate gate-fill">
-                  <div class="gate-headline">The agent wants to type into a field</div>
-                  <div class="gate-body">
-                    <div class="fill-row">
-                      <span class="fill-label">Field</span>
-                      <span class="fill-value">{request.field}</span>
-                    </div>
-                    <div class="fill-row">
-                      <span class="fill-label">On</span>
-                      <span class="fill-value" classList={{ insecure: !request.secure }}>
-                        {request.url}
-                        {!request.secure ? " (not secure)" : ""}
-                      </span>
-                    </div>
-                    <div class="fill-row">
-                      <span class="fill-label">Text</span>
-                      <span class="fill-value fill-text">{request.value}</span>
-                    </div>
-                    <Show when={request.reason}>
-                      <div class="fill-reason">{request.reason}</div>
-                    </Show>
-                  </div>
-                  <div class="gate-actions">
-                    <button class="deny" onClick={() => void answerFill(request, false)}>
-                      Don't type
-                    </button>
-                    <button class="approve" onClick={() => void answerFill(request, true)}>
-                      Type it
-                    </button>
-                  </div>
-                </div>
-              )}
-            </For>
+        <Show when={chat.gateway().state !== "ready" && !interrupting()}>
+          <div class="say say-status solid">
+            <div class="say-cloud">
+              <HealthBadge state={chat.gateway()} />
+            </div>
+            <div class="say-tail" />
           </div>
+        </Show>
 
-          <form class="composer" onSubmit={send}>
-            <input
-              type="text"
-              placeholder={busy() ? "Working…" : "Ask something"}
-              value={draft()}
-              disabled={busy() || gateway().state !== "ready"}
-              onInput={(event) => setDraft(event.currentTarget.value)}
-              onFocus={() =>
-                void api.setCharacterSignals({ listening: true }).catch(() => undefined)
-              }
-              onBlur={() =>
-                void api.setCharacterSignals({ listening: false }).catch(() => undefined)
-              }
-            />
-            <Show
-              when={busy()}
-              fallback={
-                <button
-                  type="submit"
-                  disabled={!draft().trim() || gateway().state !== "ready"}
-                >
-                  Send
+        <Show when={chat.gate()}>
+          {(pending) => (
+            <div class="ask solid">
+              <div class="ask-headline">{pending().headline}</div>
+              <pre class="ask-body">{pending().body}</pre>
+              <div class="ask-actions">
+                <button class="approve" onClick={() => void chat.answerGate(true)}>
+                  Allow once
                 </button>
-              }
-            >
-              {/* Always visible while a run is in flight, per the project's
-                  runaway-loop guardrails. */}
-              <button type="button" class="stop" onClick={() => void stop()}>
-                Stop
-              </button>
-            </Show>
-          </form>
-        </div>
-      </Show>
+                <button class="deny" onClick={() => void chat.answerGate(false)}>
+                  Deny
+                </button>
+              </div>
+            </div>
+          )}
+        </Show>
+
+        {/*
+          Sensitive-fill approval. Shows what will be typed and where — a consent
+          prompt the user can't evaluate isn't consent. Deny is the easy answer.
+        */}
+        <For each={chat.fills()}>
+          {(request) => (
+            <div class="ask ask-fill solid">
+              <div class="ask-headline">The agent wants to type into a field</div>
+              <div class="ask-body">
+                <div class="fill-row">
+                  <span class="fill-label">Field</span>
+                  <span class="fill-value">{request.field}</span>
+                </div>
+                <div class="fill-row">
+                  <span class="fill-label">On</span>
+                  <span class="fill-value" classList={{ insecure: !request.secure }}>
+                    {request.url}
+                    {!request.secure ? " (not secure)" : ""}
+                  </span>
+                </div>
+                <div class="fill-row">
+                  <span class="fill-label">Text</span>
+                  <span class="fill-value fill-text">{request.value}</span>
+                </div>
+                <Show when={request.reason}>
+                  <div class="fill-reason">{request.reason}</div>
+                </Show>
+              </div>
+              <div class="ask-actions">
+                <button class="deny" onClick={() => void chat.answerFill(request, false)}>
+                  Don't type
+                </button>
+                <button class="approve" onClick={() => void chat.answerFill(request, true)}>
+                  Type it
+                </button>
+              </div>
+            </div>
+          )}
+        </For>
+      </div>
 
       <CharacterView
-        panelOpen={panelOpen}
-        onHeadTap={() => setPanelOpen((open) => !open)}
+        speaking={() => says() !== null || interrupting()}
+        onHeadTap={() => void api.openDashboard().catch(() => undefined)}
       />
     </div>
   );
@@ -575,7 +344,7 @@ function HealthBadge(props: { state: GatewayState }) {
  * click-through mask: the panel's rect plus the character's silhouette, pushed
  * whenever either can have changed.
  */
-function CharacterView(props: { panelOpen: () => boolean; onHeadTap: () => void }) {
+function CharacterView(props: { speaking: () => boolean; onHeadTap: () => void }) {
   let container: HTMLDivElement | undefined;
 
   // The voice loop's state, for the mic-live indicator. `null` when voice is off.
@@ -583,11 +352,12 @@ function CharacterView(props: { panelOpen: () => boolean; onHeadTap: () => void 
 
   // Set once the renderer is mounted. The effect lives in the component body
   // (an async onMount continuation has no Solid owner), and re-pushes the mask
-  // when the panel toggles — its rect just appeared or vanished.
+  // whenever the character starts or stops speaking — a balloon or an approval
+  // card just appeared or vanished, and those are the only solid things here.
   const [maskPusher, setMaskPusher] = createSignal<(() => void) | null>(null);
   createEffect(
     on(
-      () => [props.panelOpen(), maskPusher()] as const,
+      () => [props.speaking(), maskPusher()] as const,
       ([, push]) => {
         if (push) setTimeout(push, 60);
       },
@@ -638,7 +408,8 @@ function CharacterView(props: { panelOpen: () => boolean; onHeadTap: () => void 
       // Voice-loop state → the mic-live indicator.
       cleanups.push(await onVoiceState((state) => setVoiceState(state)));
 
-      // Click head = summon/dismiss the chat panel; drag body = move the window.
+      // Click head = open the dashboard (the transcript, settings, everything);
+      // drag body = move the window.
       const onPointerDown = (event: PointerEvent) => {
         if (event.button !== 0) return;
         const hit = renderer.hitAt?.(event.clientX, event.clientY);
@@ -652,9 +423,9 @@ function CharacterView(props: { panelOpen: () => boolean; onHeadTap: () => void 
       // with idle motion), and immediately when the panel toggles.
       const pushMask = () => {
         const profile = renderer.hitProfile?.(MASK_CELL) ?? null;
-        const solids = Array.from(
-          document.querySelectorAll<HTMLElement>(".bubble-panel"),
-        );
+        // Everything clickable in this window carries `.solid`: the speech
+        // balloon and the approval cards. Anything else is desktop.
+        const solids = Array.from(document.querySelectorAll<HTMLElement>(".solid"));
         void api.setHitMask(buildHitMask(profile, solids)).catch(() => undefined);
       };
       pushMask();

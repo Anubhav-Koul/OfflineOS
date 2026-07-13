@@ -39,17 +39,12 @@ use serde::Serialize;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tokio::sync::Mutex;
 
 const WIDGET: &str = "widget";
 const DASHBOARD: &str = "dashboard";
 const CANVAS: &str = "canvas";
-
-/// Ctrl+Alt+Space, chosen to dodge the common Windows and IDE bindings.
-fn summon_shortcut() -> Shortcut {
-    Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::Space)
-}
 
 /// Shared state, owned by Tauri.
 struct AppState {
@@ -70,6 +65,12 @@ struct AppState {
     /// holds a boxed response body that is `Send` but not `Sync`. This is only
     /// ever spawned from inside an async command, so the runtime is present.
     pump: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The conversation both webviews are looking at.
+    ///
+    /// Owned here, not in a webview: the widget and the dashboard are two views of
+    /// **one** conversation. If each created its own thread the user would type
+    /// into one and watch the other. See [`current_thread`].
+    thread: Mutex<Option<ic_widget::gateway_client::ThreadId>>,
     /// The local model, once one has been brought up. `None` when no model is
     /// installed or the launch failed — the gateway then runs without local
     /// inference. Held for its `Drop`, which stops the sidecar and its proxy;
@@ -191,12 +192,43 @@ async fn gateway_log(state: tauri::State<'_, AppState>) -> Result<String, String
     })
 }
 
-/// Create a thread and start pumping its events to the UI.
+/// The conversation both windows are looking at, creating it on first ask.
+///
+/// **The thread is owned by Rust, not by a webview.** The widget and the dashboard
+/// are two independent webviews showing *one* conversation; if each created its
+/// own thread on mount, the user would type into one and watch the other, and the
+/// second pump would abort the first (the gateway caps concurrent streams anyway).
+/// So whoever asks first creates it, and everyone else joins.
 #[tauri::command]
-async fn create_thread(
+async fn current_thread(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
+    let mut current = state.thread.lock().await;
+    if let Some(thread_id) = current.as_ref() {
+        return Ok(thread_id.to_string());
+    }
+    let thread_id = open_thread(&app, &state).await?;
+    *current = Some(thread_id.clone());
+    Ok(thread_id.to_string())
+}
+
+/// Start a fresh conversation, replacing the current one in both windows.
+#[tauri::command]
+async fn new_thread(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let thread_id = open_thread(&app, &state).await?;
+    *state.thread.lock().await = Some(thread_id.clone());
+    // Both webviews follow the app's thread, so tell them it moved rather than
+    // leaving the widget bubbling replies from a conversation the user has left.
+    let _ = app.emit("thread://changed", thread_id.to_string());
+    Ok(thread_id.to_string())
+}
+
+/// Create a thread on the gateway and point the event pump at it.
+async fn open_thread(
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<ic_widget::gateway_client::ThreadId, String> {
     let client = state.client().await?;
     let thread_id = client.create_thread().await.map_err(user_facing)?;
 
@@ -213,10 +245,10 @@ async fn create_thread(
     )));
 
     // A fresh thread has no active run; clear any phase left from the last one.
-    update_character(&app, |inputs| inputs.run = None).await;
+    update_character(app, |inputs| inputs.run = None).await;
 
-    tracing::info!(%thread_id, "the widget created a thread and started its event pump");
-    Ok(thread_id.to_string())
+    tracing::info!(%thread_id, "the widget opened a thread and started its event pump");
+    Ok(thread_id)
 }
 
 #[derive(Serialize)]
@@ -1203,6 +1235,12 @@ fn build_widget(app: &AppHandle) -> tauri::Result<WebviewWindow> {
         .min_inner_size(320.0, 420.0)
         .decorations(false)
         .transparent(true)
+        // **The frame the user sees is this.** An undecorated, transparent window
+        // still gets a DWM drop-shadow and rounded border on Windows 11 — drawn by
+        // the compositor, not by us, so no amount of CSS removes it. It reads as a
+        // window frame hanging in mid-air around a character that is supposed to be
+        // standing on the desktop.
+        .shadow(false)
         .always_on_top(true)
         .skip_taskbar(true)
         .visible(false) // shown once its position is restored, to avoid a jump
@@ -1772,12 +1810,46 @@ async fn start_voice(app: AppHandle) {
         .map(|s| s.voice_muted)
         .unwrap_or(false);
 
+    // Voice speaks on the app's conversation, not one of its own — so a spoken
+    // question lands in the same transcript the dashboard shows and the same bubble
+    // the character speaks from.
+    let threads: ic_widget::voice::ThreadProvider = {
+        let app = app.clone();
+        Arc::new(move || {
+            let app = app.clone();
+            Box::pin(async move {
+                let state = app.state::<AppState>();
+                let mut current = state.thread.lock().await;
+                if let Some(thread_id) = current.as_ref() {
+                    return Some(thread_id.clone());
+                }
+                let thread_id = open_thread(&app, &state).await.ok()?;
+                *current = Some(thread_id.clone());
+                Some(thread_id)
+            })
+        })
+    };
+
+    // Re-read every turn: the user may switch between read and hear mid-conversation.
+    let speaks: ic_widget::voice::SpeaksFn = {
+        let app = app.clone();
+        Arc::new(move || {
+            app.state::<AppState>()
+                .settings_store
+                .load()
+                .map(|settings| settings.reply_mode.speaks())
+                .unwrap_or(true)
+        })
+    };
+
     let service = ic_widget::voice::start(
         job,
         models_root,
         wake_dir,
         downloader,
         provider,
+        threads,
+        speaks,
         on_state,
         amplitude,
         start_muted,
@@ -2148,7 +2220,9 @@ async fn set_summon_hotkey(app: AppHandle, binding: String) -> Result<(), String
                 Some(binding) => {
                     format!("{binding} is still bound — the new hotkey is taken ({error})")
                 }
-                None => format!("that hotkey is taken, and the old one could not be restored: {error}"),
+                None => {
+                    format!("that hotkey is taken, and the old one could not be restored: {error}")
+                }
             }
         })?;
 
@@ -2227,7 +2301,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             gateway_state,
             gateway_log,
-            create_thread,
+            current_thread,
+            new_thread,
             send_message,
             cancel_run,
             fetch_timeline,
@@ -2272,6 +2347,7 @@ fn main() {
                 gateway: Mutex::new(None),
                 job: Arc::clone(&job),
                 pump: Mutex::new(None),
+                thread: Mutex::new(None),
                 local_llm: Mutex::new(None),
                 browser: Mutex::new(None),
                 canvas: Mutex::new(None),

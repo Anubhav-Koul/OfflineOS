@@ -22,9 +22,10 @@ body {
   color: var(--text);
 }
 
-/* The widget window is transparent and undecorated. The character stands on
-   the desktop at the bottom; the chat panel — the speech bubble — floats above
-   it and is the only painted surface. */
+/* The widget window is transparent and undecorated, and the character IS the
+   window. Nothing is painted except speech (a balloon) and interruptions (an
+   approval the parked run is waiting on) — both anchored to the character, both
+   transient. The durable surfaces live in the dashboard. */
 body.widget-body {
   background: transparent;
   overflow: hidden;
@@ -37,16 +38,148 @@ body.widget-body {
   background: transparent;
 }
 
-.bubble-panel {
-  display: flex;
-  flex-direction: column;
+/* Where speech and interruptions appear: directly above the character, bottom
+   aligned so a balloon grows upward from the head rather than pushing it down. */
+.stage {
   flex: 1 1 auto;
   min-height: 0;
-  background: var(--bg);
-  border: 1px solid #2b2f38;
-  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
   overflow: hidden;
+  /* Clicks pass through the empty stage; only `.solid` children take them. */
+  pointer-events: none;
+}
+.stage > * {
+  pointer-events: auto;
+}
+
+/* ── Speech ─────────────────────────────────────────────────────────────────
+   A cloud, not a card. The old chat panel was an opaque bordered box that read
+   as a window frame stuck to the character's head; this is a balloon with a tail
+   pointing down at whoever is talking, so the eye goes to the character first and
+   the text second. It animates in, because speech arrives — it does not just
+   exist. */
+.say {
+  max-width: 300px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  animation: say-in 180ms ease-out;
+}
+@keyframes say-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.say-cloud {
+  background: #fdfdfb;
+  color: #1a1c22;
+  border-radius: 18px;
+  padding: 10px 14px;
+  font-size: 13px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 260px;
+  overflow-y: auto;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+}
+/* The tail. A triangle under the cloud, pointing at the character's head. */
+.say-tail {
+  width: 0;
+  height: 0;
+  margin-top: -1px;
+  border-left: 9px solid transparent;
+  border-right: 9px solid transparent;
+  border-top: 12px solid #fdfdfb;
+  filter: drop-shadow(0 4px 3px rgba(0, 0, 0, 0.25));
+}
+
+/* Thinking / status: the same balloon, quieter, so a pulse of "thinking" does
+   not read as loudly as an actual answer. */
+.say-thinking .say-cloud,
+.say-status .say-cloud {
+  background: rgba(253, 253, 251, 0.82);
+  color: #3a3f4a;
+  font-style: italic;
+}
+.say-thinking .say-tail,
+.say-status .say-tail {
+  border-top-color: rgba(253, 253, 251, 0.82);
+}
+.say-thinking .say-cloud {
+  animation: say-pulse 1.6s ease-in-out infinite;
+}
+@keyframes say-pulse {
+  0%,
+  100% {
+    opacity: 0.75;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* ── Interruptions ──────────────────────────────────────────────────────────
+   An approval is not speech: the run is parked until it is answered, and the
+   dashboard may be closed. So it is a real card, deliberately unlike the balloon,
+   and it takes the stage on its own. */
+.ask {
+  width: 100%;
+  max-width: 340px;
+  border: 1px solid var(--warn);
+  border-radius: 10px;
+  padding: 10px;
+  background: rgba(24, 26, 32, 0.96);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+.ask-headline {
+  font-weight: 600;
   margin-bottom: 6px;
+}
+.ask-body {
+  margin: 0 0 8px;
+  font-size: 12px;
+  white-space: pre-wrap;
+  color: var(--muted);
+  max-height: 140px;
+  overflow: auto;
+}
+.ask-actions {
+  display: flex;
+  gap: 8px;
+}
+.ask-actions button {
+  flex: 1 1 auto;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+}
+.ask-actions .approve {
+  background: var(--ok);
+  color: #10231a;
+}
+.ask-actions .deny {
+  background: #2b2f38;
+  color: var(--text);
+}
+
+/* A sensitive-fill prompt is a stronger warning than a normal gate: it is the
+   only thing between the agent and the user's password. Red, not amber. */
+.ask-fill {
+  border-color: var(--danger, #d1524a);
+  background: rgba(38, 22, 22, 0.97);
 }
 
 .widget-header {
@@ -99,19 +232,15 @@ button.ghost {
 
 .character {
   position: relative;
-  height: 320px;
+  height: 340px;
   display: flex;
   justify-content: center;
   align-items: flex-end;
   user-select: none;
   flex: none;
-  /* Stays glued to the window's bottom edge when the panel is hidden, so the
-     character keeps standing in the same spot. */
+  /* Glued to the window's bottom edge: the character stands on the desktop. */
   margin-top: auto;
   cursor: pointer;
-}
-.widget.panel-closed .character {
-  height: 100%;
 }
 .character canvas {
   position: absolute;
@@ -736,4 +865,149 @@ h3.subhead {
   margin: auto;
   color: var(--muted);
   font-size: 13px;
+}
+
+/* ── Dashboard: chat ────────────────────────────────────────────────────────
+   The transcript and the composer live here now. The widget is the character;
+   the character does not carry a text box. */
+.chat-pane h2 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.chat-pane h2 .right {
+  margin-left: auto;
+  font-size: 12px;
+}
+.chat-transcript {
+  height: 260px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  background: var(--panel);
+  border: 1px solid #2b2f38;
+  border-radius: 8px;
+}
+.chat-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  max-width: 92%;
+}
+.chat-line .chat-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  flex: 1 1 auto;
+}
+/* Copy is always present but stays quiet until the line is hovered — a button
+   per line, shouting, would drown the conversation. */
+.chat-line .copy {
+  opacity: 0;
+  transition: opacity 120ms;
+  font-size: 11px;
+  flex: none;
+}
+.chat-line:hover .copy {
+  opacity: 1;
+}
+.chat-line.user {
+  align-self: flex-end;
+  background: #223046;
+}
+.chat-line.assistant {
+  align-self: flex-start;
+  background: #1e2530;
+}
+.chat-line.error {
+  align-self: flex-start;
+  background: rgba(240, 115, 106, 0.14);
+  color: var(--danger);
+}
+.chat-status {
+  align-self: flex-start;
+  font-size: 12px;
+  color: var(--muted);
+  font-style: italic;
+}
+.chat-composer {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.chat-composer textarea {
+  width: 100%;
+  resize: vertical;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid #2b2f38;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
+.chat-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+.chat-actions .stop {
+  background: var(--danger);
+  color: #2a0f0d;
+}
+
+/* ── Dashboard: profile ─────────────────────────────────────────────────── */
+.profile-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.profile-grid label,
+.reply-mode {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+}
+.profile-grid input[type="text"] {
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid #2b2f38;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
+.reply-modes {
+  display: flex;
+  gap: 8px;
+}
+.reply-mode {
+  flex: 1 1 0;
+  padding: 10px;
+  border: 1px solid #2b2f38;
+  border-radius: 8px;
+  cursor: pointer;
+  background: var(--panel);
+}
+.reply-mode.active {
+  border-color: var(--ok);
+  background: rgba(87, 201, 138, 0.1);
+}
+.reply-mode input {
+  display: none;
+}
+.hotkey-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.hotkey-row .active {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+.small {
+  font-size: 12px;
 }

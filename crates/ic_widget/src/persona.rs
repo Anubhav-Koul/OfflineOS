@@ -228,7 +228,10 @@ mod tests {
 
         assert_eq!(second.matches(START).count(), 1, "{second}");
         assert!(second.contains("Your name is Aria"));
-        assert!(!second.contains("Your name is Nova"), "the old name lingers");
+        assert!(
+            !second.contains("Your name is Nova"),
+            "the old name lingers"
+        );
         assert!(second.contains("runtime default"));
     }
 

@@ -6,8 +6,9 @@
 //! * a **gateway turn** — a spoken transcript is just a chat message, so [`start`]
 //!   builds the pipeline's [`ReplyFn`](ic_voice::ReplyFn) here: send the transcript,
 //!   wait for the run to finish, read the assistant's reply back off the timeline
-//!   ([`drive_turn`]). Voice keeps its own thread so a spoken conversation has
-//!   continuity without entangling the typed chat.
+//!   ([`drive_turn`]). Voice speaks on the **app's shared thread**, not one of its
+//!   own: it is an alternate *input* to the same conversation, so a spoken question
+//!   and a typed one belong to one transcript and the reply reaches the bubble.
 //! * a **Job Object slot** — Piper's TTS subprocess is enlisted through
 //!   [`enlist`] so a hard kill of the widget takes it down too, exactly like
 //!   `llama-server` and the browser sidecar.
@@ -51,6 +52,23 @@ const LISTEN_TIMEOUT: Duration = Duration::from_secs(12);
 /// starting. The widget implements this over its app state.
 pub type ClientProvider =
     Arc<dyn Fn() -> futures_util::future::BoxFuture<'static, Option<GatewayClient>> + Send + Sync>;
+
+/// Yields the conversation the app is showing, creating it if needed.
+///
+/// Voice used to open a thread of its own, which meant a spoken question and a
+/// typed one were two different conversations: the character would answer out loud
+/// something the dashboard had never heard of, and the reply could not surface in
+/// the speech bubble because no window was watching that thread. Voice is an
+/// *input* to the same conversation, not a channel of its own — so it takes the
+/// app's shared thread.
+pub type ThreadProvider =
+    Arc<dyn Fn() -> futures_util::future::BoxFuture<'static, Option<ThreadId>> + Send + Sync>;
+
+/// Whether a reply should be spoken, read fresh each turn.
+///
+/// The user can change `reply_mode` mid-conversation, and the answer must take
+/// effect on the next reply rather than on the next app launch.
+pub type SpeaksFn = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// A running voice pipeline, held in app state for its lifetime.
 pub struct VoiceService {
@@ -116,6 +134,8 @@ pub async fn start(
     wake_dir: PathBuf,
     downloader: Downloader,
     client_provider: ClientProvider,
+    thread_provider: ThreadProvider,
+    speaks: SpeaksFn,
     on_state: StateFn,
     amplitude: AmplitudeSink,
     start_muted: bool,
@@ -181,30 +201,32 @@ pub async fn start(
     // lazily-created thread. A send that fails (a wiped/lost thread after a
     // user-initiated data reset) drops the cached thread and retries once on a
     // fresh one, so voice recovers without an app restart.
-    let thread: Arc<tokio::sync::Mutex<Option<ThreadId>>> = Arc::new(tokio::sync::Mutex::new(None));
     let reply: ic_voice::ReplyFn = {
         let provider = Arc::clone(&client_provider);
+        let threads = Arc::clone(&thread_provider);
+        let speaks = Arc::clone(&speaks);
         Arc::new(move |transcript: String| {
             let provider = Arc::clone(&provider);
-            let thread = Arc::clone(&thread);
+            let threads = Arc::clone(&threads);
+            let speaks = Arc::clone(&speaks);
             Box::pin(async move {
                 let client = provider().await?;
-                for attempt in 0..2 {
-                    let thread_id = ensure_thread(&client, &thread).await?;
-                    match drive_turn(&client, &thread_id, &transcript).await {
-                        TurnResult::Reply(text) => return Some(speechify(&text)),
-                        TurnResult::NothingToSpeak => return None,
-                        TurnResult::SendFailed => {
-                            // The cached thread may be gone (wiped data). Forget it
-                            // and try once on a fresh one.
-                            *thread.lock().await = None;
-                            if attempt == 1 {
-                                return None;
-                            }
-                        }
-                    }
+                // The app's conversation, not one of voice's own — so the reply
+                // reaches the speech bubble and the dashboard transcript like any
+                // other, and a spoken question can be followed up by a typed one.
+                let thread_id = threads().await?;
+                let text = match drive_turn(&client, &thread_id, &transcript).await {
+                    TurnResult::Reply(text) => text,
+                    TurnResult::NothingToSpeak | TurnResult::SendFailed => return None,
+                };
+                // `read` means the user wants the answer on screen, not aloud. The
+                // turn still ran and the bubble still shows it — this only decides
+                // whether Piper is handed anything to say.
+                if !speaks() {
+                    tracing::debug!("reply mode is read-only; not speaking the reply");
+                    return None;
                 }
-                None
+                Some(speechify(&text))
             })
         })
     };
@@ -245,27 +267,6 @@ pub async fn start(
         _watcher: watcher,
         muted: AtomicBool::new(start_muted),
     })
-}
-
-/// Get voice's thread, creating it on first use.
-async fn ensure_thread(
-    client: &GatewayClient,
-    thread: &tokio::sync::Mutex<Option<ThreadId>>,
-) -> Option<ThreadId> {
-    let mut guard = thread.lock().await;
-    if let Some(id) = guard.as_ref() {
-        return Some(id.clone());
-    }
-    match client.create_thread().await {
-        Ok(id) => {
-            *guard = Some(id.clone());
-            Some(id)
-        }
-        Err(error) => {
-            tracing::warn!(%error, "could not create the voice thread");
-            None
-        }
-    }
 }
 
 /// How a spoken turn ended, distinguishing "the send itself failed" (retryable on

@@ -32,6 +32,10 @@ pub const MIN_SAMPLES: usize = 3;
 /// A single recorded utterance of the wake phrase, as 16 kHz mono f32.
 pub type Sample = Vec<f32>;
 
+/// Below this peak, a recording contains no voice at all — a muted microphone or a
+/// dead endpoint. Set from measurement, not intuition: see [`train`].
+pub const SILENCE_PEAK: f32 = 0.005;
+
 /// Encode PCM as a 16-bit mono WAV. rustpotter reads WAV, not raw samples, so the
 /// header is not optional.
 fn wav_bytes(samples: &[f32]) -> Vec<u8> {
@@ -93,8 +97,14 @@ pub fn train(wake_dir: &Path, name: &str, samples: &[Sample]) -> Result<PathBuf>
     // A silent "recording" trains a model that fires on silence — which means the
     // agent wakes constantly and the user cannot work out why. Refuse it here rather
     // than shipping a model that is worse than none.
+    //
+    // The bar is deliberately low. Measured on real hardware, a person speaking
+    // normally into a Bluetooth headset peaks around 0.03 — so a threshold of 0.02
+    // (which looked "obviously silent" on paper) would reject a slightly quieter take
+    // and tell the user their microphone was broken when it was working. This must
+    // only catch *actual* silence: a muted mic, or a dead endpoint.
     for (index, sample) in samples.iter().enumerate() {
-        if peak(sample) < 0.02 {
+        if peak(sample) < SILENCE_PEAK {
             return Err(Error::model(format!(
                 "recording {} is silent — check the microphone and try again",
                 index + 1

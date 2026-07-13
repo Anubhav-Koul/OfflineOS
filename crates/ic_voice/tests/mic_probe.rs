@@ -103,3 +103,61 @@ fn a_chosen_microphone_is_used_instead_of_the_default() {
     println!("captured {} samples, peak = {peak:.4}", samples.len());
     assert!(!samples.is_empty(), "the chosen device delivered nothing");
 }
+
+/// Record from EVERY input device in turn and report which one actually hears a
+/// voice. The only way to tell a dead endpoint from a quiet room is for a human to
+/// speak, so this asks for exactly that — and then measures, per device, instead of
+/// guessing from the default.
+#[test]
+#[ignore = "needs a human to talk; run with --ignored"]
+fn records_every_device_and_reports_which_hears_you() {
+    let names = ic_voice::input_devices();
+    println!(
+        "
+=== TALK CONTINUOUSLY — each device gets 5 seconds ===
+"
+    );
+
+    let mut results: Vec<(String, f32)> = Vec::new();
+    for name in &names {
+        println!(">>> now recording: {name}  — KEEP TALKING");
+        let peak = match CpalCapture::start_on(Some(name), 6.0) {
+            Ok(capture) => {
+                let ring = capture.ring();
+                std::thread::sleep(Duration::from_secs(5));
+                drop(capture);
+                sample_peak(&ring.latest(SAMPLE_RATE as usize * 5))
+            }
+            Err(error) => {
+                println!("    could not open: {error}");
+                continue;
+            }
+        };
+        println!("    peak = {peak:.4}");
+        results.push((name.clone(), peak));
+    }
+
+    println!(
+        "
+=== VERDICT ==="
+    );
+    for (name, peak) in &results {
+        let verdict = if *peak >= 0.02 {
+            "HEARS YOU"
+        } else {
+            "deaf / silent"
+        };
+        println!("  {peak:.4}  {verdict:14}  {name}");
+    }
+    let best = results.iter().max_by(|a, b| a.1.total_cmp(&b.1));
+    match best {
+        Some((name, peak)) if *peak >= 0.02 => println!(
+            "
+USE THIS ONE: {name}"
+        ),
+        _ => println!(
+            "
+NO DEVICE HEARD ANYTHING — the mic is muted in Windows, or blocked by privacy settings"
+        ),
+    }
+}

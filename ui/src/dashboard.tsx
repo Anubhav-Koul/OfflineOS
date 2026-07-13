@@ -1178,6 +1178,15 @@ function ProfilePanel() {
  * default peaked at 0.003 while the real microphone sat unused. So the device is a
  * choice, and the level meter is how the user can *see* which one hears them.
  */
+/**
+ * Below this peak there is no voice in the recording at all — a muted mic or a dead
+ * endpoint. Measured, not guessed: a person speaking normally into a Bluetooth
+ * headset peaks around 0.03, so a bar at 0.02 would call a slightly quiet speaker
+ * "silent" and send them hunting for a hardware fault they do not have.
+ * Mirrors `ic_voice::train::SILENCE_PEAK`.
+ */
+const SILENCE_PEAK = 0.005;
+
 function MicSetup(props: {
   assistantName: string;
   compact?: boolean;
@@ -1237,7 +1246,7 @@ function MicSetup(props: {
       setTakes(sample.recorded);
       setNeeded(sample.needed);
       // Say so on take one, not after three wasted takes and a failed training run.
-      setQuiet(sample.peak < 0.02);
+      setQuiet(sample.peak < SILENCE_PEAK);
     } catch (problem) {
       setError(String(problem));
     } finally {
@@ -1266,9 +1275,7 @@ function MicSetup(props: {
     void api.resetWakeSamples().catch(() => undefined);
   };
 
-  // A peak below this is silence in any room with a person in it.
-  const HEARD = 0.02;
-  const heard = () => level() !== null && level()! >= HEARD;
+  const heard = () => level() !== null && level()! >= SILENCE_PEAK;
 
   return (
     <div class="mic-setup">

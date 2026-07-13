@@ -11,7 +11,7 @@
 //! in-tree (recorded, so the licence is clean), located with [`bundled_wake_models`].
 //!
 //! Digests were taken from the sources on 2026-07-12:
-//! - whisper `ggml-base.en.bin` — HuggingFace `ggerganov/whisper.cpp` (MIT).
+//! - whisper `ggml-small.en.bin` — HuggingFace `ggerganov/whisper.cpp` (MIT).
 //! - Piper voice `en_US-amy-medium` — HuggingFace `rhasspy/piper-voices`
 //!   (**verify the voice's MODEL_CARD licence before public release** — Phase 6).
 //! - Piper `2023.11.14-2` `piper_windows_amd64.zip` — `rhasspy/piper` (MIT).
@@ -48,13 +48,26 @@ impl PinnedAsset {
     }
 }
 
-/// whisper `base.en`, q?_0 GGML (147 MB). CPU-friendly, English-only.
+/// whisper `small.en` GGML (488 MB). English-only, CPU.
+///
+/// **Not `base.en` (147 MB), which was here first.** Measured on this hardware, over
+/// a Bluetooth headset: `base.en` transcribed "Nova, can you check my emails?" as
+/// "North and New check my emails." — the content words right, the short function
+/// words at the front invented. Bluetooth HFP audio is compressed and narrowband,
+/// and that is precisely where the small model runs out of context to disambiguate
+/// with. Signal processing had already been pushed as far as it goes (silence
+/// trimmed, level normalized against a click-proof estimate); what was left was the
+/// model.
+///
+/// The cost is honest: 488 MB instead of 147, and slower on CPU. Worth it — a
+/// wake word *is* a short function word, and an assistant that mishears its own name
+/// is not an assistant.
 pub const WHISPER_MODEL: PinnedAsset = PinnedAsset {
-    label: "whisper base.en",
-    url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
-    sha256: "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
-    size_bytes: 147_964_211,
-    file_name: "ggml-base.en.bin",
+    label: "whisper small.en",
+    url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin",
+    sha256: "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d",
+    size_bytes: 487_614_201,
+    file_name: "ggml-small.en.bin",
 };
 
 /// The Piper voice model (`en_US-amy-medium`, 63 MB).

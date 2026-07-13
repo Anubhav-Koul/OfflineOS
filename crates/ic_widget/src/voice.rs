@@ -142,6 +142,7 @@ pub async fn start(
     thread_provider: ThreadProvider,
     speaks: SpeaksFn,
     input_device: InputDeviceFn,
+    on_transcript: ic_voice::TranscriptFn,
     on_state: StateFn,
     amplitude: AmplitudeSink,
     start_muted: bool,
@@ -246,6 +247,7 @@ pub async fn start(
     };
 
     let config = ic_voice::PipelineConfig {
+        on_transcript,
         capture_factory,
         wake,
         vad,

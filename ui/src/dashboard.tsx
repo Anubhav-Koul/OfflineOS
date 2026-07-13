@@ -6,6 +6,8 @@ import {
   api,
   onGatewayState,
   onModelEvent,
+  onVoiceState,
+  onVoiceTranscript,
   type Automation,
   type GatewayState,
   type InstalledModel,
@@ -16,6 +18,7 @@ import {
   type RecommendedModel,
   type ReplyMode,
   type Thread,
+  type VoiceState,
 } from "./api";
 import { createChat } from "./chat";
 import "./styles.css";
@@ -1175,7 +1178,11 @@ function ProfilePanel() {
  * default peaked at 0.003 while the real microphone sat unused. So the device is a
  * choice, and the level meter is how the user can *see* which one hears them.
  */
-function MicSetup(props: { assistantName: string; compact?: boolean }) {
+function MicSetup(props: {
+  assistantName: string;
+  compact?: boolean;
+  onTrained?: () => void;
+}) {
   const [devices, setDevices] = createSignal<string[]>([]);
   const [device, setDevice] = createSignal<string | null>(null);
   const [level, setLevel] = createSignal<number | null>(null);
@@ -1244,6 +1251,7 @@ function MicSetup(props: { assistantName: string; compact?: boolean }) {
     try {
       await api.trainWakeWord(props.assistantName);
       setTrained(true);
+      props.onTrained?.();
     } catch (problem) {
       setError(String(problem));
     } finally {
@@ -1387,6 +1395,9 @@ function VoicePanel() {
   const [running, setRunning] = createSignal(false);
   const [assistantName, setAssistantName] = createSignal("");
   const [error, setError] = createSignal<string | null>(null);
+  const [state, setState] = createSignal<VoiceState>("idle");
+  const [heard, setHeard] = createSignal<string | null>(null);
+  const [wakeWord, setWakeWord] = createSignal(false);
 
   const refresh = async () => {
     try {
@@ -1400,7 +1411,30 @@ function VoicePanel() {
     }
   };
 
-  onMount(() => void refresh());
+  onMount(() => {
+    void refresh();
+    const cleanups: (() => void)[] = [];
+    onCleanup(() => cleanups.forEach((fn) => fn()));
+    void (async () => {
+      cleanups.push(await onVoiceState(setState));
+      cleanups.push(await onVoiceTranscript((text) => setHeard(text.trim())));
+      setWakeWord(await api.hasWakeWord().catch(() => false));
+    })();
+  });
+
+  /**
+   * Why voice is not listening, in the user's terms. Every one of these was
+   * previously invisible: the app simply did nothing and the user had no way to tell
+   * a muted mic from a deaf device from a wake word that was never trained.
+   */
+  const blocker = () => {
+    if (!enabled()) return "Voice is off.";
+    if (!running()) return "Starting — the speech models are still downloading.";
+    if (muted()) return "The microphone is muted. Nothing is being heard.";
+    if (!wakeWord())
+      return `No wake word yet — say nothing, just hold ${"the summon hotkey"} and speak (push-to-talk).`;
+    return null;
+  };
 
   const toggleEnabled = async (on: boolean) => {
     setError(null);
@@ -1443,7 +1477,23 @@ function VoicePanel() {
         </label>
       </Show>
 
-      <MicSetup assistantName={assistantName()} />
+      <Show when={blocker()}>
+        {(why) => <p class="reason-inline">{why()}</p>}
+      </Show>
+
+      <Show when={enabled() && running()}>
+        <p class="muted small">
+          Status: <strong>{state()}</strong>
+          <Show when={heard() !== null}>
+            {" — last heard: "}
+            <Show when={heard()} fallback={<em>nothing</em>}>
+              <strong>“{heard()}”</strong>
+            </Show>
+          </Show>
+        </p>
+      </Show>
+
+      <MicSetup assistantName={assistantName()} onTrained={() => setWakeWord(true)} />
 
       <Show when={error()}>
         <p class="error">{error()}</p>

@@ -27,6 +27,7 @@ import {
   onChatEvent,
   onGatewayState,
   onThreadChanged,
+  onVoiceTranscript,
   TERMINAL_PHASES,
   type BrowserApproval,
   type ChatEvent,
@@ -67,6 +68,8 @@ export function createChat() {
   const [gateway, setGateway] = createSignal<GatewayState>({ state: "starting" });
   /** The newest assistant reply — what the character says out loud. */
   const [lastReply, setLastReply] = createSignal<string | null>(null);
+  /** The last thing the microphone heard. `""` means it heard nothing. */
+  const [heard, setHeard] = createSignal<string | null>(null);
   /**
    * Sensitive-fill approvals queue. A page may ask for several in a row and each
    * needs its own explicit answer, so they are never collapsed into one.
@@ -201,6 +204,22 @@ export function createChat() {
     );
     cleanups.push(await onChatEvent(handleChatEvent));
     cleanups.push(await onBrowserApproval((request) => setFills((q) => [...q, request])));
+    // A spoken question never appeared anywhere: voice sent it straight to the
+    // gateway, so the transcript held the reply but not the question, and the user
+    // could not tell a misheard word from a broken microphone. Now what was heard is
+    // shown — and an empty transcript says so out loud.
+    cleanups.push(
+      await onVoiceTranscript((text) => {
+        const heard = text.trim();
+        if (heard) {
+          push({ role: "user", text: heard });
+          setHeard(heard);
+        } else {
+          push({ role: "error", text: "I listened, but heard nothing." });
+          setHeard("");
+        }
+      }),
+    );
     // The other window started a new session; follow it rather than bubbling
     // replies from a conversation the user has left.
     cleanups.push(
@@ -319,6 +338,7 @@ export function createChat() {
     gateway,
     lastReply,
     setLastReply,
+    heard,
     phase,
     busy,
     ready,

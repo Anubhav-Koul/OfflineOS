@@ -1849,6 +1849,19 @@ async fn start_voice(app: AppHandle) {
         Arc::new(move || chosen_microphone(&app.state::<AppState>()))
     };
 
+    // What the microphone actually heard. Without this the voice pipeline is a
+    // black box with five stages and one symptom: a muted mic, a device that hears
+    // nothing, a wake word that never fired, a transcript whisper could not make
+    // out, and a failed gateway turn are indistinguishable from outside — all of
+    // them are just "nothing happened".
+    let on_transcript: ic_voice::TranscriptFn = {
+        let app = app.clone();
+        Arc::new(move |text: String| {
+            tracing::info!(heard = %text, "voice transcript");
+            let _ = app.emit("voice://transcript", text);
+        })
+    };
+
     let service = ic_widget::voice::start(
         job,
         models_root,
@@ -1858,6 +1871,7 @@ async fn start_voice(app: AppHandle) {
         threads,
         speaks,
         input_device,
+        on_transcript,
         on_state,
         amplitude,
         start_muted,
@@ -2060,6 +2074,17 @@ async fn record_wake_sample(state: tauri::State<'_, AppState>) -> Result<WakeSam
 
 /// How long the microphone test listens.
 const MIC_TEST_SECONDS: f32 = 2.0;
+
+/// Whether a wake word has actually been trained.
+///
+/// Recording takes is not training: the user can record three times, never press
+/// "Teach it", and be left with a wake word that does not exist — which is exactly
+/// what happened. The UI needs to be able to say so.
+#[tauri::command]
+async fn has_wake_word(app: AppHandle) -> Result<bool, String> {
+    let wake_dir = voice_wake_dir(&app);
+    Ok(!ic_voice::bundled_wake_models(&wake_dir).is_empty())
+}
 
 /// Throw away the recordings and start over.
 #[tauri::command]
@@ -2501,6 +2526,7 @@ fn main() {
             set_input_device,
             test_microphone,
             voice_settings,
+            has_wake_word,
             complete_setup,
         ])
         .setup(|app| {

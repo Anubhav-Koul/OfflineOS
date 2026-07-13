@@ -53,6 +53,9 @@ pub type CaptureFactory = Arc<dyn Fn() -> Result<Box<dyn Capture>> + Send + Sync
 /// when the turn failed or produced nothing to say. The widget implements this over
 /// its `GatewayClient` (send → await terminal run → latest assistant reply).
 pub type ReplyFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>;
+/// Reports what was transcribed, empty string included.
+pub type TranscriptFn = Arc<dyn Fn(String) + Send + Sync>;
+
 /// A callback from transcript to spoken reply. See [`ReplyFuture`].
 pub type ReplyFn = Arc<dyn Fn(String) -> ReplyFuture + Send + Sync>;
 
@@ -82,6 +85,15 @@ pub struct PipelineConfig {
     pub reply: ReplyFn,
     /// State-change notifier.
     pub on_state: StateFn,
+    /// **What the microphone actually heard**, reported after every transcription —
+    /// including an empty one.
+    ///
+    /// Without this the pipeline is a black box with five stages and one symptom
+    /// ("nothing happened"): a muted mic, a deaf device, a wake word that never
+    /// fired, a transcript whisper could not make out, and a gateway that failed all
+    /// look identical from outside. An empty string means "I listened and heard
+    /// nothing", which is a *different* and much more useful answer than silence.
+    pub on_transcript: TranscriptFn,
     /// Lip-sync amplitude sink, handed to the player.
     pub amplitude: AmplitudeSink,
     /// Endpointing thresholds.
@@ -209,6 +221,7 @@ struct Driver {
     player: Arc<dyn Player>,
     reply: ReplyFn,
     on_state: StateFn,
+    on_transcript: TranscriptFn,
     amplitude: AmplitudeSink,
     playback: Option<Playback>,
     /// Where finished stage tasks report back into the select loop.
@@ -249,6 +262,7 @@ impl Driver {
             player: config.player,
             reply: config.reply,
             on_state: config.on_state,
+            on_transcript: config.on_transcript,
             amplitude: config.amplitude,
             playback: None,
             stage_tx,
@@ -424,6 +438,7 @@ impl Driver {
         let transcriber = Arc::clone(&self.transcriber);
         let tx = self.stage_tx.clone();
         let turn = self.turn;
+        let on_transcript = Arc::clone(&self.on_transcript);
         tokio::spawn(async move {
             let text = match tokio::task::spawn_blocking(move || {
                 // Recover a poisoned lock: whisper builds a fresh state per call,
@@ -443,6 +458,7 @@ impl Driver {
                     String::new()
                 }
             };
+            on_transcript(text.clone());
             let _ = tx.send(StageOutcome::Transcribed(turn, text)).await;
         });
     }
@@ -671,6 +687,8 @@ mod tests {
         player: FakePlayer,
         states: Arc<Mutex<Vec<VoiceState>>>,
         sent: Arc<Mutex<Vec<String>>>,
+        /// Everything the pipeline reported hearing, empty transcripts included.
+        transcripts: Arc<Mutex<Vec<String>>>,
     }
 
     /// Knobs for the test pipeline; the defaults are the happy path.
@@ -709,6 +727,9 @@ mod tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
 
         let states_sink = Arc::clone(&states);
+        let transcripts: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transcripts_sink = Arc::clone(&transcripts);
         let sent_sink = Arc::clone(&sent);
         let reply = options.reply;
         let reply_delay = options.reply_delay;
@@ -739,6 +760,14 @@ mod tests {
                 }
             }),
             amplitude: crate::stages::null_amplitude(),
+            on_transcript: {
+                let sink = Arc::clone(&transcripts_sink);
+                Arc::new(move |text: String| {
+                    if let Ok(mut heard) = sink.lock() {
+                        heard.push(text);
+                    }
+                })
+            },
             endpoint: EndpointConfig {
                 // Small thresholds so a short scripted clip endpoints quickly.
                 min_speech_ms: 32,
@@ -760,6 +789,7 @@ mod tests {
                 player,
                 states,
                 sent,
+                transcripts,
             },
         )
     }
@@ -791,6 +821,40 @@ mod tests {
     async fn settle() {
         // Let the 20 ms tick loop run several times.
         tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+
+    /// The pipeline must say what it heard — and say so even when it heard nothing.
+    ///
+    /// The regression: a user spoke, nothing happened, and there was no way to tell
+    /// a muted microphone from a deaf device from a wake word that never fired from a
+    /// transcript whisper could not make out. All five look identical from outside.
+    /// An empty transcript reported *as* an empty transcript is the difference
+    /// between "I heard nothing" and silence.
+    #[tokio::test]
+    async fn the_pipeline_reports_what_it_heard_including_nothing() {
+        let (handle, h) = build(Some("It is noon."));
+
+        h.wake_arm.store(true, Ordering::SeqCst);
+        h.ring.write(&speech(512));
+        settle().await;
+        for _ in 0..6 {
+            h.ring.write(&speech(512));
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        for _ in 0..8 {
+            h.ring.write(&silence(512));
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        settle().await;
+        settle().await;
+
+        let heard = h.transcripts.lock().unwrap().clone();
+        assert_eq!(
+            heard,
+            ["what time is it"],
+            "the transcript was not reported"
+        );
+        handle.shutdown().await;
     }
 
     #[tokio::test]

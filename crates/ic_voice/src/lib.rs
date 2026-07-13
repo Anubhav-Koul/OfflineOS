@@ -70,7 +70,8 @@ pub use envelope::EnvelopeFollower;
 pub use error::{Error, Result};
 pub use format::SAMPLE_RATE;
 pub use pipeline::{
-    CaptureFactory, PipelineConfig, ReplyFn, RestartTrigger, StateFn, VoiceHandle, spawn,
+    CaptureFactory, PipelineConfig, ReplyFn, RestartTrigger, StateFn, TranscriptFn, VoiceHandle,
+    spawn,
 };
 pub use playback::CpalPlayer;
 pub use resample::Resampler;

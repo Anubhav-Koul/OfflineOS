@@ -254,6 +254,8 @@ export const api = {
   /** Record one utterance of the wake phrase (the assistant's name). */
   recordWakeSample: () => invoke<WakeSample>("record_wake_sample"),
   resetWakeSamples: () => invoke<void>("reset_wake_samples"),
+  /** Whether a wake word has actually been trained (recording takes is not training). */
+  hasWakeWord: () => invoke<boolean>("has_wake_word"),
   /** Turn the recordings into a wake-word model, on this machine. */
   trainWakeWord: (name: string) => invoke<string>("train_wake_word", { name }),
   sendMessage: (threadId: string, content: string) =>
@@ -382,6 +384,15 @@ export function onChatEvent(handler: (event: ChatEvent) => void): Promise<Unlist
  */
 export function onThreadChanged(handler: (threadId: string) => void): Promise<UnlistenFn> {
   return listen<string>("thread://changed", (event) => handler(event.payload));
+}
+
+/**
+ * What the microphone heard, after every transcription — **including an empty
+ * string**, which means "I listened and heard nothing". That is a different and far
+ * more useful answer than silence, which is what the user got before.
+ */
+export function onVoiceTranscript(handler: (text: string) => void): Promise<UnlistenFn> {
+  return listen<string>("voice://transcript", (event) => handler(event.payload));
 }
 
 /** The profile changed in the other window (name, or how replies are delivered). */

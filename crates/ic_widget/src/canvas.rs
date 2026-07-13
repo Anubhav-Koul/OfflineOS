@@ -119,13 +119,13 @@ pub async fn register(client: &GatewayClient) {
         }
         Ok(_) => {
             tracing::warn!(
-                "the canvas extension activated but its tool was not discovered — the gateway \
-                 fell back to the bundled template. The server was probably not reachable at \
-                 activation."
+                "the canvas extension activated with no capabilities, so the agent has no canvas. \
+                 The manifest was probably written after the gateway booted (the catalogue is only \
+                 scanned once) or failed to parse."
             );
         }
         Err(error) => {
-            tracing::warn!(%error, "could not confirm the canvas tool was discovered");
+            tracing::warn!(%error, "could not confirm the canvas tool reached the agent");
         }
     }
 }

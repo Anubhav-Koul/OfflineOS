@@ -40,16 +40,18 @@ use tokio::sync::Mutex;
 use crate::gateway_client::GatewayClient;
 use crate::job_object::ProcessJob;
 
-/// The handshake line the sidecar prints once it is listening *and* the browser
-/// is up.
+/// The handshake line the sidecar prints once it is listening. The browser
+/// itself starts on the first tool call, not here — see `LazyBrowser` in
+/// `ic_browser_mcp` for why.
 const LISTENING_PREFIX: &str = "IC_BROWSER_MCP_LISTENING ";
 /// The stdout line carrying a sensitive-fill approval request from the sidecar.
 const APPROVAL_PREFIX: &str = "IC_BROWSER_MCP_APPROVAL ";
 /// The stdin line carrying our decision back.
 const DECISION_PREFIX: &str = "IC_BROWSER_MCP_DECISION ";
 
-/// How long to wait for that line. A cold Chrome on a first run is not instant,
-/// but it is not a minute either; past this we assume it is wedged.
+/// How long to wait for that line. It now only covers binding a loopback port
+/// (the browser launch moved to the first tool call), but the budget is left
+/// generous: a cold sidecar behind an on-access AV scan is not instant.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// A running browser sidecar.
@@ -336,8 +338,14 @@ pub async fn register(client: &GatewayClient) {
         }
     }
 
-    // The honest check. `activated: true` above is not evidence that discovery
-    // reached the sidecar.
+    // The honest check. `activated: true` above is not evidence that the agent
+    // actually got the tools.
+    //
+    // Note this no longer depends on hosted-MCP *discovery*, which cannot succeed
+    // in Reborn (the egress has no staged network policy at activation — see
+    // `ic_browser_mcp::manifest`). The six capabilities come from the bundled
+    // manifest itself, so a short count here means the manifest was not scanned:
+    // it was written after the gateway booted, or it failed to parse.
     match client.extension_capabilities(EXTENSION_ID).await {
         Ok(capabilities) if capabilities.len() >= ALL_TOOLS.len() => {
             tracing::info!(
@@ -349,13 +357,13 @@ pub async fn register(client: &GatewayClient) {
             tracing::warn!(
                 found = capabilities.len(),
                 expected = ALL_TOOLS.len(),
-                "the browser extension activated but its tools were not discovered — \
-                 the gateway fell back to the bundled manifest, so the agent has no browser. \
-                 The sidecar was probably not reachable when the extension was activated."
+                "the browser extension activated with fewer capabilities than it declares, \
+                 so the agent's browser is incomplete. The manifest was probably written \
+                 after the gateway booted (the catalogue is only scanned once) or failed to parse."
             );
         }
         Err(error) => {
-            tracing::warn!(%error, "could not confirm the browser tools were discovered");
+            tracing::warn!(%error, "could not confirm the browser tools reached the agent");
         }
     }
 }

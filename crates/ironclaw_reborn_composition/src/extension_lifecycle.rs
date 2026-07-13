@@ -8,7 +8,7 @@ use ironclaw_extensions::{
 };
 use ironclaw_filesystem::RootFilesystem;
 use ironclaw_host_api::{
-    CapabilityDescriptor, CapabilityId, EffectKind, ExtensionId, ResourceScope,
+    CapabilityDescriptor, CapabilityId, EffectKind, ExtensionId, NetworkPolicy, ResourceScope,
     RuntimeCredentialRequirement, RuntimeHttpEgress, VirtualPath, sha256_digest_token,
 };
 use ironclaw_product_workflow::{
@@ -56,6 +56,15 @@ pub(crate) struct ActiveExtensionCapability {
     pub(crate) provider: ExtensionId,
     pub(crate) effects: Vec<EffectKind>,
     pub(crate) runtime_credentials: Vec<RuntimeCredentialRequirement>,
+    /// core-patch (desktop fork) CP-5: the network policy this capability must be
+    /// granted to reach its own hosted-MCP server, when it has one.
+    ///
+    /// `Some` only for a hosted-HTTP-MCP provider (see
+    /// [`crate::mcp::hosted_mcp_grant_policy`]). Every other capability leaves this
+    /// `None` and keeps the credential-audience policy the extension surface has
+    /// always built. It is carried here because the grant is built from the
+    /// capability, while the endpoint is only knowable from the *package*.
+    pub(crate) network: Option<NetworkPolicy>,
 }
 
 #[derive(Clone)]
@@ -68,12 +77,17 @@ pub(crate) enum ExtensionActivationMode {
 }
 
 impl ActiveExtensionCapability {
-    fn from_descriptor(descriptor: &CapabilityDescriptor) -> Self {
+    /// `network` is the provider's hosted-MCP grant policy (CP-5), or `None` for a
+    /// provider that is not a hosted-MCP server. The descriptor alone cannot say —
+    /// the endpoint lives on the package — so the caller resolves it and passes it
+    /// in.
+    fn from_descriptor(descriptor: &CapabilityDescriptor, network: Option<NetworkPolicy>) -> Self {
         Self {
             id: descriptor.id.clone(),
             provider: descriptor.provider.clone(),
             effects: descriptor.effects.clone(),
             runtime_credentials: descriptor.runtime_credentials.clone(),
+            network,
         }
     }
 }
@@ -245,7 +259,16 @@ impl RebornLocalExtensionManagementPort {
                     .unwrap_or(CapabilityVisibility::Model)
                     == CapabilityVisibility::Model
             })
-            .map(ActiveExtensionCapability::from_descriptor)
+            .map(|descriptor| {
+                // core-patch (desktop fork) CP-5: resolve the provider's hosted-MCP
+                // endpoint here, where the package is in scope, so the grant built
+                // from this capability can actually reach it. `None` for every
+                // provider that is not a hosted-MCP server.
+                let network = registry
+                    .get_extension(&descriptor.provider)
+                    .and_then(crate::mcp::hosted_mcp_grant_policy);
+                ActiveExtensionCapability::from_descriptor(descriptor, network)
+            })
             .collect())
     }
 

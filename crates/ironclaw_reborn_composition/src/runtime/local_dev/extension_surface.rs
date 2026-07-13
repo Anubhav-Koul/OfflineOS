@@ -123,6 +123,18 @@ fn extension_network_policy(capability: &ActiveExtensionCapability) -> NetworkPo
         return policy;
     }
 
+    // core-patch (desktop fork) CP-5: a hosted-MCP provider's capability must be
+    // allowed to reach that provider's own server. Without this its allowlist is
+    // built solely from runtime-credential audiences — empty for a sidecar that
+    // needs no credentials — and `validate_network_policy_metadata` rejects an
+    // empty allowlist, so every `tools/call` fails in obligation preflight with
+    // `Network` before a byte leaves the process. The policy comes from
+    // `hosted_mcp_grant_policy`, which allows exactly the one declared endpoint and
+    // waives private-IP denial only for a loopback IP literal.
+    if let Some(policy) = &capability.network {
+        return policy.clone();
+    }
+
     let mut targets = Vec::new();
     for credential in &capability.runtime_credentials {
         if !targets.contains(&credential.audience) {
@@ -162,6 +174,7 @@ mod tests {
             provider: ExtensionId::new(WEB_ACCESS_EXTENSION_ID).unwrap(),
             effects: vec![EffectKind::DispatchCapability, EffectKind::Network],
             runtime_credentials: Vec::new(),
+            network: None,
         };
 
         let policy = extension_network_policy(&capability);
@@ -199,6 +212,7 @@ mod tests {
                 },
                 required: true,
             }],
+            network: None,
         };
 
         let policy = extension_network_policy(&capability);
@@ -219,6 +233,7 @@ mod tests {
                 EffectKind::UseSecret,
             ],
             runtime_credentials: Vec::new(),
+            network: None,
         };
 
         let policy = extension_network_policy(&capability);
@@ -238,6 +253,7 @@ mod tests {
                 EffectKind::UseSecret,
             ],
             runtime_credentials: Vec::new(),
+            network: None,
         };
 
         let policy = extension_network_policy(&capability);

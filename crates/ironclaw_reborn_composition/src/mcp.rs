@@ -193,6 +193,27 @@ fn normalize_mcp_path(path: &str) -> String {
     }
 }
 
+/// The network policy an *active* hosted-MCP capability must be granted so its
+/// `tools/call` can reach its own server.
+///
+/// core-patch (desktop fork) CP-5. `extension_network_policy` (the local-dev
+/// extension surface) builds a grant's `NetworkPolicy` purely from the
+/// capability's runtime-credential audiences, and hardcodes
+/// `deny_private_ip_ranges: true`. A hosted-MCP provider that needs no credentials
+/// — an on-device sidecar — therefore gets an **empty allowlist**, and
+/// `validate_network_policy_metadata` rejects an empty allowlist outright, so every
+/// `tools/call` dies in obligation preflight with `Network` before a byte is sent.
+/// CP-4 opened the loopback lane for the *dispatch plan*; this is the same lane in
+/// the *grant*, and without it CP-4 cannot actually be used.
+///
+/// Returns `None` for a package that is not a hosted-HTTP-MCP provider, so every
+/// other extension keeps the credential-audience policy it has today. A remote
+/// provider still gets `deny_private_ip_ranges: true` — only a loopback IP literal
+/// (which is all `HostedMcpEndpoint::parse` will accept for `http`) waives it.
+pub(crate) fn hosted_mcp_grant_policy(package: &ExtensionPackage) -> Option<NetworkPolicy> {
+    hosted_http_mcp_endpoint(package).map(|endpoint| hosted_mcp_network_policy(&endpoint))
+}
+
 fn hosted_mcp_network_policy(endpoint: &HostedMcpEndpoint) -> NetworkPolicy {
     NetworkPolicy {
         allowed_targets: vec![NetworkTargetPattern {
@@ -565,6 +586,55 @@ mod tests {
             "notion.notion-search",
             "mcp_notion_access_token",
         )
+    }
+
+    /// CP-5 tripwire. A loopback sidecar needs no credentials, so the grant policy
+    /// the extension surface would otherwise build for it has an **empty
+    /// allowlist** — and an empty allowlist is rejected outright in obligation
+    /// preflight, killing every `tools/call` before a byte is sent. The grant must
+    /// therefore carry the provider's own endpoint, with private-IP denial waived.
+    /// If this fails, CP-4 is intact but unusable: the browser tools will be listed
+    /// on the agent and fail with `obligation handling failed: Network`.
+    #[test]
+    fn cp5_a_loopback_hosted_mcp_provider_is_granted_its_own_endpoint() {
+        let registry = registry_with_provider(
+            "ic-browser",
+            "http://127.0.0.1:8931/mcp",
+            "ic-browser.browser_click",
+            "unused",
+        );
+        let package = registry
+            .get_extension(&ExtensionId::new("ic-browser").unwrap())
+            .expect("the package");
+
+        let policy = hosted_mcp_grant_policy(package).expect("a loopback provider gets a policy");
+
+        assert!(
+            !policy.allowed_targets.is_empty(),
+            "an empty allowlist is rejected by validate_network_policy_metadata"
+        );
+        assert!(
+            !policy.deny_private_ip_ranges,
+            "127.0.0.1 is a private range"
+        );
+        assert_eq!(policy.allowed_targets[0].host_pattern, "127.0.0.1");
+        assert_eq!(policy.allowed_targets[0].port, Some(8931));
+        assert_eq!(policy.allowed_targets[0].scheme, Some(NetworkScheme::Http));
+    }
+
+    /// The waiver is narrow: a remote provider keeps private-range denial, so CP-5
+    /// cannot be used to reach a private address through an https MCP server.
+    #[test]
+    fn cp5_a_remote_hosted_mcp_provider_still_denies_private_ranges() {
+        let registry = registry_with_notion();
+        let package = registry
+            .get_extension(&ExtensionId::new("notion").unwrap())
+            .expect("the package");
+
+        let policy = hosted_mcp_grant_policy(package).expect("a hosted provider gets a policy");
+
+        assert!(policy.deny_private_ip_ranges);
+        assert_eq!(policy.allowed_targets[0].host_pattern, NOTION_MCP_HOST);
     }
 
     fn registry_with_provider(

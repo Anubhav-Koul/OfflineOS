@@ -169,6 +169,73 @@ grep -rn "core-patch (desktop fork)" crates/
     Either way the `cp4_*` tests in both crates are the tripwire: they fail loudly
     if the patch is lost, and they are the first thing to remove.
 
+## CP-5 — a hosted-MCP capability is never granted its own endpoint (PATCHED)
+
+**CP-4 alone does not work.** It opens the loopback lane for the *dispatch plan*,
+but the grant the capability actually runs under is built somewhere else, and there
+the sidecar is still unreachable. Found on 2026-07-13, by driving a real browse
+through the running app: the six tools were listed on the agent, the model called
+`browser_navigate`, and every call died with
+`capability ic-browser.browser_navigate obligation handling failed: Network` — ~0.4 ms
+in, before a byte left the process.
+
+- **Files:**
+  - `crates/ironclaw_reborn_composition/src/mcp.rs` — new `hosted_mcp_grant_policy`
+    (reuses CP-4's `HostedMcpEndpoint` + `hosted_mcp_network_policy`)
+  - `crates/ironclaw_reborn_composition/src/extension_lifecycle.rs` —
+    `ActiveExtensionCapability` gains `network: Option<NetworkPolicy>`, resolved in
+    `active_model_visible_capabilities` where the *package* (and so the endpoint) is
+    in scope
+  - `crates/ironclaw_reborn_composition/src/runtime/local_dev/extension_surface.rs` —
+    `extension_network_policy` honors it
+- **Why:** `extension_network_policy` builds a grant's `NetworkPolicy` **solely from
+  the capability's runtime-credential audiences**, and hardcodes
+  `deny_private_ip_ranges: true`. An on-device sidecar needs no credentials, so it
+  gets an **empty allowlist** — and `obligations.rs::validate_network_policy_metadata`
+  rejects an empty allowlist outright (`network_obligation_failed()`). So the call
+  fails in obligation preflight, which is *upstream of* the network policy CP-4
+  patched: `authorize_static_policy` is never even reached. CP-4's notes predicted
+  this seam ("`extension_surface.rs` hardcodes `deny_private_ip_ranges: true` for
+  **every** extension capability") but read it as a WASM-shim problem; it is in fact
+  on the hosted-MCP path too, and CP-4 cannot be used without it.
+- **Blast radius:** `hosted_mcp_grant_policy` returns `None` for anything that is not
+  a hosted-HTTP-MCP package, so every other extension keeps exactly the
+  credential-audience policy it has today. A remote (`https`) provider still gets
+  `deny_private_ip_ranges: true` — only a **loopback IP literal** waives it, which is
+  the only thing `HostedMcpEndpoint::parse` accepts for `http` (CP-4). The allowlist
+  holds exactly the one declared endpoint.
+- **Tripwires:** `cp5_a_loopback_hosted_mcp_provider_is_granted_its_own_endpoint` and
+  `cp5_a_remote_hosted_mcp_provider_still_denies_private_ranges` in `mcp.rs`.
+- **DELETE CP-5 WITH CP-4** — same issue
+  ([#5998](https://github.com/nearai/ironclaw/issues/5998)). Any upstream fix that
+  makes an on-device MCP server reachable has to solve the grant too, or it has not
+  actually shipped a working local MCP server.
+
+### Related: hosted-MCP tool *discovery* cannot succeed at all (route-around, not a patch)
+
+Discovery is a third, independent break — and unlike CP-4/CP-5 we did **not** patch
+it, because it can be routed around.
+
+`discover_hosted_mcp_package` calls the sidecar's `tools/list` through
+`RuntimeHttpEgress`, which resolves its `NetworkPolicy` from the staged
+`NetworkObligationPolicyStore`, keyed by `(scope, capability_id)`. That store is only
+ever written during a **capability-dispatch** obligation preflight
+(`obligations.rs::finish_prepare`). Discovery runs at **activation**, outside any
+dispatch, so nothing has staged a policy: the lookup fails with
+`network_policy_missing`, the error boundary collapses that to an opaque
+`network_error`, and `extension_lifecycle.rs` logs at `debug!` and **silently falls
+back to the bundled manifest while still reporting `activated: true`**. Verified: the
+sidecar is never contacted.
+
+So the "the runtime rebuilds every capability from your live `tools/list`" contract
+(`hosted_mcp_discovery.rs`) **never actually runs** in `ironclaw-reborn serve`. The
+bundled manifest is not a fallback — it is the only path. **Route-around:**
+`ic_browser_mcp::manifest` declares all six capabilities (generated from
+`protocol::Tool`, the same source `tools/list` is generated from, so they cannot
+drift) instead of the single representative template the discovery contract asked
+for. If upstream ever fixes discovery it will rebuild those same six from the live
+list and nothing has to change.
+
 ### Related: the runtime approval flow is a no-op (not a patch — a route-around)
 
 CP-4 puts browser tools on the agent, and every discovered MCP tool is stamped

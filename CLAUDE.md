@@ -509,12 +509,36 @@ the smallest cut and lands on the lane upstream already supports: `http` is acce
 for, and only for, a **literal loopback IP** (not `localhost` — a DNS name is
 rebindable), and private-range denial is waived for exactly that one endpoint.
 
+### ⚠️ Correction (2026-07-13): CP-4 alone never worked. See CP-5 + the discovery break.
+
+The three claims below marked "free" were read off the *code contract*, not off a
+running agent. Driving a real browse end to end on 2026-07-13 found the browser tools
+had **never actually worked through the gateway** — two further breaks sat behind
+CP-4, both silent:
+
+1. **Tool discovery can never succeed** (`network_policy_missing` — the egress wants a
+   staged policy that only a *dispatch* stages, and discovery runs at *activation*).
+   Reborn then falls back to the bundled manifest **while reporting `activated: true`**.
+   So the manifest is not a template — it is the whole tool list. `ic_browser_mcp::manifest`
+   now declares all six capabilities, generated from `protocol::Tool`.
+2. **The capability is never granted its own endpoint** (`extension_network_policy`
+   builds the allowlist only from credential audiences → empty for a credential-less
+   sidecar → rejected in obligation preflight). Fixed by **CP-5**.
+
+Both are written up in `docs/desktop/core-patches.md`. Verified after the fix: the
+agent calls `browser_navigate` + `browser_get_text` against real Chrome and answers
+from the page. **The lesson worth keeping: the Phase 4 gate drove the sidecar and the
+runtime's discovery *code*, but never the runtime's *egress* — so a green suite
+coexisted with a browser the agent could not reach. The same shape of gap as "the bug
+every unit test passed" below, one layer out.**
+
 ### What we got for free by riding the supported lane
 
-- **Schemas come from the live `tools/list`.** Reborn *discards* the manifest's
-  capability declarations and rebuilds every capability from our `inputSchema`
-  (`hosted_mcp_discovery.rs`). So `protocol::Tool::input_schema` **is** the
-  agent-facing tool signature, and there are no schema files to keep in sync.
+- ~~**Schemas come from the live `tools/list`.**~~ **False in practice — see the
+  correction above.** Reborn *would* discard the manifest's capability declarations and
+  rebuild every capability from our `inputSchema` (`hosted_mcp_discovery.rs`), but that
+  discovery call never reaches us. The manifest's declarations are what the agent gets,
+  so `protocol::Tool` generates them (schemas included) rather than a single template.
 - **Approval gating is enforced in the sidecar, not the runtime.** The runtime's
   own approval flow is a no-op — `default_permission: Ask` is hardcoded for every
   discovered MCP tool and **nothing reads it** (see the security section below). So

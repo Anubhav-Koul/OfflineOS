@@ -174,43 +174,7 @@ impl GatewayClient {
     /// not imply the tools are there.
     pub async fn extension_capabilities(&self, id: &str) -> Result<Vec<String>> {
         let response: serde_json::Value = self.get("/extensions").await?;
-        let extensions = response
-            .get("extensions")
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-
-        let Some(extension) = extensions.into_iter().find(|extension| {
-            extension
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .or_else(|| {
-                    extension
-                        .get("package_ref")
-                        .and_then(|package| package.get("id"))
-                        .and_then(serde_json::Value::as_str)
-                })
-                == Some(id)
-        }) else {
-            return Ok(Vec::new());
-        };
-
-        Ok(extension
-            .get("capabilities")
-            .and_then(serde_json::Value::as_array)
-            .map(|capabilities| {
-                capabilities
-                    .iter()
-                    .filter_map(|capability| {
-                        capability
-                            .get("id")
-                            .and_then(serde_json::Value::as_str)
-                            .or_else(|| capability.as_str())
-                            .map(str::to_string)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default())
+        Ok(capability_ids_of(&response, id))
     }
 
     /// Send a user message, starting a turn.
@@ -730,9 +694,107 @@ pub enum MessageKind {
     Other,
 }
 
+/// The capability ids `GET /extensions` reports for one extension.
+///
+/// The gateway names this array **`tools`** and fills it with capability-id
+/// strings (`"ic-browser.browser_click"`). An earlier version read only
+/// `capabilities`, so it always returned an empty list — and the caller's "did the
+/// tools actually reach the agent?" check therefore warned on *every* launch,
+/// including the ones where the tools were there. A check that cannot report
+/// success is worse than no check: it trains you to ignore it.
+///
+/// `capabilities` is still accepted as a fallback, and an entry may be either a
+/// bare string or an object with an `id`, so a gateway that tightens either shape
+/// keeps working.
+fn capability_ids_of(response: &serde_json::Value, id: &str) -> Vec<String> {
+    let Some(extensions) = response
+        .get("extensions")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    let Some(extension) = extensions.iter().find(|extension| {
+        extension
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                extension
+                    .get("package_ref")
+                    .and_then(|package| package.get("id"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            == Some(id)
+    }) else {
+        return Vec::new();
+    };
+
+    extension
+        .get("tools")
+        .or_else(|| extension.get("capabilities"))
+        .and_then(serde_json::Value::as_array)
+        .map(|capabilities| {
+            capabilities
+                .iter()
+                .filter_map(|capability| {
+                    capability
+                        .as_str()
+                        .or_else(|| capability.get("id").and_then(serde_json::Value::as_str))
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The exact body the running gateway returns. This is the regression: the
+    /// six tools were live on the agent and the widget reported `found=0`.
+    #[test]
+    fn the_capability_list_is_read_from_the_tools_array_the_gateway_actually_sends() {
+        let response = serde_json::json!({
+            "extensions": [{
+                "package_ref": { "kind": "extension", "id": "ic-browser" },
+                "display_name": "Browser",
+                "active": true,
+                "tools": [
+                    "ic-browser.browser_navigate",
+                    "ic-browser.browser_get_text",
+                    "ic-browser.browser_find",
+                    "ic-browser.browser_fill",
+                    "ic-browser.browser_click",
+                    "ic-browser.browser_screenshot"
+                ]
+            }]
+        });
+
+        let capabilities = capability_ids_of(&response, "ic-browser");
+        assert_eq!(capabilities.len(), 6, "{capabilities:?}");
+        assert!(capabilities.contains(&"ic-browser.browser_click".to_string()));
+    }
+
+    #[test]
+    fn an_object_shaped_capabilities_array_still_decodes() {
+        let response = serde_json::json!({
+            "extensions": [{
+                "id": "ic-canvas",
+                "capabilities": [{ "id": "ic-canvas.canvas_render" }]
+            }]
+        });
+        assert_eq!(
+            capability_ids_of(&response, "ic-canvas"),
+            vec!["ic-canvas.canvas_render".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_extension_the_gateway_does_not_list_has_no_capabilities() {
+        let response = serde_json::json!({ "extensions": [] });
+        assert!(capability_ids_of(&response, "ic-browser").is_empty());
+    }
 
     #[test]
     fn an_automation_list_decodes_a_full_row_and_a_never_run_one() {

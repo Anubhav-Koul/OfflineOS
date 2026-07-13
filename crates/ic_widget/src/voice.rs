@@ -109,6 +109,11 @@ impl VoiceService {
         self.handle.trigger_listen().await;
     }
 
+    /// Say `text` aloud — the reply to a message the user typed.
+    pub async fn speak(&self, text: String) {
+        self.handle.speak(text).await;
+    }
+
     /// Stop the pipeline and release the microphone.
     pub async fn shutdown(self) {
         self.handle.shutdown().await;

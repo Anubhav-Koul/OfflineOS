@@ -254,6 +254,8 @@ export const api = {
   /** Record one utterance of the wake phrase (the assistant's name). */
   recordWakeSample: () => invoke<WakeSample>("record_wake_sample"),
   resetWakeSamples: () => invoke<void>("reset_wake_samples"),
+  /** Speak a reply aloud. Rust ignores it unless the reply mode says to speak. */
+  speakReply: (text: string) => invoke<void>("speak_reply", { text }),
   /** Whether a wake word has actually been trained (recording takes is not training). */
   hasWakeWord: () => invoke<boolean>("has_wake_word"),
   /** Turn the recordings into a wake-word model, on this machine. */

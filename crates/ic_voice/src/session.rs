@@ -74,6 +74,14 @@ pub enum VoiceEvent {
     ReplyReceived(String),
     /// The gateway turn failed or returned nothing to speak.
     ReplyFailed,
+    /// Say something that did not come from a spoken turn — the reply to a message
+    /// the user **typed**.
+    ///
+    /// Without this, `Speaking` was reachable only from `Sending`, i.e. only as the
+    /// tail of a conversation the user had started *with their voice*. So an app set
+    /// to speak its replies stayed silent for every typed message, which is most of
+    /// them.
+    SpeakRequested(String),
     /// TTS playback finished on its own.
     SpeakingEnded,
     /// The user cut in *while we were speaking* — the wake word fired or the
@@ -181,6 +189,12 @@ impl VoiceSession {
                 }
             }
             (VoiceState::Sending, VoiceEvent::ReplyReceived(text)) => {
+                self.state = VoiceState::Speaking;
+                VoiceEffect::Speak(text)
+            }
+            // Only from Idle: mid-turn the user is either talking to us or waiting on
+            // an answer, and neither is a moment to start reading something else out.
+            (VoiceState::Idle, VoiceEvent::SpeakRequested(text)) => {
                 self.state = VoiceState::Speaking;
                 VoiceEffect::Speak(text)
             }

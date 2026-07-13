@@ -58,7 +58,7 @@ export type Chat = ReturnType<typeof createChat>;
  * The shared conversation. Call once per window; both windows drive the same
  * underlying thread.
  */
-export function createChat() {
+export function createChat(options: { speaks?: boolean } = {}) {
   const [threadId, setThreadId] = createSignal<string | null>(null);
   const [bubbles, setBubbles] = createSignal<Bubble[]>([]);
   const [activeRun, setActiveRun] = createSignal<string | null>(null);
@@ -77,6 +77,13 @@ export function createChat() {
   const [fills, setFills] = createSignal<BrowserApproval[]>([]);
   /** Runs whose reply has already been collected. See `handleChatEvent`. */
   const collected = new Set<string>();
+  /**
+   * Whether this turn began with the user's voice. A *spoken* turn is already read
+   * aloud by the voice pipeline itself, so asking it to speak again would say the
+   * answer twice. A *typed* turn has no such path — which is why the app could never
+   * talk back to a user who typed, whatever their reply mode said.
+   */
+  let spokenTurn = false;
 
   const push = (bubble: Omit<Bubble, "at">) =>
     setBubbles((current) => [...current, { ...bubble, at: Date.now() }]);
@@ -122,7 +129,13 @@ export function createChat() {
         push({ role: "assistant", text: reply.content });
         setLastReply(reply.content);
         setSpeaking(reply.content);
+        // One window speaks (the widget), and only for a turn the pipeline is not
+        // already speaking. Rust decides *whether* to, from the persisted reply mode.
+        if (options.speaks && !spokenTurn) {
+          void api.speakReply(reply.content).catch(() => undefined);
+        }
       }
+      spokenTurn = false;
     } catch (error) {
       push({ role: "error", text: `Could not load the reply: ${error}` });
     }
@@ -211,6 +224,7 @@ export function createChat() {
     cleanups.push(
       await onVoiceTranscript((text) => {
         const heard = text.trim();
+        spokenTurn = true;
         if (heard) {
           push({ role: "user", text: heard });
           setHeard(heard);

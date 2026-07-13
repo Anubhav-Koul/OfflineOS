@@ -115,6 +115,13 @@ enum Command {
     /// The default input device changed (WASAPI): drop and reopen capture so we
     /// follow the new default mic. A no-op while muted (nothing is open).
     RestartCapture,
+    /// Say something, whatever asked for it.
+    ///
+    /// Speech used to be reachable only from a *spoken* turn — the reply callback of
+    /// a voice-initiated conversation. So a message the user **typed** was never
+    /// spoken, no matter what their reply mode said, and the app had no way to talk
+    /// to them at all unless they talked to it first.
+    Speak(String),
     /// Stop the loop and release the microphone.
     Shutdown,
 }
@@ -151,6 +158,12 @@ impl VoiceHandle {
         RestartTrigger {
             commands: self.commands.clone(),
         }
+    }
+
+    /// Say `text` aloud: synthesize it and play it, with the same lip-sync amplitude
+    /// and barge-in behaviour as a spoken reply. Used for replies to *typed* messages.
+    pub async fn speak(&self, text: String) {
+        let _ = self.commands.send(Command::Speak(text)).await;
     }
 
     /// Stop the pipeline and wait for it to release the device.
@@ -304,6 +317,16 @@ impl Driver {
                     VoiceState::Speaking => self.barge_in(),
                     _ => {}
                 },
+                // The state machine decides: only Idle accepts it, so we never talk
+                // over a user who is mid-utterance or waiting on an answer.
+                // `step` only advances the state machine — the *effect* it returns is
+                // what actually does the work, and dropping it means the transition
+                // happens and nothing is spoken.
+                Woke::Command(Some(Command::Speak(text))) => {
+                    if let VoiceEffect::Speak(text) = self.step(VoiceEvent::SpeakRequested(text)) {
+                        self.begin_synthesis(text);
+                    }
+                }
                 Woke::Command(Some(Command::RestartCapture)) => {
                     // Drop the current mic and reopen the (new) default. Only while
                     // unmuted; sync_capture reopens via the factory.
@@ -502,6 +525,7 @@ impl Driver {
 
     /// Launch synthesis; the result comes back as [`StageOutcome::Synthesized`].
     fn begin_synthesis(&mut self, text: String) {
+        tracing::debug!(chars = text.len(), "synthesizing speech");
         let synthesizer = Arc::clone(&self.synthesizer);
         let tx = self.stage_tx.clone();
         let turn = self.turn;
@@ -595,6 +619,7 @@ impl Driver {
         let effect = self.session.on(event);
         let after = self.session.state();
         if after != before {
+            tracing::debug!(?before, ?after, "voice state");
             (self.on_state)(after);
         }
         effect
@@ -821,6 +846,32 @@ mod tests {
     async fn settle() {
         // Let the 20 ms tick loop run several times.
         tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+
+    /// A reply to a **typed** message must be spoken.
+    ///
+    /// The regression, in the user's words: "I still can't hear from the app."
+    /// `Speaking` was reachable only from `Sending` — the tail of a conversation the
+    /// user had started *with their voice*. So an app configured to speak its replies
+    /// stayed silent for every typed message, which is most of them, and there was no
+    /// way to make it talk except to talk to it first.
+    #[tokio::test]
+    async fn a_typed_reply_is_spoken() {
+        let (handle, h) = build(None);
+
+        handle.speak("Hello Anubhav.".to_string()).await;
+        settle().await;
+        settle().await;
+
+        assert_eq!(
+            h.synth.spoken(),
+            ["Hello Anubhav."],
+            "nothing was synthesized"
+        );
+        assert_eq!(h.player.played().len(), 1, "nothing was played");
+        let states = h.states.lock().unwrap().clone();
+        assert!(states.contains(&VoiceState::Speaking), "{states:?}");
+        handle.shutdown().await;
     }
 
     /// The pipeline must say what it heard — and say so even when it heard nothing.

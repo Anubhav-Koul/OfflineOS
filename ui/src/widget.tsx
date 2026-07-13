@@ -154,7 +154,8 @@ function buildHitMask(profile: HitProfile | null, elements: HTMLElement[]): HitM
 }
 
 function App() {
-  const chat = createChat();
+  // The widget is the character: it is the one that talks.
+  const chat = createChat({ speaks: true });
   const [profile, setProfile] = createSignal<Profile>({
     user_name: "",
     assistant_name: "",

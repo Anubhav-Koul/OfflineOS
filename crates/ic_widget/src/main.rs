@@ -2075,6 +2075,28 @@ async fn record_wake_sample(state: tauri::State<'_, AppState>) -> Result<WakeSam
 /// How long the microphone test listens.
 const MIC_TEST_SECONDS: f32 = 2.0;
 
+/// Speak a reply aloud, if the user asked for replies to be heard.
+///
+/// The *decision* lives here, not in the UI: `reply_mode` is persisted state, and a
+/// webview that had to consult it before every call would eventually get it wrong.
+/// Silently does nothing when the mode is `read`, or when voice is not running.
+#[tauri::command]
+async fn speak_reply(state: tauri::State<'_, AppState>, text: String) -> Result<(), String> {
+    let settings = state.settings_store.load().map_err(|e| e.to_string())?;
+    if !settings.reply_mode.speaks() {
+        tracing::debug!(mode = ?settings.reply_mode, "not speaking the reply: reply mode is read-only");
+        return Ok(());
+    }
+    let voice = state.voice.lock().await;
+    let Some(service) = voice.as_ref() else {
+        tracing::warn!("asked to speak a reply, but voice is not running");
+        return Ok(());
+    };
+    tracing::info!(chars = text.len(), "speaking a typed reply");
+    service.speak(text).await;
+    Ok(())
+}
+
 /// Whether a wake word has actually been trained.
 ///
 /// Recording takes is not training: the user can record three times, never press
@@ -2527,6 +2549,7 @@ fn main() {
             test_microphone,
             voice_settings,
             has_wake_word,
+            speak_reply,
             complete_setup,
         ])
         .setup(|app| {

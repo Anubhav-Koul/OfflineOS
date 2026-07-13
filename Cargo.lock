@@ -4675,6 +4675,7 @@ dependencies = [
  "rubato 0.16.2",
  "rustpotter",
  "serde",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

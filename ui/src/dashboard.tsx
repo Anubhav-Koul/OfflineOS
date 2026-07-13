@@ -592,58 +592,354 @@ function ProviderRow(props: {
  * libSQL store on boot (no Postgres).
  */
 function SetupWizard(props: { onDone: () => void }) {
-  const [voiceOn, setVoiceOn] = createSignal(false);
+  const [step, setStep] = createSignal(0);
   const [busy, setBusy] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
 
-  const finish = async () => {
+  // Step 1 — the model. The download is *started* here and keeps streaming while
+  // the user answers everything else, so the wizard and the bytes finish together
+  // instead of ending on a progress bar.
+  const [models, setModels] = createSignal<RecommendedModel[]>([]);
+  const [installed, setInstalled] = createSignal<InstalledModel[]>([]);
+  const [downloading, setDownloading] = createSignal<string | null>(null);
+  const [fraction, setFraction] = createSignal<number | null>(null);
+  const [downloadDone, setDownloadDone] = createSignal(false);
+
+  // Step 2 — the names.
+  const [userName, setUserName] = createSignal("");
+  const [assistantName, setAssistantName] = createSignal("");
+  const [replyMode, setReplyMode] = createSignal<ReplyMode>("both");
+
+  // Step 3 — the wake word.
+  const [voiceOn, setVoiceOn] = createSignal(true);
+  const [takes, setTakes] = createSignal(0);
+  const [needed, setNeeded] = createSignal(3);
+  const [recording, setRecording] = createSignal(false);
+  const [quiet, setQuiet] = createSignal(false);
+  const [trained, setTrained] = createSignal(false);
+
+  onMount(async () => {
+    const cleanups: (() => void)[] = [];
+    onCleanup(() => cleanups.forEach((fn) => fn()));
+    try {
+      setModels(await api.recommendedModels());
+      setInstalled(await api.installedModels());
+      // A machine that already has a model does not need to download one.
+      if (installed().length > 0) setDownloadDone(true);
+    } catch (problem) {
+      setError(String(problem));
+    }
+    cleanups.push(
+      await onModelEvent((event) => {
+        if (event.kind === "progress") {
+          setFraction(event.fraction);
+          return;
+        }
+        setDownloading(null);
+        if (event.ok) {
+          setDownloadDone(true);
+          setFraction(1);
+        } else if (event.cancelled) {
+          setFraction(null);
+        } else {
+          setError(event.error ?? "The download failed.");
+        }
+      }),
+    );
+  });
+
+  const startDownload = async (model: RecommendedModel) => {
+    setError(null);
+    setDownloading(model.file);
+    setFraction(0);
+    try {
+      await api.downloadModel(model.repo, model.file);
+    } catch (problem) {
+      setDownloading(null);
+      setError(String(problem));
+    }
+  };
+
+  const recordTake = async () => {
+    setError(null);
+    setRecording(true);
+    setQuiet(false);
+    try {
+      const sample = await api.recordWakeSample();
+      setTakes(sample.recorded);
+      setNeeded(sample.needed);
+      // Tell the user their microphone is muted *now*, not after three silent takes
+      // and a failed training run.
+      setQuiet(sample.peak < 0.02);
+    } catch (problem) {
+      setError(String(problem));
+    } finally {
+      setRecording(false);
+    }
+  };
+
+  const trainWake = async () => {
+    setError(null);
     setBusy(true);
     try {
-      if (voiceOn()) {
-        // Enabling downloads the speech models in the background (~210 MB).
-        await api.setVoiceEnabled(true).catch(() => undefined);
-      }
-      await api.completeSetup();
-      props.onDone();
+      await api.trainWakeWord(assistantName());
+      setTrained(true);
+    } catch (problem) {
+      setError(String(problem));
     } finally {
       setBusy(false);
     }
   };
 
+  const finish = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.setProfile(userName(), assistantName(), replyMode());
+      if (voiceOn()) await api.setVoiceEnabled(true).catch(() => undefined);
+      await api.completeSetup();
+      props.onDone();
+    } catch (problem) {
+      setError(String(problem));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const percent = () => (fraction() === null ? null : Math.round(fraction()! * 100));
+
   return (
     <div class="wizard-overlay">
       <div class="wizard-card">
-        <h1>Welcome to IronClaw Desktop</h1>
+        <h1>Welcome</h1>
         <p class="wizard-lead">
-          A character companion with a local AI agent. Two quick things to get set up
-          — everything else works out of the box, and your data stays on this machine.
+          A companion that lives on your desktop, thinks on your machine, and keeps your
+          data there. Three quick things.
         </p>
-        <ol class="wizard-steps">
-          <li>
-            <strong>Pick a brain.</strong> Below, either download a recommended local
-            model (runs offline on your GPU) or add a cloud provider key. You can
-            change this any time.
-          </li>
-          <li>
-            <strong>Optional: talk to it.</strong>
-            <label class="wizard-voice">
-              <input
-                type="checkbox"
-                checked={voiceOn()}
-                onChange={(e) => setVoiceOn(e.currentTarget.checked)}
-              />
-              Enable voice (wake with the summon hotkey; downloads speech models on
-              first use)
-            </label>
-          </li>
+
+        <ol class="wizard-progress">
+          <For each={["Brain", "Names", "Voice"]}>
+            {(label, index) => (
+              <li classList={{ active: step() === index(), done: step() > index() }}>{label}</li>
+            )}
+          </For>
         </ol>
-        <div class="wizard-actions">
-          <button class="wizard-primary" disabled={busy()} onClick={() => void finish()}>
-            {busy() ? "Finishing…" : "Get started"}
-          </button>
-        </div>
-        <p class="wizard-note">
-          Storage sets itself up automatically — no database to install.
-        </p>
+
+        {/* ── 1. the model ─────────────────────────────────────────────── */}
+        <Show when={step() === 0}>
+          <h2>Pick a brain</h2>
+          <Show
+            when={!downloadDone()}
+            fallback={
+              <p class="muted">
+                A local model is installed. You can add more, or a cloud key, later.
+              </p>
+            }
+          >
+            <p class="muted small">
+              This runs entirely offline on your GPU. It is a big download — it will keep
+              going in the background while you finish setting up.
+            </p>
+            <div class="wizard-models">
+              <For each={models()}>
+                {(model) => (
+                  <button
+                    class="wizard-model"
+                    disabled={downloading() !== null}
+                    onClick={() => void startDownload(model)}
+                  >
+                    <strong>{model.name}</strong>
+                    <span class="muted small">{model.note}</span>
+                    <span class="muted small">
+                      {model.params} · {model.quant} · ~{model.approx_gib} GiB
+                    </span>
+                  </button>
+                )}
+              </For>
+            </div>
+          </Show>
+
+          <Show when={downloading()}>
+            <div class="wizard-download">
+              <div class="bar">
+                <div class="bar-fill" style={{ width: `${percent() ?? 0}%` }} />
+              </div>
+              <span class="muted small">
+                downloading… {percent() ?? 0}% — carry on, this continues in the background
+              </span>
+            </div>
+          </Show>
+
+          <div class="wizard-actions">
+            <button
+              class="wizard-primary"
+              disabled={!downloading() && !downloadDone()}
+              onClick={() => setStep(1)}
+            >
+              Next
+            </button>
+            <button class="ghost" onClick={() => setStep(1)}>
+              I'll use a cloud key instead
+            </button>
+          </div>
+        </Show>
+
+        {/* ── 2. the names ─────────────────────────────────────────────── */}
+        <Show when={step() === 1}>
+          <h2>Introductions</h2>
+          <p class="muted small">
+            The agent is actually told these — it answers to its name and calls you by
+            yours.
+          </p>
+          <div class="profile-grid">
+            <label>
+              What should it call you?
+              <input
+                type="text"
+                value={userName()}
+                placeholder="your name"
+                onInput={(event) => setUserName(event.currentTarget.value)}
+              />
+            </label>
+            <label>
+              What do you call it?
+              <input
+                type="text"
+                value={assistantName()}
+                placeholder="e.g. Nova"
+                onInput={(event) => setAssistantName(event.currentTarget.value)}
+              />
+            </label>
+          </div>
+
+          <h3>How should it answer?</h3>
+          <div class="reply-modes">
+            <For each={["read", "hear", "both"] as ReplyMode[]}>
+              {(mode) => (
+                <label class="reply-mode" classList={{ active: replyMode() === mode }}>
+                  <input
+                    type="radio"
+                    name="setup-reply-mode"
+                    checked={replyMode() === mode}
+                    onChange={() => setReplyMode(mode)}
+                  />
+                  <strong>{mode === "read" ? "Read" : mode === "hear" ? "Hear" : "Both"}</strong>
+                  <span class="muted small">
+                    {mode === "read"
+                      ? "a speech bubble"
+                      : mode === "hear"
+                        ? "spoken aloud"
+                        : "bubble and voice"}
+                  </span>
+                </label>
+              )}
+            </For>
+          </div>
+
+          <div class="wizard-actions">
+            <button class="ghost" onClick={() => setStep(0)}>
+              Back
+            </button>
+            <button class="wizard-primary" onClick={() => setStep(2)}>
+              Next
+            </button>
+          </div>
+        </Show>
+
+        {/* ── 3. the wake word ─────────────────────────────────────────── */}
+        <Show when={step() === 2}>
+          <h2>Teach it to hear its name</h2>
+          <label class="wizard-voice">
+            <input
+              type="checkbox"
+              checked={voiceOn()}
+              onChange={(event) => setVoiceOn(event.currentTarget.checked)}
+            />
+            Let me talk to it (downloads speech models, ~210 MB)
+          </label>
+
+          <Show when={voiceOn()}>
+            <Show
+              when={assistantName().trim()}
+              fallback={
+                <p class="muted small">
+                  Go back and give it a name first — the name <em>is</em> the wake word.
+                </p>
+              }
+            >
+              <p class="muted small">
+                Say <strong>“{assistantName()}”</strong> {needed()} times. The recordings
+                never leave this machine — they are turned into a small model here and
+                then they are the wake word.
+              </p>
+
+              <div class="wake-takes">
+                <For each={Array.from({ length: needed() })}>
+                  {(_, index) => (
+                    <span class="wake-dot" classList={{ filled: takes() > index() }} />
+                  )}
+                </For>
+              </div>
+
+              <Show when={quiet()}>
+                <p class="error small">
+                  That take was silent — is the microphone muted? Record it again.
+                </p>
+              </Show>
+
+              <div class="wizard-actions">
+                <Show
+                  when={takes() >= needed()}
+                  fallback={
+                    <button
+                      class="wizard-primary"
+                      disabled={recording()}
+                      onClick={() => void recordTake()}
+                    >
+                      {recording() ? "Listening…" : `Record “${assistantName()}”`}
+                    </button>
+                  }
+                >
+                  <Show
+                    when={!trained()}
+                    fallback={<span class="muted small">Wake word ready.</span>}
+                  >
+                    <button class="wizard-primary" disabled={busy()} onClick={() => void trainWake()}>
+                      {busy() ? "Learning…" : "Teach it"}
+                    </button>
+                  </Show>
+                </Show>
+                <button
+                  class="ghost"
+                  onClick={() => {
+                    setTakes(0);
+                    setTrained(false);
+                    void api.resetWakeSamples().catch(() => undefined);
+                  }}
+                >
+                  Start over
+                </button>
+              </div>
+
+              <p class="muted small">
+                You can skip this — the summon hotkey works as push-to-talk either way.
+              </p>
+            </Show>
+          </Show>
+
+          <div class="wizard-actions">
+            <button class="ghost" onClick={() => setStep(1)}>
+              Back
+            </button>
+            <button class="wizard-primary" disabled={busy()} onClick={() => void finish()}>
+              {busy() ? "Finishing…" : "Done"}
+            </button>
+          </div>
+        </Show>
+
+        <Show when={error()}>
+          <p class="error">{error()}</p>
+        </Show>
       </div>
     </div>
   );

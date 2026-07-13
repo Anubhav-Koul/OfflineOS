@@ -215,6 +215,14 @@ export interface Profile {
 /** Whether a reply is shown, spoken, or both. */
 export type ReplyMode = "read" | "hear" | "both";
 
+/** One recorded take of the wake phrase. */
+export interface WakeSample {
+  /** Loudness, so a muted microphone is caught on the first take, not the third. */
+  peak: number;
+  recorded: number;
+  needed: number;
+}
+
 export const api = {
   gatewayState: () => invoke<GatewayState>("gateway_state"),
   /** The conversation both windows share, created on first ask. */
@@ -230,6 +238,11 @@ export const api = {
     }),
   summonHotkey: () => invoke<string | null>("summon_hotkey"),
   setSummonHotkey: (binding: string) => invoke<void>("set_summon_hotkey", { binding }),
+  /** Record one utterance of the wake phrase (the assistant's name). */
+  recordWakeSample: () => invoke<WakeSample>("record_wake_sample"),
+  resetWakeSamples: () => invoke<void>("reset_wake_samples"),
+  /** Turn the recordings into a wake-word model, on this machine. */
+  trainWakeWord: (name: string) => invoke<string>("train_wake_word", { name }),
   sendMessage: (threadId: string, content: string) =>
     invoke<SendResult>("send_message", { threadId, content }),
   cancelRun: (threadId: string, runId: string) =>

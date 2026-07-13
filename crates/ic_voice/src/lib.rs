@@ -54,6 +54,7 @@ pub mod ring;
 pub mod session;
 pub mod stages;
 pub mod stt;
+pub mod train;
 pub mod tts;
 pub mod vad;
 pub mod wake;
@@ -80,6 +81,7 @@ pub use stages::{
     null_amplitude,
 };
 pub use stt::WhisperStt;
+pub use train::{MIN_SAMPLES as WAKE_MIN_SAMPLES, peak as sample_peak, train as train_wake_word};
 pub use tts::{ChildEnlist, PiperTts, no_enlist};
 pub use vad::SileroVad;
 pub use wake::{NullWakeWord, RustpotterWake};

@@ -65,6 +65,8 @@ struct AppState {
     /// holds a boxed response body that is `Send` but not `Sync`. This is only
     /// ever spawned from inside an async command, so the runtime is present.
     pump: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Wake-phrase recordings banked by the setup wizard, until it trains them.
+    wake_takes: Mutex<Vec<Vec<f32>>>,
     /// The conversation both webviews are looking at.
     ///
     /// Owned here, not in a webview: the widget and the dashboard are two views of
@@ -1941,6 +1943,87 @@ async fn complete_setup(state: tauri::State<'_, AppState>) -> Result<(), String>
     Ok(())
 }
 
+/// One recorded utterance of the wake phrase.
+#[derive(Serialize)]
+struct WakeSample {
+    /// How loud it was, so the wizard can tell the user their mic is muted rather
+    /// than letting them record three silent takes and fail at the end.
+    peak: f32,
+    /// How many the user has banked so far, and how many are needed.
+    recorded: usize,
+    needed: usize,
+}
+
+/// Record one utterance of the wake phrase.
+///
+/// The wake word is the assistant's *name*, and rustpotter is a reference-model
+/// spotter — a wake word simply *is* a few recordings of someone saying it. So the
+/// model is trained here, on this machine, from this user's voice. Nothing is
+/// uploaded, and this is the only way the app can have a wake word at all: there is
+/// no pretrained one to ship (openWakeWord's are non-commercial).
+#[tauri::command]
+async fn record_wake_sample(state: tauri::State<'_, AppState>) -> Result<WakeSample, String> {
+    // A fresh capture per take, released as soon as the take ends: holding the mic
+    // open across the whole wizard would show a live mic indicator for minutes while
+    // the user reads instructions.
+    use ic_voice::Capture as _; // `ring()` lives on the trait.
+    let capture = ic_voice::CpalCapture::start(WAKE_TAKE_SECONDS + 0.5)
+        .map_err(|error| format!("could not open the microphone: {error}"))?;
+    let ring = capture.ring();
+
+    tokio::time::sleep(std::time::Duration::from_secs_f32(WAKE_TAKE_SECONDS)).await;
+    drop(capture);
+
+    let samples = ring.latest((ic_voice::format::SAMPLE_RATE as f32 * WAKE_TAKE_SECONDS) as usize);
+    let peak = ic_voice::sample_peak(&samples);
+
+    let mut takes = state.wake_takes.lock().await;
+    takes.push(samples);
+    Ok(WakeSample {
+        peak,
+        recorded: takes.len(),
+        needed: ic_voice::WAKE_MIN_SAMPLES,
+    })
+}
+
+/// Throw away the recordings and start over.
+#[tauri::command]
+async fn reset_wake_samples(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.wake_takes.lock().await.clear();
+    Ok(())
+}
+
+/// Train the wake word from the recordings and save it.
+///
+/// The model lands in the directory the voice pipeline already scans, so the next
+/// start swaps push-to-talk for a real wake word with no further wiring.
+#[tauri::command]
+async fn train_wake_word(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    name: String,
+) -> Result<String, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("give the assistant a name first — the name is the wake word".to_string());
+    }
+
+    let takes = state.wake_takes.lock().await.clone();
+    let wake_dir = voice_wake_dir(&app);
+    let path = ic_voice::train_wake_word(&wake_dir, &name, &takes).map_err(|e| e.to_string())?;
+
+    // The pipeline reads its models at start, so a model trained while voice is
+    // already running does not take until voice restarts. Say so rather than leaving
+    // the user wondering why the name does nothing.
+    tracing::info!(%name, "wake word trained; it takes effect when voice next starts");
+    Ok(path.display().to_string())
+}
+
+/// How long one wake-phrase take records for. A name is a word or two; a longer
+/// window mostly banks silence, which drags the model's reference features toward
+/// the room rather than the voice.
+const WAKE_TAKE_SECONDS: f32 = 1.8;
+
 /// The local profile: who the user is, what the assistant is called, and how it
 /// answers. There is no account here — this is a single-user desktop app, and
 /// these are the facts the agent is told about itself and the person it is
@@ -2336,6 +2419,9 @@ fn main() {
             set_profile,
             summon_hotkey,
             set_summon_hotkey,
+            record_wake_sample,
+            reset_wake_samples,
+            train_wake_word,
             complete_setup,
         ])
         .setup(|app| {
@@ -2347,6 +2433,7 @@ fn main() {
                 gateway: Mutex::new(None),
                 job: Arc::clone(&job),
                 pump: Mutex::new(None),
+                wake_takes: Mutex::new(Vec::new()),
                 thread: Mutex::new(None),
                 local_llm: Mutex::new(None),
                 browser: Mutex::new(None),

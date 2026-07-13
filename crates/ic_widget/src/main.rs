@@ -1709,13 +1709,19 @@ fn voice_root() -> Result<PathBuf, String> {
         .ok_or_else(|| "could not locate the local application data directory".to_string())
 }
 
-/// The bundled directory of rustpotter wakeword models (`.rpw`). Empty until we
-/// ship recorded reference models — until then voice uses push-to-talk.
+/// Where the user's trained wakeword models (`.rpw`) live.
+///
+/// **The user's data directory, not the app's resource directory.** A wake word is
+/// recorded *by this user, on this machine*, so it belongs beside their models and
+/// settings — not inside the bundle. Writing it to the resource dir would fail
+/// outright on an installed app (Program Files is read-only) and, in a dev build,
+/// would be wiped by the next `cargo build`. The user would train a wake word, watch
+/// it work, and find it gone tomorrow.
 fn voice_wake_dir(app: &AppHandle) -> PathBuf {
-    app.path()
-        .resource_dir()
-        .map(|dir| dir.join("voice-wakewords"))
-        .unwrap_or_else(|_| PathBuf::from("voice-wakewords"))
+    let _ = app;
+    voice_root()
+        .map(|root| root.join("wake"))
+        .unwrap_or_else(|_| PathBuf::from("wake"))
 }
 
 /// Start voice in the background if the user has enabled it. Provisioning may
@@ -2074,6 +2080,25 @@ async fn record_wake_sample(state: tauri::State<'_, AppState>) -> Result<WakeSam
 
 /// How long the microphone test listens.
 const MIC_TEST_SECONDS: f32 = 2.0;
+
+/// Start listening now — the same thing the summon hotkey does.
+///
+/// Exists because the two ways in are both easy to miss: the hotkey is invisible
+/// (and its default was already taken on this machine), and the wake word does not
+/// exist until the user records one. A button that says "Talk" is the honest third
+/// door.
+#[tauri::command]
+async fn start_listening(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let voice = state.voice.lock().await;
+    let Some(service) = voice.as_ref() else {
+        return Err("Voice is not running — enable it first.".to_string());
+    };
+    if service.is_muted() {
+        return Err("The microphone is muted.".to_string());
+    }
+    service.trigger_listen().await;
+    Ok(())
+}
 
 /// Speak a reply aloud, if the user asked for replies to be heard.
 ///
@@ -2550,6 +2575,7 @@ fn main() {
             voice_settings,
             has_wake_word,
             speak_reply,
+            start_listening,
             complete_setup,
         ])
         .setup(|app| {

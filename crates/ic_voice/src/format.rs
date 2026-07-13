@@ -66,6 +66,42 @@ pub fn pcm_i16le_to_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// The peak level Whisper is fed at.
+///
+/// Whisper's accuracy falls off sharply on quiet input — `base.en` starts
+/// substituting similar-sounding words and, on very quiet audio, hallucinating short
+/// filler ("No.", "Thank you."). Measured on real hardware, a Bluetooth headset
+/// delivers a normal speaking voice at a peak of only ~0.03, which is where that
+/// degradation lives. Lifting the utterance to a healthy level costs nothing and is
+/// what a human would do with a gain knob.
+const TARGET_PEAK: f32 = 0.7;
+
+/// Below this there is no voice to amplify — only room noise, which gain would
+/// merely make louder.
+const NOISE_FLOOR: f32 = 0.005;
+
+/// The most we will amplify. Without a ceiling, near-silence would be multiplied by
+/// hundreds and a quiet room would arrive at Whisper as a roar of hiss, which
+/// transcribes as confident nonsense.
+const MAX_GAIN: f32 = 20.0;
+
+/// Normalize an utterance to a level Whisper transcribes well.
+///
+/// Returns the gain applied (`1.0` = untouched), for logging.
+pub fn normalize(samples: &mut [f32]) -> f32 {
+    let peak = samples
+        .iter()
+        .fold(0.0_f32, |loudest, sample| loudest.max(sample.abs()));
+    if !(NOISE_FLOOR..TARGET_PEAK).contains(&peak) {
+        return 1.0;
+    }
+    let gain = (TARGET_PEAK / peak).min(MAX_GAIN);
+    for sample in samples.iter_mut() {
+        *sample = (*sample * gain).clamp(-1.0, 1.0);
+    }
+    gain
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +167,54 @@ mod tests {
         for (a, b) in original.iter().zip(&round_tripped) {
             assert!((a - b).abs() <= 1, "{a} vs {b}");
         }
+    }
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::*;
+
+    /// The measured case: a Bluetooth headset delivers a normal speaking voice at a
+    /// peak of ~0.03, and whisper mishears it ("Nova, can you search the internet?"
+    /// came back as "Now, can you start the internet?"). It must be lifted.
+    #[test]
+    fn a_quiet_voice_is_amplified_to_a_level_whisper_can_read() {
+        let mut samples: Vec<f32> = (0..1000).map(|i| 0.03 * (i as f32 / 10.0).sin()).collect();
+
+        let gain = normalize(&mut samples);
+
+        assert!(
+            gain > 1.0,
+            "a quiet utterance must be amplified, got {gain}"
+        );
+        let peak = samples.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+        // The gain ceiling binds first here (0.03 × 20 = 0.6), which is the point:
+        // the utterance lands in a range whisper reads well, without lifting the cap
+        // to chase an exact target and amplifying noise along with the voice.
+        assert!(peak >= 0.5, "peak after gain: {peak}");
+        assert!(peak <= 1.0, "peak after gain: {peak}");
+    }
+
+    /// Amplifying a silent room turns hiss into a roar, which whisper transcribes as
+    /// confident nonsense. Leave it alone and let the empty transcript say so.
+    #[test]
+    fn room_noise_is_left_alone_rather_than_amplified_into_hiss() {
+        let mut samples = vec![0.001, -0.002, 0.0015];
+        assert_eq!(normalize(&mut samples), 1.0);
+    }
+
+    #[test]
+    fn an_already_loud_utterance_is_untouched() {
+        let mut samples = vec![0.9, -0.8, 0.75];
+        assert_eq!(normalize(&mut samples), 1.0);
+    }
+
+    /// Gain is capped, and clamping keeps it inside the valid range whatever happens.
+    #[test]
+    fn gain_is_bounded_and_never_clips_out_of_range() {
+        let mut samples = vec![0.006, -0.006];
+        let gain = normalize(&mut samples);
+        assert!(gain <= MAX_GAIN, "{gain}");
+        assert!(samples.iter().all(|s| (-1.0..=1.0).contains(s)));
     }
 }

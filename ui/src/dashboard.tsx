@@ -1489,6 +1489,17 @@ function VoicePanel() {
       </Show>
 
       <Show when={enabled() && running()}>
+        <div class="row">
+          <button
+            disabled={muted() || state() !== "idle"}
+            onClick={() =>
+              void api.startListening().catch((problem) => setError(String(problem)))
+            }
+          >
+            {state() === "listening" ? "Listening…" : "Talk to it"}
+          </button>
+          <span class="muted small">or press the summon hotkey</span>
+        </div>
         <p class="muted small">
           Status: <strong>{state()}</strong>
           <Show when={heard() !== null}>

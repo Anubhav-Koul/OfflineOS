@@ -1103,3 +1103,48 @@ h3.subhead {
 .error {
   color: var(--danger);
 }
+
+/* ── Microphone + wake word ─────────────────────────────────────────────────
+   The device list is a real control, not a detail: the OS default is often a
+   Bluetooth headset that opens cleanly and hears nothing, and the level bar is
+   how the user sees that for themselves. */
+.mic-setup {
+  margin-top: 8px;
+}
+.mic-devices {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 0;
+}
+.mic-device {
+  text-align: left;
+  padding: 8px 10px;
+}
+.mic-device.active {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+.mic-test {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.level {
+  flex: 1 1 120px;
+  height: 8px;
+  border-radius: 999px;
+  background: #2b2f38;
+  overflow: hidden;
+  min-width: 100px;
+}
+.level-fill {
+  height: 100%;
+  background: var(--danger);
+  transition: width 150ms;
+}
+.level-fill.good {
+  background: var(--ok);
+}

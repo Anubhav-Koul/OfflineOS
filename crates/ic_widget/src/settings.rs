@@ -110,6 +110,15 @@ pub struct Settings {
     /// Whether the microphone starts muted when voice is enabled.
     #[serde(default)]
     pub voice_muted: bool,
+    /// Which input device to record from. `None` follows the OS default.
+    ///
+    /// The default is frequently wrong and *silently* so: a paired Bluetooth
+    /// headset takes the default input slot and its HFP endpoint delivers a steady
+    /// stream of near-silence — live enough to pass a "does it produce samples?"
+    /// probe, deaf enough that nothing is ever heard. So the microphone is a choice
+    /// the user can make, and it has to survive restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_device: Option<String>,
     /// Whether the first-run setup wizard has been completed. `false` on a fresh
     /// install shows the wizard (pick a model / provider, optionally enable voice).
     #[serde(default)]

@@ -1844,6 +1844,11 @@ async fn start_voice(app: AppHandle) {
         })
     };
 
+    let input_device: ic_widget::voice::InputDeviceFn = {
+        let app = app.clone();
+        Arc::new(move || chosen_microphone(&app.state::<AppState>()))
+    };
+
     let service = ic_widget::voice::start(
         job,
         models_root,
@@ -1852,6 +1857,7 @@ async fn start_voice(app: AppHandle) {
         provider,
         threads,
         speaks,
+        input_device,
         on_state,
         amplitude,
         start_muted,
@@ -1954,6 +1960,82 @@ struct WakeSample {
     needed: usize,
 }
 
+/// Record `seconds` of audio from the chosen microphone.
+///
+/// Runs on a blocking thread: `CpalCapture::start` probes each candidate device for
+/// up to half a second, which must not sit on an async worker.
+async fn record_samples(device: Option<String>, seconds: f32) -> Result<Vec<f32>, String> {
+    tokio::task::spawn_blocking(move || {
+        use ic_voice::Capture as _; // `ring()` lives on the trait.
+        // A fresh capture per take, released as soon as the take ends: holding the
+        // mic open across the whole wizard would light the mic indicator for minutes
+        // while the user reads instructions.
+        let capture = ic_voice::CpalCapture::start_on(device.as_deref(), seconds + 0.5)
+            .map_err(|error| format!("could not open the microphone: {error}"))?;
+        let ring = capture.ring();
+        std::thread::sleep(std::time::Duration::from_secs_f32(seconds));
+        drop(capture);
+        Ok(ring.latest((ic_voice::format::SAMPLE_RATE as f32 * seconds) as usize))
+    })
+    .await
+    .map_err(|error| format!("the recording task failed: {error}"))?
+}
+
+/// The microphone the user chose, or `None` to follow the OS default.
+fn chosen_microphone(state: &AppState) -> Option<String> {
+    state
+        .settings_store
+        .load()
+        .ok()
+        .and_then(|settings| settings.input_device)
+}
+
+/// Which microphone is chosen (`None` follows the OS default).
+#[derive(Serialize)]
+struct VoiceSettings {
+    input_device: Option<String>,
+}
+
+#[tauri::command]
+async fn voice_settings(state: tauri::State<'_, AppState>) -> Result<VoiceSettings, String> {
+    Ok(VoiceSettings {
+        input_device: chosen_microphone(&state),
+    })
+}
+
+/// Every input device on the machine, OS default first.
+#[tauri::command]
+async fn input_devices() -> Result<Vec<String>, String> {
+    Ok(tokio::task::spawn_blocking(ic_voice::input_devices)
+        .await
+        .map_err(|error| format!("could not list the microphones: {error}"))?)
+}
+
+/// Choose the microphone. Takes effect on the next recording / unmute.
+#[tauri::command]
+async fn set_input_device(
+    state: tauri::State<'_, AppState>,
+    device: Option<String>,
+) -> Result<(), String> {
+    state.update_settings(|settings| settings.input_device = device.clone())?;
+    tracing::info!(device = ?device, "the microphone was changed");
+    Ok(())
+}
+
+/// Listen for a moment and report how loud it was.
+///
+/// This exists because the failure it catches is invisible: a Bluetooth headset's
+/// HFP endpoint takes the default input slot, opens cleanly, and delivers a steady
+/// stream of near-silence. Nothing errors; the user simply is not heard. A number
+/// they can watch move while they talk is the only honest way to tell them which
+/// microphone actually works.
+#[tauri::command]
+async fn test_microphone(state: tauri::State<'_, AppState>) -> Result<f32, String> {
+    let device = chosen_microphone(&state);
+    let samples = record_samples(device, MIC_TEST_SECONDS).await?;
+    Ok(ic_voice::sample_peak(&samples))
+}
+
 /// Record one utterance of the wake phrase.
 ///
 /// The wake word is the assistant's *name*, and rustpotter is a reference-model
@@ -1963,18 +2045,8 @@ struct WakeSample {
 /// no pretrained one to ship (openWakeWord's are non-commercial).
 #[tauri::command]
 async fn record_wake_sample(state: tauri::State<'_, AppState>) -> Result<WakeSample, String> {
-    // A fresh capture per take, released as soon as the take ends: holding the mic
-    // open across the whole wizard would show a live mic indicator for minutes while
-    // the user reads instructions.
-    use ic_voice::Capture as _; // `ring()` lives on the trait.
-    let capture = ic_voice::CpalCapture::start(WAKE_TAKE_SECONDS + 0.5)
-        .map_err(|error| format!("could not open the microphone: {error}"))?;
-    let ring = capture.ring();
-
-    tokio::time::sleep(std::time::Duration::from_secs_f32(WAKE_TAKE_SECONDS)).await;
-    drop(capture);
-
-    let samples = ring.latest((ic_voice::format::SAMPLE_RATE as f32 * WAKE_TAKE_SECONDS) as usize);
+    let device = chosen_microphone(&state);
+    let samples = record_samples(device, WAKE_TAKE_SECONDS).await?;
     let peak = ic_voice::sample_peak(&samples);
 
     let mut takes = state.wake_takes.lock().await;
@@ -1985,6 +2057,9 @@ async fn record_wake_sample(state: tauri::State<'_, AppState>) -> Result<WakeSam
         needed: ic_voice::WAKE_MIN_SAMPLES,
     })
 }
+
+/// How long the microphone test listens.
+const MIC_TEST_SECONDS: f32 = 2.0;
 
 /// Throw away the recordings and start over.
 #[tauri::command]
@@ -2422,6 +2497,10 @@ fn main() {
             record_wake_sample,
             reset_wake_samples,
             train_wake_word,
+            input_devices,
+            set_input_device,
+            test_microphone,
+            voice_settings,
             complete_setup,
         ])
         .setup(|app| {

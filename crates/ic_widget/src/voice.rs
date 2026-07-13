@@ -64,6 +64,11 @@ pub type ClientProvider =
 pub type ThreadProvider =
     Arc<dyn Fn() -> futures_util::future::BoxFuture<'static, Option<ThreadId>> + Send + Sync>;
 
+/// The microphone the user chose, read fresh on every open — so switching device
+/// takes effect on the next unmute, not the next launch. `None` follows the OS
+/// default.
+pub type InputDeviceFn = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 /// Whether a reply should be spoken, read fresh each turn.
 ///
 /// The user can change `reply_mode` mid-conversation, and the answer must take
@@ -136,6 +141,7 @@ pub async fn start(
     client_provider: ClientProvider,
     thread_provider: ThreadProvider,
     speaks: SpeaksFn,
+    input_device: InputDeviceFn,
     on_state: StateFn,
     amplitude: AmplitudeSink,
     start_muted: bool,
@@ -192,10 +198,18 @@ pub async fn start(
         }
     };
 
-    // The microphone factory: opens the current default input on start / unmute /
-    // device change.
-    let capture_factory: ic_voice::CaptureFactory =
-        Arc::new(|| CpalCapture::start(RING_SECONDS).map(|c| Box::new(c) as Box<dyn Capture>));
+    // The microphone factory: opens the user's chosen input on start / unmute /
+    // device change, falling back to the OS default when they have not chosen one
+    // (or their choice has been unplugged). Re-read per open, so switching device in
+    // settings takes effect on the next unmute rather than the next launch.
+    let capture_factory: ic_voice::CaptureFactory = {
+        let device = Arc::clone(&input_device);
+        Arc::new(move || {
+            let chosen = device();
+            CpalCapture::start_on(chosen.as_deref(), RING_SECONDS)
+                .map(|c| Box::new(c) as Box<dyn Capture>)
+        })
+    };
 
     // The reply path: transcript → gateway turn → spoken reply, on voice's own
     // lazily-created thread. A send that fails (a wiped/lost thread after a

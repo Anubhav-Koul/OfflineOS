@@ -63,7 +63,7 @@ pub mod wake;
 pub mod testsupport;
 
 pub use assets::{PinnedAsset, VoiceAssets, bundled_wake_models};
-pub use capture::{Capture, CpalCapture};
+pub use capture::{Capture, CpalCapture, input_devices};
 pub use device::{DeviceChangeFn, DeviceWatcher};
 pub use endpoint::{EndpointConfig, EndpointEvent, Endpointer};
 pub use envelope::EnvelopeFollower;

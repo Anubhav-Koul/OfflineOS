@@ -70,12 +70,48 @@ impl CpalCapture {
     /// Blocks up to `PROBE_WINDOW` per dead device; the driver calls this off any
     /// latency-sensitive path (startup, unmute, device change).
     pub fn start(ring_seconds: f32) -> Result<Self> {
+        Self::start_on(None, ring_seconds)
+    }
+
+    /// Start capture, preferring the input device named `preferred`.
+    ///
+    /// **The OS default is not good enough on its own.** A paired Bluetooth headset
+    /// makes itself the default input, and its HFP endpoint opens cleanly, reports
+    /// no error, and delivers a steady stream of *near-silence* — so it passes
+    /// [`Self::delivers_audio`], which can only tell "produces samples" from
+    /// "produces nothing". It cannot tell "produces samples that contain a voice",
+    /// because a live mic in a quiet room looks the same. Measured on this machine:
+    /// the default (`Headset (OnePlus Buds 4)`) peaked at 0.003 while the user's
+    /// actual microphone sat unused. So the device must be a *choice*, and this is
+    /// how the user makes it.
+    ///
+    /// A `preferred` device that is missing (unplugged since it was chosen) falls
+    /// back to the automatic order rather than failing: no microphone at all is
+    /// worse than the wrong one.
+    pub fn start_on(preferred: Option<&str>, ring_seconds: f32) -> Result<Self> {
         let host = cpal::default_host();
         let ring = SampleRing::for_seconds(ring_seconds);
 
-        // Default first — it is usually right — then the rest, deduplicated by
-        // description (the default also appears in the enumeration).
+        // The user's choice first, then the OS default, then everything else —
+        // deduplicated by description (the default also appears in the enumeration).
         let mut candidates: Vec<cpal::Device> = Vec::new();
+        if let Some(preferred) = preferred {
+            match host.input_devices() {
+                Ok(devices) => candidates.extend(devices.filter(|device| {
+                    device
+                        .description()
+                        .map(|d| d.to_string())
+                        .is_ok_and(|name| name == preferred)
+                })),
+                Err(error) => tracing::warn!(%error, "could not enumerate input devices"),
+            }
+            if candidates.is_empty() {
+                tracing::warn!(
+                    device = preferred,
+                    "the chosen microphone is not present; falling back"
+                );
+            }
+        }
         candidates.extend(host.default_input_device());
         match host.input_devices() {
             Ok(devices) => candidates.extend(devices),
@@ -268,6 +304,32 @@ impl Capture for FakeCapture {
         self.ring.clone()
     }
     fn stop(self: Box<Self>) {}
+}
+
+/// Every input device the machine offers, with the OS default first.
+///
+/// The UI needs this because the default is often wrong: a paired Bluetooth
+/// headset takes the default input slot and then hears nothing (see
+/// [`CpalCapture::start_on`]). Names are what [`CpalCapture::start_on`] matches on.
+pub fn input_devices() -> Vec<String> {
+    let host = cpal::default_host();
+    let mut names: Vec<String> = Vec::new();
+
+    let describe = |device: &cpal::Device| device.description().map(|d| d.to_string()).ok();
+
+    if let Some(name) = host.default_input_device().as_ref().and_then(describe) {
+        names.push(name);
+    }
+    if let Ok(devices) = host.input_devices() {
+        for device in devices {
+            if let Some(name) = describe(&device)
+                && !names.contains(&name)
+            {
+                names.push(name);
+            }
+        }
+    }
+    names
 }
 
 #[cfg(test)]

@@ -612,11 +612,6 @@ function SetupWizard(props: { onDone: () => void }) {
 
   // Step 3 — the wake word.
   const [voiceOn, setVoiceOn] = createSignal(true);
-  const [takes, setTakes] = createSignal(0);
-  const [needed, setNeeded] = createSignal(3);
-  const [recording, setRecording] = createSignal(false);
-  const [quiet, setQuiet] = createSignal(false);
-  const [trained, setTrained] = createSignal(false);
 
   onMount(async () => {
     const cleanups: (() => void)[] = [];
@@ -660,37 +655,8 @@ function SetupWizard(props: { onDone: () => void }) {
     }
   };
 
-  const recordTake = async () => {
-    setError(null);
-    setRecording(true);
-    setQuiet(false);
-    try {
-      const sample = await api.recordWakeSample();
-      setTakes(sample.recorded);
-      setNeeded(sample.needed);
-      // Tell the user their microphone is muted *now*, not after three silent takes
-      // and a failed training run.
-      setQuiet(sample.peak < 0.02);
-    } catch (problem) {
-      setError(String(problem));
-    } finally {
-      setRecording(false);
-    }
-  };
-
-  const trainWake = async () => {
-    setError(null);
-    setBusy(true);
-    try {
-      await api.trainWakeWord(assistantName());
-      setTrained(true);
-    } catch (problem) {
-      setError(String(problem));
-    } finally {
-      setBusy(false);
-    }
-  };
-
+  
+  
   const finish = async () => {
     setBusy(true);
     setError(null);
@@ -859,73 +825,16 @@ function SetupWizard(props: { onDone: () => void }) {
           </label>
 
           <Show when={voiceOn()}>
-            <Show
-              when={assistantName().trim()}
-              fallback={
-                <p class="muted small">
-                  Go back and give it a name first — the name <em>is</em> the wake word.
-                </p>
-              }
-            >
-              <p class="muted small">
-                Say <strong>“{assistantName()}”</strong> {needed()} times. The recordings
-                never leave this machine — they are turned into a small model here and
-                then they are the wake word.
-              </p>
-
-              <div class="wake-takes">
-                <For each={Array.from({ length: needed() })}>
-                  {(_, index) => (
-                    <span class="wake-dot" classList={{ filled: takes() > index() }} />
-                  )}
-                </For>
-              </div>
-
-              <Show when={quiet()}>
-                <p class="error small">
-                  That take was silent — is the microphone muted? Record it again.
-                </p>
-              </Show>
-
-              <div class="wizard-actions">
-                <Show
-                  when={takes() >= needed()}
-                  fallback={
-                    <button
-                      class="wizard-primary"
-                      disabled={recording()}
-                      onClick={() => void recordTake()}
-                    >
-                      {recording() ? "Listening…" : `Record “${assistantName()}”`}
-                    </button>
-                  }
-                >
-                  <Show
-                    when={!trained()}
-                    fallback={<span class="muted small">Wake word ready.</span>}
-                  >
-                    <button class="wizard-primary" disabled={busy()} onClick={() => void trainWake()}>
-                      {busy() ? "Learning…" : "Teach it"}
-                    </button>
-                  </Show>
-                </Show>
-                <button
-                  class="ghost"
-                  onClick={() => {
-                    setTakes(0);
-                    setTrained(false);
-                    void api.resetWakeSamples().catch(() => undefined);
-                  }}
-                >
-                  Start over
-                </button>
-              </div>
-
-              <p class="muted small">
-                You can skip this — the summon hotkey works as push-to-talk either way.
-              </p>
-            </Show>
+            {/* The same component the dashboard's Voice panel uses — so a user who
+                skips this, or has no microphone today, gets the identical thing
+                later instead of a worse copy of it. */}
+            <MicSetup assistantName={assistantName()} compact />
           </Show>
+
+          <p class="muted small">
+            You can skip all of this — the summon hotkey works as push-to-talk, and voice
+            can be set up any time from the dashboard.
+          </p>
 
           <div class="wizard-actions">
             <button class="ghost" onClick={() => setStep(1)}>
@@ -1254,6 +1163,295 @@ function ProfilePanel() {
   );
 }
 
+/**
+ * Microphone + wake word. Used by the setup wizard *and* by a permanent dashboard
+ * panel, because "set up voice" is not a one-time event: the user may skip it at
+ * first run, have no microphone that day, or want to retrain the wake word after
+ * changing the assistant's name.
+ *
+ * The device picker is not a nicety. The OS default input is frequently a paired
+ * Bluetooth headset whose HFP endpoint opens cleanly and then delivers near-silence
+ * — nothing errors, the user simply is not heard. Measured on this machine: the
+ * default peaked at 0.003 while the real microphone sat unused. So the device is a
+ * choice, and the level meter is how the user can *see* which one hears them.
+ */
+function MicSetup(props: { assistantName: string; compact?: boolean }) {
+  const [devices, setDevices] = createSignal<string[]>([]);
+  const [device, setDevice] = createSignal<string | null>(null);
+  const [level, setLevel] = createSignal<number | null>(null);
+  const [testing, setTesting] = createSignal(false);
+  const [takes, setTakes] = createSignal(0);
+  const [needed, setNeeded] = createSignal(3);
+  const [recording, setRecording] = createSignal(false);
+  const [quiet, setQuiet] = createSignal(false);
+  const [training, setTraining] = createSignal(false);
+  const [trained, setTrained] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+
+  onMount(async () => {
+    try {
+      setDevices(await api.inputDevices());
+      const profile = await api.voiceSettings();
+      setDevice(profile.input_device);
+    } catch (problem) {
+      setError(String(problem));
+    }
+  });
+
+  const choose = async (name: string) => {
+    setError(null);
+    setLevel(null);
+    setDevice(name);
+    try {
+      await api.setInputDevice(name);
+    } catch (problem) {
+      setError(String(problem));
+    }
+  };
+
+  const test = async () => {
+    setError(null);
+    setTesting(true);
+    try {
+      setLevel(await api.testMicrophone());
+    } catch (problem) {
+      setError(String(problem));
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const record = async () => {
+    setError(null);
+    setRecording(true);
+    setQuiet(false);
+    try {
+      const sample = await api.recordWakeSample();
+      setTakes(sample.recorded);
+      setNeeded(sample.needed);
+      // Say so on take one, not after three wasted takes and a failed training run.
+      setQuiet(sample.peak < 0.02);
+    } catch (problem) {
+      setError(String(problem));
+    } finally {
+      setRecording(false);
+    }
+  };
+
+  const train = async () => {
+    setError(null);
+    setTraining(true);
+    try {
+      await api.trainWakeWord(props.assistantName);
+      setTrained(true);
+    } catch (problem) {
+      setError(String(problem));
+    } finally {
+      setTraining(false);
+    }
+  };
+
+  const restart = () => {
+    setTakes(0);
+    setTrained(false);
+    setQuiet(false);
+    void api.resetWakeSamples().catch(() => undefined);
+  };
+
+  // A peak below this is silence in any room with a person in it.
+  const HEARD = 0.02;
+  const heard = () => level() !== null && level()! >= HEARD;
+
+  return (
+    <div class="mic-setup">
+      <h3>Microphone</h3>
+      <p class="muted small">
+        Windows often defaults to a Bluetooth headset that opens fine and hears nothing.
+        Pick the one that moves the bar.
+      </p>
+      <div class="mic-devices">
+        <For each={devices()}>
+          {(name, index) => (
+            <button
+              class="ghost mic-device"
+              classList={{ active: device() === name || (device() === null && index() === 0) }}
+              onClick={() => void choose(name)}
+            >
+              {name}
+              <Show when={index() === 0}>
+                <span class="muted small"> (system default)</span>
+              </Show>
+            </button>
+          )}
+        </For>
+      </div>
+
+      <div class="mic-test">
+        <button class="ghost" disabled={testing()} onClick={() => void test()}>
+          {testing() ? "Listening…" : "Test — say something"}
+        </button>
+        <Show when={level() !== null}>
+          <div class="level">
+            <div
+              class="level-fill"
+              classList={{ good: heard() }}
+              style={{ width: `${Math.min(100, Math.round(level()! * 400))}%` }}
+            />
+          </div>
+          <span class="muted small" classList={{ error: !heard() }}>
+            {heard()
+              ? "heard you"
+              : "nothing came through — try another microphone, or unmute it"}
+          </span>
+        </Show>
+      </div>
+
+      <h3>Wake word</h3>
+      <Show
+        when={props.assistantName.trim()}
+        fallback={
+          <p class="muted small">
+            Name the assistant first — its name <em>is</em> the wake word.
+          </p>
+        }
+      >
+        <p class="muted small">
+          Say <strong>“{props.assistantName}”</strong> {needed()} times. The recordings are
+          turned into a small model on this machine and never leave it.
+        </p>
+
+        <div class="wake-takes">
+          <For each={Array.from({ length: needed() })}>
+            {(_, index) => <span class="wake-dot" classList={{ filled: takes() > index() }} />}
+          </For>
+        </div>
+
+        <Show when={quiet()}>
+          <p class="error small">That take was silent — check the microphone above.</p>
+        </Show>
+
+        <div class="row">
+          <Show
+            when={takes() >= needed()}
+            fallback={
+              <button disabled={recording()} onClick={() => void record()}>
+                {recording() ? "Listening…" : `Record “${props.assistantName}”`}
+              </button>
+            }
+          >
+            <Show when={!trained()} fallback={<span class="muted small">Wake word ready.</span>}>
+              <button disabled={training()} onClick={() => void train()}>
+                {training() ? "Learning…" : "Teach it"}
+              </button>
+            </Show>
+          </Show>
+          <Show when={takes() > 0}>
+            <button class="ghost" onClick={restart}>
+              Start over
+            </button>
+          </Show>
+        </div>
+
+        <Show when={trained()}>
+          <p class="muted small">
+            It takes effect the next time voice starts — restart the app, or toggle voice
+            off and on.
+          </p>
+        </Show>
+      </Show>
+
+      <Show when={!props.compact}>
+        <p class="muted small">
+          Push-to-talk works either way: hold the summon hotkey and speak.
+        </p>
+      </Show>
+
+      <Show when={error()}>
+        <p class="error">{error()}</p>
+      </Show>
+    </div>
+  );
+}
+
+/**
+ * Voice, permanently available — not only during first-run setup.
+ *
+ * The wizard is a moment; a microphone is a lifetime. A user who skipped voice, had
+ * no mic that day, or renamed the assistant needs to come back to this, and before
+ * this panel existed the only way to see the wake-word step again was to wipe
+ * `setup_complete` by hand.
+ */
+function VoicePanel() {
+  const [enabled, setEnabled] = createSignal(false);
+  const [muted, setMuted] = createSignal(false);
+  const [running, setRunning] = createSignal(false);
+  const [assistantName, setAssistantName] = createSignal("");
+  const [error, setError] = createSignal<string | null>(null);
+
+  const refresh = async () => {
+    try {
+      const status = await api.voiceStatus();
+      setEnabled(status.enabled);
+      setMuted(status.muted);
+      setRunning(status.running);
+      setAssistantName((await api.profile()).assistant_name);
+    } catch (problem) {
+      setError(String(problem));
+    }
+  };
+
+  onMount(() => void refresh());
+
+  const toggleEnabled = async (on: boolean) => {
+    setError(null);
+    setEnabled(on);
+    try {
+      await api.setVoiceEnabled(on);
+      await refresh();
+    } catch (problem) {
+      setError(String(problem));
+    }
+  };
+
+  return (
+    <section>
+      <h2>Voice</h2>
+      <label class="wizard-voice">
+        <input
+          type="checkbox"
+          checked={enabled()}
+          onChange={(event) => void toggleEnabled(event.currentTarget.checked)}
+        />
+        Let me talk to it
+        <Show when={enabled() && !running()}>
+          <span class="muted small"> — starting (first time downloads ~210 MB)</span>
+        </Show>
+      </label>
+
+      <Show when={enabled()}>
+        <label class="wizard-voice">
+          <input
+            type="checkbox"
+            checked={muted()}
+            onChange={async (event) => {
+              const next = event.currentTarget.checked;
+              setMuted(next);
+              await api.setVoiceMuted(next).catch((problem) => setError(String(problem)));
+            }}
+          />
+          Mute the microphone
+        </label>
+      </Show>
+
+      <MicSetup assistantName={assistantName()} />
+
+      <Show when={error()}>
+        <p class="error">{error()}</p>
+      </Show>
+    </section>
+  );
+}
+
 function Dashboard() {
   const [gateway, setGateway] = createSignal<GatewayState>({ state: "starting" });
   const [log, setLog] = createSignal("");
@@ -1299,6 +1497,7 @@ function Dashboard() {
 
       <ChatPane />
       <ProfilePanel />
+      <VoicePanel />
 
       <section>
         <h2>Gateway</h2>

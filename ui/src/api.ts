@@ -215,6 +215,12 @@ export interface Profile {
 /** Whether a reply is shown, spoken, or both. */
 export type ReplyMode = "read" | "hear" | "both";
 
+/** Which microphone the app records from. */
+export interface VoiceSettings {
+  /** `null` follows the OS default — which is often a deaf Bluetooth headset. */
+  input_device: string | null;
+}
+
 /** One recorded take of the wake phrase. */
 export interface WakeSample {
   /** Loudness, so a muted microphone is caught on the first take, not the third. */
@@ -238,6 +244,13 @@ export const api = {
     }),
   summonHotkey: () => invoke<string | null>("summon_hotkey"),
   setSummonHotkey: (binding: string) => invoke<void>("set_summon_hotkey", { binding }),
+  /** Every input device, OS default first. */
+  inputDevices: () => invoke<string[]>("input_devices"),
+  setInputDevice: (device: string | null) => invoke<void>("set_input_device", { device }),
+  /** Which microphone is chosen. */
+  voiceSettings: () => invoke<VoiceSettings>("voice_settings"),
+  /** Listen briefly and report the peak level — the only way to *see* a deaf mic. */
+  testMicrophone: () => invoke<number>("test_microphone"),
   /** Record one utterance of the wake phrase (the assistant's name). */
   recordWakeSample: () => invoke<WakeSample>("record_wake_sample"),
   resetWakeSamples: () => invoke<void>("reset_wake_samples"),

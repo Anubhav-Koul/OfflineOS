@@ -38,6 +38,11 @@ use crate::ring::SampleRing;
 /// second is generous.
 const PROBE_WINDOW: Duration = Duration::from_millis(500);
 
+/// How long the *user's chosen* device gets. A Bluetooth headset's HFP endpoint can
+/// take seconds to engage, and abandoning it for a device the user did not choose is
+/// worse than waiting — see [`CpalCapture::start_on`].
+const CHOSEN_PROBE_WINDOW: Duration = Duration::from_secs(3);
+
 /// A running microphone capture, writing 16 kHz mono into a ring.
 pub trait Capture: Send {
     /// The ring this capture writes into.
@@ -127,6 +132,7 @@ impl CpalCapture {
             if tried.contains(&label) {
                 continue;
             }
+            let is_chosen = preferred == Some(label.as_str());
             tried.push(label.clone());
 
             let capture = match Self::open(&device, ring.clone()) {
@@ -136,8 +142,31 @@ impl CpalCapture {
                     continue;
                 }
             };
-            if capture.delivers_audio(PROBE_WINDOW) {
+
+            // The device the *user picked* gets longer to wake up, and is kept even if
+            // it stays quiet through the probe.
+            //
+            // A Bluetooth headset's HFP endpoint takes a moment to engage — longer
+            // than the probe window a wired mic needs. Falling through on that timeout
+            // means silently abandoning the microphone the user chose for one they did
+            // not, and the next candidate may be a device that hears *nothing* (an ASUS
+            // line-in processor with nothing plugged into it, on this machine). That is
+            // strictly worse than waiting: a mic that is slow to start still works, and
+            // a mic that is deaf never will. Their choice is a decision, not a hint.
+            let window = if is_chosen {
+                CHOSEN_PROBE_WINDOW
+            } else {
+                PROBE_WINDOW
+            };
+            if capture.delivers_audio(window) {
                 tracing::info!(device = %label, "microphone capture started");
+                return Ok(capture);
+            }
+            if is_chosen {
+                tracing::warn!(
+                    device = %label,
+                    "the chosen microphone has not delivered audio yet; keeping it anyway"
+                );
                 return Ok(capture);
             }
             // Opened cleanly, reported no error, delivered nothing: a dead

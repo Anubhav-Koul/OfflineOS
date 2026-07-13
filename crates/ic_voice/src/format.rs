@@ -89,6 +89,29 @@ const MAX_GAIN: f32 = 20.0;
 /// first loud sample clips the attack of the first word.
 const TRIM_PADDING: usize = SAMPLE_RATE as usize / 10;
 
+/// A level estimate that a single loud sample cannot move.
+///
+/// **Not the peak.** A Bluetooth microphone emits a click as its HFP endpoint
+/// engages, and that one transient can be twenty times louder than the speech behind
+/// it. Every decision keyed off the peak then goes wrong at once: the trim gate
+/// (10% of peak) rises above the actual words, so the speech is discarded and the
+/// click is kept; and the gain, seeing a "loud" clip, declines to amplify the quiet
+/// voice. Observed: a clip peaking at 0.67 whose speech sat at 0.03 transcribed as
+/// "can we? Yeah."
+///
+/// The 95th percentile of magnitude ignores a handful of outliers while still
+/// tracking the body of the signal.
+fn robust_level(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mut magnitudes: Vec<f32> = samples.iter().map(|sample| sample.abs()).collect();
+    let index = (magnitudes.len() as f32 * 0.95) as usize;
+    let index = index.min(magnitudes.len() - 1);
+    magnitudes.select_nth_unstable_by(index, f32::total_cmp);
+    magnitudes[index]
+}
+
 /// Drop the silence either side of the speech.
 ///
 /// Whisper *fills* leading silence with plausible filler: a push-to-talk clip that
@@ -101,13 +124,11 @@ const TRIM_PADDING: usize = SAMPLE_RATE as usize / 10;
 /// and a quiet one alike. An utterance with no speech in it is returned untouched —
 /// an empty transcript is the honest answer there, not a trimmed one.
 pub fn trim_silence(samples: &[f32]) -> &[f32] {
-    let peak = samples
-        .iter()
-        .fold(0.0_f32, |loudest, sample| loudest.max(sample.abs()));
-    if peak < NOISE_FLOOR {
+    let level = robust_level(samples);
+    if level < NOISE_FLOOR {
         return samples;
     }
-    let gate = peak * 0.1;
+    let gate = level * 0.1;
 
     let Some(first) = samples.iter().position(|sample| sample.abs() >= gate) else {
         return samples;
@@ -126,13 +147,13 @@ pub fn trim_silence(samples: &[f32]) -> &[f32] {
 ///
 /// Returns the gain applied (`1.0` = untouched), for logging.
 pub fn normalize(samples: &mut [f32]) -> f32 {
-    let peak = samples
-        .iter()
-        .fold(0.0_f32, |loudest, sample| loudest.max(sample.abs()));
-    if !(NOISE_FLOOR..TARGET_PEAK).contains(&peak) {
+    // Robust, not peak: a single click must not convince us the clip is already loud
+    // and leave the speech beneath it unamplified. Clipping is handled by the clamp.
+    let level = robust_level(samples);
+    if !(NOISE_FLOOR..TARGET_PEAK).contains(&level) {
         return 1.0;
     }
-    let gain = (TARGET_PEAK / peak).min(MAX_GAIN);
+    let gain = (TARGET_PEAK / level).min(MAX_GAIN);
     for sample in samples.iter_mut() {
         *sample = (*sample * gain).clamp(-1.0, 1.0);
     }
@@ -236,6 +257,39 @@ mod normalize_tests {
             "silence survived: {} samples for {} of speech",
             trimmed.len(),
             speech.len()
+        );
+    }
+
+    /// The regression that made a *loud* clip transcribe as badly as a quiet one: a
+    /// Bluetooth mic clicks as its endpoint engages, and that transient is far louder
+    /// than the speech. Keyed off the peak, the trim gate rose above the words —
+    /// keeping the click, discarding the sentence — and the gain saw a "loud" clip
+    /// and left the quiet voice alone. Observed transcript: "can we? Yeah."
+    #[test]
+    fn one_loud_click_does_not_swallow_the_speech() {
+        let mut clip = vec![0.0_f32; SAMPLE_RATE as usize / 10];
+        clip.push(0.9); // the click
+        clip.extend(vec![0.0_f32; SAMPLE_RATE as usize / 10]);
+        let speech_start = clip.len();
+        // A whole second of quiet speech, well below the click.
+        clip.extend((0..SAMPLE_RATE as usize).map(|i| 0.03 * (i as f32 / 8.0).sin()));
+
+        let trimmed = trim_silence(&clip);
+
+        // The speech survives the trim...
+        assert!(
+            trimmed.len() > SAMPLE_RATE as usize,
+            "the speech was trimmed away and the click kept: {} samples",
+            trimmed.len()
+        );
+        assert!(speech_start > 0);
+
+        // ...and is then amplified, rather than being written off as already loud.
+        let mut owned = trimmed.to_vec();
+        let gain = normalize(&mut owned);
+        assert!(
+            gain > 2.0,
+            "quiet speech under a click was not amplified: {gain}"
         );
     }
 

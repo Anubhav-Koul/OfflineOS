@@ -954,7 +954,9 @@ The spec said "scheduled proactivity through the existing triggers/automations l
   **by timing**: between two polls, one completed automation + one new thread = the
   same event; anything else surfaces the automation's name and status with **no body**,
   because a wrong body is worse than none. This is the one honest weak spot in 7a, and
-  it is a missing field upstream, not a design choice here.
+  it is a missing field upstream, not a design choice here — filed as
+  [nearai/ironclaw#6076](https://github.com/nearai/ironclaw/issues/6076); the timing
+  pairing gets deleted when it lands.
 
 ### What "the character speaks first" is made of
 

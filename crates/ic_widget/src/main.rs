@@ -704,6 +704,17 @@ struct UiProvider {
     /// providers whose wire dialect is not OpenAI-shaped: the proxy forwards
     /// the body the gateway already built, so they could never answer it.
     can_fail_over: bool,
+    /// The vendor's own name for itself.
+    name: String,
+    /// Where the user goes to mint a key.
+    key_url: Option<String>,
+    /// The endpoint we will probe and the gateway will use. `None` means the
+    /// user must supply one (`openai_compatible`, self-hosted).
+    base_url: Option<String>,
+    /// Whether "Test" can actually answer for this provider. False for the
+    /// out-of-band authenticators — better to say so than to show a green tick
+    /// that means nothing (which is what the gateway's own probe does).
+    probeable: bool,
 }
 
 /// The provider panel's data: what is active, and the configurable providers.
@@ -734,6 +745,10 @@ async fn provider_settings(
         // would let a transient store error read as an unconfigured provider.
         let has_key = secrets.has_provider_key(&provider).map_err(user_facing)?;
         providers.push(UiProvider {
+            name: provider.display_name().to_string(),
+            key_url: provider.key_url().map(str::to_string),
+            base_url: provider.probe_base_url(),
+            probeable: provider.is_probeable(),
             id: provider.id.clone(),
             description: provider.description.clone(),
             default_model: provider.default_model.clone(),
@@ -746,6 +761,39 @@ async fn provider_settings(
         providers,
         fallback: settings.cloud_fallback,
     })
+}
+
+/// Does this key work, and what can it run? (Phase 8a.5)
+///
+/// Asked of the **provider itself**, from this process. The gateway cannot
+/// answer: its `/llm/test-connection` reports `ok` for a dead endpoint with a
+/// junk key, and its `/llm/providers` answers `503` under our profile. Both are
+/// pinned by integration tests that fail the day upstream fixes them.
+///
+/// The key is read from the credential store when the user has already saved one
+/// (`key: None`), so a "Test" on a configured provider never round-trips the
+/// secret through the webview. A `key` is only passed in when the user is typing
+/// a new one and wants to check it *before* saving.
+#[tauri::command]
+async fn test_provider(
+    provider_id: String,
+    key: Option<String>,
+    base_url: Option<String>,
+) -> Result<ic_widget::probe::Probe, String> {
+    let provider = provider_by_id(&provider_id)?;
+
+    let key = match key
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())
+    {
+        Some(typed) => typed,
+        None => SecretStore::new()
+            .provider_key(&provider)
+            .map_err(user_facing)?
+            .ok_or_else(|| "No key saved for this provider yet.".to_string())?,
+    };
+
+    Ok(ic_widget::probe::probe(&provider, &key, base_url.as_deref()).await)
 }
 
 /// Resolve a provider id from the catalog, or a user-facing error.
@@ -1877,13 +1925,24 @@ async fn resolve_provider(
                 .unwrap_or_default();
             (env, local)
         }
-        ProviderSelection::Cloud { id, model } => (cloud_provider_env(id, model.as_deref()), None),
+        ProviderSelection::Cloud {
+            id,
+            model,
+            base_url,
+        } => (
+            cloud_provider_env(id, model.as_deref(), base_url.as_deref()),
+            None,
+        ),
     }
 }
 
 /// The environment that points the gateway at a cloud provider, or empty when it
 /// cannot be built. Every empty-returning path is logged.
-fn cloud_provider_env(id: &str, model: Option<&str>) -> Vec<(String, String)> {
+fn cloud_provider_env(
+    id: &str,
+    model: Option<&str>,
+    base_url: Option<&str>,
+) -> Vec<(String, String)> {
     let provider = match ic_widget::providers::find(id) {
         Ok(Some(provider)) => provider,
         Ok(None) => {
@@ -1899,7 +1958,13 @@ fn cloud_provider_env(id: &str, model: Option<&str>) -> Vec<(String, String)> {
         }
     };
     match SecretStore::new().provider_key(&provider) {
-        Ok(Some(key)) => provider.llm_env(&key, model).unwrap_or_default(),
+        Ok(Some(key)) => provider
+            .llm_env(
+                &key,
+                model,
+                base_url.or(provider.probe_base_url().as_deref()),
+            )
+            .unwrap_or_default(),
         Ok(None) => {
             tracing::warn!(
                 provider = id,
@@ -3679,6 +3744,7 @@ fn main() {
             set_watch_rules,
             set_thread_hidden,
             use_thread,
+            test_provider,
             respond_suggestion,
             needs_setup,
             profile,

@@ -236,6 +236,14 @@ body.widget-body {
   cursor: default;
 }
 
+/* A provider probe that came back good. Green, and quiet — the interesting
+   result is the failure, which uses the existing .reason-inline. */
+.probe-ok {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--ok);
+}
+
 /* A heading inside a panel, for a second concern that belongs with the first
    (the local model's cloud fallback lives under Provider). */
 .subhead {

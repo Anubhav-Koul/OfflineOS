@@ -163,7 +163,7 @@ export interface ModelMetrics {
  */
 export type ProviderSelection =
   | { kind: "local" }
-  | { kind: "cloud"; id: string; model?: string | null };
+  | { kind: "cloud"; id: string; model?: string | null; base_url?: string | null };
 
 /** A configurable cloud provider. `has_key` never carries the key itself. */
 export interface Provider {
@@ -173,7 +173,29 @@ export interface Provider {
   has_key: boolean;
   /** Whether it can be the local model's fallback (OpenAI-shaped providers only). */
   can_fail_over: boolean;
+  /** The vendor's own name for itself. */
+  name: string;
+  /** Where to mint a key. */
+  key_url: string | null;
+  /** The endpoint the probe and the gateway will use. `null` means "you supply it". */
+  base_url: string | null;
+  /** Whether "Test" can actually answer for this provider. */
+  probeable: boolean;
 }
+
+/**
+ * What asking the provider directly told us (Phase 8a.5).
+ *
+ * The gateway cannot answer this — its own probe reports `ok` for a dead
+ * endpoint with a junk key — so the widget asks the provider itself, with the
+ * key from the credential store.
+ */
+export type Probe =
+  | { kind: "ok"; models: string[]; message: string }
+  | { kind: "key_rejected"; message: string }
+  | { kind: "unreachable"; message: string }
+  | { kind: "rate_limited"; message: string }
+  | { kind: "unsupported"; message: string };
 
 /** The provider panel's data: the active selection and the cloud catalog. */
 export interface ProviderSettings {
@@ -434,6 +456,11 @@ export const api = {
     invoke<void>("clear_provider_key", { providerId }),
   applyProvider: (selection: ProviderSelection) =>
     invoke<void>("apply_provider", { selection }),
+  /** Ask the provider itself whether the key works, and what it can run.
+   *  `key` is only sent when testing one the user is still typing; otherwise the
+   *  stored key is used and never leaves the Rust side. */
+  testProvider: (providerId: string, key?: string | null, baseUrl?: string | null) =>
+    invoke<Probe>("test_provider", { providerId, key, baseUrl }),
   /** Pin which installed GGUF the local model runs (`null` unpins). Restarts
    *  the gateway when the local model is the active provider. */
   useModel: (modelId: string | null) => invoke<void>("use_model", { modelId }),

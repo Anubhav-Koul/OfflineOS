@@ -1684,3 +1684,69 @@ someone's time.
 
 Next: **8b — connectors**, whose first job is its own ⚠️ VERIFY: drive a registry
 connector to a *real tool call* before building any UI.
+
+### 8a.5 resolution — the provider directory, and a probe that tells the truth (2026-07-15)
+
+The blocked item is closed **widget-side, additively, with no core patch** — and the
+⚠️ VERIFY turned up a second inert route, which settles the design rather than merely
+constraining it.
+
+**⚠️ VERIFY answered: `POST /llm/providers` accepts *no* protocol under our profile.**
+All eleven come back **`503 service_unavailable`**; only a bogus adapter name gets a
+`400`, which proves the route parses and the *service* is simply not composed under
+`local-dev`. So the gateway's provider-config lane is unusable, on top of its probe
+lane being inert (the 8a finding above). Everything — directory, keys, probe — is
+ours. Pinned by `provider_protocols.rs`, which turns green→red the day upstream
+composes the service.
+
+- **Provider directory** from the runtime's own `providers.json` (26 entries): each
+  row shows the vendor's own name, a **"get a key" link** (20 of 26 carry one), the
+  endpoint it will be reached at, and whether it can be tested at all. The panel
+  features **OpenRouter** explicitly — one key there reaches most models online, and
+  you can change model without changing provider. `openai_compatible` remains the
+  escape hatch; **`cloudflare` joins it** as bring-your-own-endpoint (its URL embeds
+  an account id), which a test caught rather than a user.
+- **The probe is ours** (`ic_widget::probe`), by **protocol family, not brand**:
+  OpenAI-shaped (16 of 26, plus OpenRouter) → authenticated `GET /models`;
+  Anthropic → `x-api-key` + version header; Gemini → key as a query parameter.
+  **The trap, and why the fallback exists:** plenty of OpenAI-compatible servers
+  serve `/models` to *anyone*, so a `200` there proves the endpoint exists, not that
+  the key is good — exactly the lie the gateway's own probe tells. So the probe asks
+  again with a deliberately invalid key; if that also passes, it falls through to a
+  **one-token completion**, the only probe that truly validates. Pinned by
+  `an_endpoint_that_does_not_check_the_key_falls_back_to_a_completion`.
+- **Failures are told apart**: unreachable (typo'd URL, no network) vs key rejected
+  vs rate-limited vs "authenticates out of band, so a pasted key cannot be tested"
+  (Bedrock, Codex, NEAR AI, Copilot's token exchange). A green tick that means
+  nothing is worse than no button.
+- **Model dropdown** is fed by the same probe, with **free text when the provider
+  lists nothing** — which is most of them, and is not an error. Model and endpoint
+  are now part of the selection's identity, so changing the model on the *active*
+  provider is a change you can Apply (it used to silently disable the button), and
+  it persists through the existing apply-and-restart flow. `ProviderSelection::Cloud`
+  gained `base_url`; an older settings file without it still loads.
+- **The stored key never round-trips through the webview.** "Test" on a configured
+  provider reads the key from the Credential Manager in Rust; a key is only sent
+  from the UI when the user is checking one they have not saved yet.
+- **Honest-UX note in the panel** (the spec's point 5): *any online model works* is
+  true of chatting and emphatically not of **agent** use — this app hands the model
+  two dozen tools and needs well-formed tool calls back, and models differ far more
+  at that than at chat. The panel names known-good agentic models and warns that
+  small models (≤8B) will chat happily and fail at tasks.
+
+**Two robustness items, both from this session's own scars:**
+
+- **A UTF-8 BOM no longer resets your settings.** `serde_json` rejects a BOM at
+  column 1, so a BOM'd `settings.json` read as *corrupt* and every setting silently
+  reverted to defaults — which is exactly what happened here when PowerShell 5.1's
+  `Set-Content -Encoding utf8` wrote one. The loader now strips it. Pinned by
+  `a_settings_file_with_a_byte_order_mark_still_loads`.
+- **A TODO for an abort endpoint** in `ic_llama::proxy`, referencing the cancel
+  finding: the proxy holds the upstream request, so a small loopback control route
+  that drops it would make llama.cpp abort generation — Stop would finally stop the
+  GPU. Not built because the widget cannot yet tell *which* proxy request belongs to
+  the run being cancelled (the gateway sends no correlation id); that mapping is the
+  actual work.
+
+Next: **8b — connectors**, whose first job is its own ⚠️ VERIFY: drive a registry
+connector to a *real tool call* before building any UI.

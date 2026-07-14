@@ -53,6 +53,26 @@
 //!   non-streamed completion; the proxy reads them on the way past. Nothing else
 //!   in the stack sees a token count, because the gateway's event stream carries
 //!   no usage data.
+//!
+//! # TODO: an abort endpoint, so Stop actually stops the GPU
+//!
+//! Verified in Phase 8a (`ic_integration_tests/tests/chat_control.rs`):
+//! `cancel_run` does **not** abort the gateway's in-flight HTTP request to the
+//! provider. So when the user presses Stop, `llama-server` keeps generating to
+//! completion — the GPU burns tokens for an answer nobody will ever read, and on
+//! a 4B model on an iGPU that is tens of seconds of stolen compute.
+//!
+//! The proxy is the one place that can fix this without a core patch: it holds
+//! the upstream request. Give it a small loopback control endpoint (`POST
+//! /_ic/abort`, say) that drops the in-flight upstream connection — llama.cpp
+//! aborts a completion the moment its client disconnects — and have the widget
+//! call it from the same click that calls `cancel_run`. The gateway is untouched
+//! and none the wiser; it still gets its cancelled run.
+//!
+//! Not built yet because the widget must know *which* proxy request belongs to
+//! the run being cancelled, and today it does not: the gateway multiplexes turns
+//! over one client. Tracking a run→request mapping (the gateway sends no
+//! correlation id, so it would have to be inferred) is the actual work.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;

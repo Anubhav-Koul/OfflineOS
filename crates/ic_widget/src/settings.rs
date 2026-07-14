@@ -29,6 +29,11 @@ pub enum ProviderSelection {
         /// A model override, or `None` for the provider's default.
         #[serde(default)]
         model: Option<String>,
+        /// An endpoint override. Required for `openai_compatible` (which has no
+        /// endpoint of its own) and honoured for anyone pointing a provider at a
+        /// proxy or a regional URL.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_url: Option<String>,
     },
 }
 
@@ -431,7 +436,14 @@ impl SettingsStore {
                 ));
             }
         };
-        match serde_json::from_str(&contents) {
+        // Strip a UTF-8 byte-order mark. `serde_json` rejects one outright
+        // ("expected value at line 1 column 1"), and plenty of Windows tools
+        // write it without asking — PowerShell 5.1's `Set-Content -Encoding utf8`
+        // does, and Notepad used to. A BOM'd file would otherwise read as
+        // *corrupt*, silently resetting every setting the user has.
+        let contents = contents.strip_prefix('\u{feff}').unwrap_or(&contents);
+
+        match serde_json::from_str(contents) {
             Ok(settings) => Ok(settings),
             Err(error) => {
                 tracing::warn!(
@@ -475,6 +487,33 @@ mod tests {
         (dir, store)
     }
 
+    /// A settings file with a UTF-8 BOM must still load.
+    ///
+    /// Not hypothetical: PowerShell 5.1's `Set-Content -Encoding utf8` writes
+    /// one, and `serde_json` rejects it at column 1 — so the file read as
+    /// *corrupt* and every setting silently reset to defaults. A user who edits
+    /// their settings in the wrong editor should not lose their assistant's name.
+    #[test]
+    fn a_settings_file_with_a_byte_order_mark_still_loads() {
+        let (_dir, store) = store();
+        let saved = Settings {
+            assistant_name: "Nova".to_string(),
+            ambient_enabled: true,
+            ..Settings::default()
+        };
+        store.save(&saved).expect("save");
+
+        // Re-write it exactly as a BOM-writing editor would.
+        let json = std::fs::read_to_string(store.path()).expect("read back");
+        std::fs::write(store.path(), format!("\u{feff}{json}")).expect("write with a BOM");
+
+        let loaded = store.load().expect("load");
+        assert_eq!(
+            loaded, saved,
+            "a byte-order mark must not silently reset the user's settings"
+        );
+    }
+
     #[test]
     fn a_first_launch_has_no_file_and_defaults_to_the_local_model() {
         let (_dir, store) = store();
@@ -489,11 +528,28 @@ mod tests {
             active_provider: ProviderSelection::Cloud {
                 id: "anthropic".into(),
                 model: Some("claude-opus-4-8".into()),
+                base_url: None,
             },
             ..Default::default()
         };
         store.save(&settings).expect("save");
         assert_eq!(store.load().expect("load"), settings);
+    }
+
+    /// A selection written by an older build has no `base_url` field at all. It
+    /// must still load — a settings file is a contract with the user's past self.
+    #[test]
+    fn a_cloud_selection_from_before_custom_endpoints_still_loads() {
+        let legacy = r#"{"kind":"cloud","id":"openai","model":"gpt-5-mini"}"#;
+        let selection: ProviderSelection = serde_json::from_str(legacy).expect("decode");
+        assert_eq!(
+            selection,
+            ProviderSelection::Cloud {
+                id: "openai".into(),
+                model: Some("gpt-5-mini".into()),
+                base_url: None,
+            }
+        );
     }
 
     #[test]
@@ -528,6 +584,7 @@ mod tests {
         let json = serde_json::to_string(&ProviderSelection::Cloud {
             id: "openai".into(),
             model: None,
+            base_url: None,
         })
         .expect("serialize");
         assert!(json.contains(r#""kind":"cloud""#), "got {json}");

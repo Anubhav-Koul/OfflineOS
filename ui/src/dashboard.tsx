@@ -23,6 +23,7 @@ import {
   type RecommendedModel,
   type ReplyMode,
   type Message,
+  type Probe,
   type Thread,
   type VoiceState,
 } from "./api";
@@ -446,10 +447,22 @@ function CharacterPanel() {
   );
 }
 
-/** Whether two selections name the same provider (model override aside). */
+/**
+ * Whether two selections describe the same thing to run.
+ *
+ * Model and endpoint are part of the identity now: changing the model on the
+ * active provider is a real change the user must be able to Apply, and before
+ * this it silently disabled the button.
+ */
 function selectionEquals(a: ProviderSelection, b: ProviderSelection): boolean {
   if (a.kind !== b.kind) return false;
-  if (a.kind === "cloud" && b.kind === "cloud") return a.id === b.id;
+  if (a.kind === "cloud" && b.kind === "cloud") {
+    return (
+      a.id === b.id &&
+      (a.model ?? null) === (b.model ?? null) &&
+      (a.base_url ?? null) === (b.base_url ?? null)
+    );
+  }
   return true;
 }
 
@@ -464,18 +477,35 @@ function ProviderPanel() {
   const data = createValueData<ProviderSettings>(api.providerSettings);
   const [chosen, setChosen] = createSignal<ProviderSelection>({ kind: "local" });
   const [drafts, setDrafts] = createSignal<Record<string, string>>({});
+  const [models, setModels] = createSignal<Record<string, string>>({});
+  const [baseUrls, setBaseUrls] = createSignal<Record<string, string>>({});
   const [applying, setApplying] = createSignal(false);
   const [notice, setNotice] = createSignal<string | null>(null);
 
   const reload = async () => {
     await data.refresh();
     const current = data.value();
-    if (current) setChosen(current.active);
+    if (current) {
+      setChosen(current.active);
+      // Seed the editors from the active selection, so the panel opens showing
+      // what is actually running rather than an empty box.
+      if (current.active.kind === "cloud") {
+        const active = current.active;
+        if (active.model) setModel(active.id, active.model);
+        if (active.base_url) setBaseUrl(active.id, active.base_url);
+      }
+    }
   };
   onMount(reload);
 
   const draft = (id: string) => drafts()[id] ?? "";
   const setDraft = (id: string, value: string) => setDrafts((all) => ({ ...all, [id]: value }));
+  const model = (id: string) => models()[id] ?? "";
+  const setModel = (id: string, value: string) =>
+    setModels((all) => ({ ...all, [id]: value }));
+  const baseUrl = (id: string) => baseUrls()[id] ?? "";
+  const setBaseUrl = (id: string, value: string) =>
+    setBaseUrls((all) => ({ ...all, [id]: value }));
 
   const saveKey = async (id: string) => {
     const key = draft(id).trim();
@@ -508,11 +538,31 @@ function ProviderPanel() {
     return !provider?.has_key;
   };
 
+  /** The selection as the editors currently describe it. */
+  const selection = (): ProviderSelection => {
+    const pick = chosen();
+    if (pick.kind !== "cloud") return pick;
+    return {
+      kind: "cloud",
+      id: pick.id,
+      model: model(pick.id).trim() || null,
+      base_url: baseUrl(pick.id).trim() || null,
+    };
+  };
+
+  /** A provider with no endpoint of its own cannot run until it is given one. */
+  const chosenNeedsEndpoint = (): boolean => {
+    const pick = chosen();
+    if (pick.kind !== "cloud") return false;
+    const provider = data.value()?.providers.find((p) => p.id === pick.id);
+    return !provider?.base_url && !baseUrl(pick.id).trim();
+  };
+
   const canApply = (): boolean => {
     const current = data.value();
     if (!current || applying()) return false;
-    if (selectionEquals(chosen(), current.active)) return false;
-    return !chosenNeedsKey();
+    if (selectionEquals(selection(), current.active)) return false;
+    return !chosenNeedsKey() && !chosenNeedsEndpoint();
   };
 
   const apply = async () => {
@@ -521,7 +571,7 @@ function ProviderPanel() {
     try {
       // Restarts the gateway and reloads this page; the promise may not settle
       // before the reload takes over.
-      await api.applyProvider(chosen());
+      await api.applyProvider(selection());
     } catch (reason) {
       setNotice(String(reason));
       setApplying(false);
@@ -548,7 +598,30 @@ function ProviderPanel() {
         </button>
       </div>
       <p class="muted small">
-        One provider is active at a time. Switching restarts the agent.
+        One provider is active at a time. Switching restarts the agent. Paste a
+        key, press <strong>Test</strong> to check it against the provider itself,
+        then Apply.
+      </p>
+
+      {/*
+        The honest-UX note. "Any online model works" is true of *chatting*; it is
+        emphatically not true of *agent* use — this app hands the model a couple
+        of dozen tools and expects well-formed tool calls back, and models differ
+        enormously at that. A user who wires up a cheap 7B and watches every task
+        fail deserves to have been told.
+      */}
+      <p class="muted small">
+        <strong>Not all models are equal for agent work.</strong> This app gives the
+        model tools (browser, files, canvas) and needs reliable tool-calling —
+        which varies far more between models than chat quality does. Known-good:
+        Claude Sonnet/Opus, GPT-5-class, Gemini 2.5 Pro, Qwen3 (≥14B) and
+        Kimi/GLM on OpenRouter. Small models (≤8B) will chat happily and fail at
+        tasks.
+      </p>
+      <p class="muted small">
+        <strong>OpenRouter</strong> is the shortest path to "any online model": one
+        key reaches most of them, and you can switch models without switching
+        providers.
       </p>
 
       <Show when={!data.error()} fallback={<p class="reason-inline">{data.error()}</p>}>
@@ -575,8 +648,12 @@ function ProviderPanel() {
                       (chosen() as { id: string }).id === provider.id
                     }
                     draft={draft(provider.id)}
+                    model={model(provider.id)}
+                    baseUrl={baseUrl(provider.id)}
                     onSelect={() => setChosen({ kind: "cloud", id: provider.id })}
                     onDraft={(value) => setDraft(provider.id, value)}
+                    onModel={(value) => setModel(provider.id, value)}
+                    onBaseUrl={(value) => setBaseUrl(provider.id, value)}
                     onSave={() => void saveKey(provider.id)}
                     onClear={() => void clearKey(provider.id)}
                   />
@@ -637,21 +714,77 @@ function ProviderRow(props: {
   provider: Provider;
   active: boolean;
   draft: string;
+  model: string;
+  baseUrl: string;
   onSelect: () => void;
   onDraft: (value: string) => void;
+  onModel: (value: string) => void;
+  onBaseUrl: (value: string) => void;
   onSave: () => void;
   onClear: () => void;
 }) {
+  const [probe, setProbe] = createSignal<Probe | null>(null);
+  const [testing, setTesting] = createSignal(false);
+
+  /**
+   * Ask the provider itself. The gateway cannot answer — its own probe reports
+   * `ok` for a dead endpoint with a junk key (see the 8a notes) — so this goes
+   * straight from Rust to the vendor, with the stored key. A key still being
+   * typed is sent along so it can be checked *before* it is saved.
+   */
+  const test = async () => {
+    setTesting(true);
+    setProbe(null);
+    try {
+      setProbe(
+        await api.testProvider(
+          props.provider.id,
+          props.draft.trim() || null,
+          props.baseUrl.trim() || null,
+        ),
+      );
+    } catch (reason) {
+      setProbe({ kind: "unreachable", message: String(reason) });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  /** The endpoint this provider will actually be reached at. */
+  const endpoint = () => props.baseUrl.trim() || props.provider.base_url;
+  /** Models the last probe found. Empty is normal — many providers list none. */
+  const models = () => {
+    const found = probe();
+    return found?.kind === "ok" ? found.models : [];
+  };
+  const canTest = () =>
+    props.provider.probeable &&
+    (props.provider.has_key || props.draft.trim().length > 0) &&
+    Boolean(endpoint());
+
   return (
     <div class="provider-option column">
       <label class="provider-head">
         <input type="radio" name="provider" checked={props.active} onChange={props.onSelect} />
-        <span class="provider-name">{props.provider.id}</span>
+        <span class="provider-name">{props.provider.name}</span>
         <Show when={props.provider.has_key} fallback={<span class="row-meta">no key</span>}>
           <span class="badge ready">key set</span>
         </Show>
       </label>
-      <p class="provider-desc">{props.provider.description}</p>
+      <p class="provider-desc">
+        {props.provider.description}
+        <Show when={props.provider.key_url}>
+          {(url) => (
+            <>
+              {" · "}
+              <a href={url()} target="_blank" rel="noreferrer">
+                get a key
+              </a>
+            </>
+          )}
+        </Show>
+      </p>
+
       <div class="key-row">
         <input
           type="password"
@@ -662,12 +795,77 @@ function ProviderRow(props: {
         <button class="ghost" disabled={!props.draft.trim()} onClick={props.onSave}>
           Save
         </button>
+        <Show
+          when={props.provider.probeable}
+          fallback={
+            <span class="row-meta" title="This provider authenticates out of band">
+              can't test
+            </span>
+          }
+        >
+          <button class="ghost" disabled={!canTest() || testing()} onClick={() => void test()}>
+            {testing() ? "Testing…" : "Test"}
+          </button>
+        </Show>
         <Show when={props.provider.has_key}>
           <button class="ghost danger" onClick={props.onClear}>
             Clear
           </button>
         </Show>
       </div>
+
+      {/* The escape hatch: a provider with no endpoint of its own, or one the
+          user is pointing somewhere else (a proxy, a regional URL). */}
+      <Show when={props.active || props.baseUrl}>
+        <div class="key-row">
+          <input
+            type="text"
+            placeholder={
+              props.provider.base_url
+                ? `Endpoint (default: ${props.provider.base_url})`
+                : "Endpoint — e.g. http://localhost:8000/v1"
+            }
+            value={props.baseUrl}
+            onInput={(event) => props.onBaseUrl(event.currentTarget.value)}
+          />
+        </div>
+      </Show>
+
+      <Show when={probe()}>
+        {(result) => (
+          <p class={result().kind === "ok" ? "probe-ok" : "reason-inline"}>
+            {result().kind === "ok" ? "✓ " : ""}
+            {result().message}
+          </p>
+        )}
+      </Show>
+
+      {/* The model. A dropdown when the provider told us what it runs; free text
+          when it did not — which is most of them, and is not an error. */}
+      <Show when={props.active}>
+        <div class="key-row">
+          <Show
+            when={models().length > 0}
+            fallback={
+              <input
+                type="text"
+                placeholder={`Model (default: ${props.provider.default_model})`}
+                value={props.model}
+                onInput={(event) => props.onModel(event.currentTarget.value)}
+              />
+            }
+          >
+            <select
+              value={props.model || props.provider.default_model}
+              onChange={(event) => props.onModel(event.currentTarget.value)}
+            >
+              <For each={models()}>
+                {(model) => <option value={model}>{model}</option>}
+              </For>
+            </select>
+          </Show>
+        </div>
+      </Show>
     </div>
   );
 }

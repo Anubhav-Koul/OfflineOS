@@ -287,6 +287,21 @@ fn parse_content_length(headers: &str) -> usize {
     0
 }
 
+/// Either of the child's output pipes, so both can be drained by one loop.
+enum PipeOut {
+    Out(std::process::ChildStdout),
+    Err(std::process::ChildStderr),
+}
+
+impl std::io::Read for PipeOut {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            PipeOut::Out(pipe) => pipe.read(buf),
+            PipeOut::Err(pipe) => pipe.read(buf),
+        }
+    }
+}
+
 /// A running `ironclaw-reborn serve` instance.
 ///
 /// The child process is killed and reaped on drop.
@@ -430,11 +445,21 @@ impl RebornServer {
 
         let mut child = command.spawn().expect("spawn ironclaw-reborn serve");
 
-        // Drain stderr into a shared buffer for diagnostics on failure.
+        // Drain **both** pipes into one buffer. `serve` writes its tracing output
+        // to stdout, not stderr, so draining only stderr left the log empty at
+        // exactly the moments it was needed (a hung tool call says nothing at
+        // all). Both are diagnostics; one buffer is what a reader wants.
         let stderr = Arc::new(Mutex::new(String::new()));
-        if let Some(mut pipe) = child.stderr.take() {
+        for pipe in [
+            child.stderr.take().map(PipeOut::Err),
+            child.stdout.take().map(PipeOut::Out),
+        ]
+        .into_iter()
+        .flatten()
+        {
             let sink = Arc::clone(&stderr);
             std::thread::spawn(move || {
+                let mut pipe = pipe;
                 let mut chunk = [0u8; 4096];
                 loop {
                     match pipe.read(&mut chunk) {

@@ -250,7 +250,7 @@ export interface AmbientStatus {
  */
 export interface Suggestion {
   id: string;
-  kind: "automation" | "skill_draft" | "skill_import";
+  kind: "automation" | "skill_draft" | "skill_import" | "watcher";
   key: string;
   source: string;
   headline: string;
@@ -283,6 +283,32 @@ export interface ImportPreview {
   description: string;
   skill_md: string;
   files: ImportFile[];
+}
+
+/** What one watcher rule fires on (Phase 7d). */
+export type WatchTrigger =
+  | { type: "foreground_app"; title_contains: string }
+  | { type: "folder_changed"; path: string }
+  | { type: "time_of_day"; hour: number; minute: number };
+
+/** One "when X happens, ask the agent to Y" rule. */
+export interface WatchRule {
+  id: string;
+  enabled: boolean;
+  trigger: WatchTrigger;
+  prompt: string;
+}
+
+/**
+ * The ambient watchers (Phase 7d). Each signal kind is its own opt-in — a user
+ * who wants folder watching has not agreed to window-title sampling — and none
+ * of it runs unless ambient mode itself is on.
+ */
+export interface WatcherSettings {
+  foreground_enabled: boolean;
+  folders_enabled: boolean;
+  time_enabled: boolean;
+  rules: WatchRule[];
 }
 
 /** One recorded take of the wake phrase. */
@@ -394,6 +420,13 @@ export const api = {
    *  happens there, and only a yes installs. */
   requestSkillImport: (path: string) =>
     invoke<void>("request_skill_import", { path }),
+  /** The watcher toggles and rules. */
+  watchersStatus: () => invoke<WatcherSettings>("watchers_status"),
+  /** Switch the three signal kinds. Takes effect on the next sample. */
+  setWatcherKinds: (foreground: boolean, folders: boolean, time: boolean) =>
+    invoke<void>("set_watcher_kinds", { foreground, folders, time }),
+  /** Replace the rule list (rules are config — editable, unlike the logs). */
+  setWatchRules: (rules: WatchRule[]) => invoke<void>("set_watch_rules", { rules }),
   /** Answer a suggestion. Accept opens the run's thread — or, for a skill
    *  draft, installs it. Both answers are recorded. */
   respondSuggestion: (id: string, accepted: boolean) =>

@@ -218,6 +218,16 @@ body.widget-body {
   color: var(--danger, #d1524a);
 }
 
+/* The watcher rule list (Phase 7d). */
+.watch-rules {
+  margin: 8px 0;
+  padding-left: 18px;
+  font-size: 12px;
+}
+.watch-rules li {
+  margin-bottom: 4px;
+}
+
 /* The dashboard's skill-import review (Phase 7c): the whole SKILL.md, because
    this review is the only gate a third-party skill passes through. */
 .import-preview {

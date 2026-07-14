@@ -37,15 +37,11 @@ use uuid::Uuid;
 
 use crate::gateway_client::{Automation, AutomationRunStatus, ThreadId};
 
-use super::{AmbientService, Suggestion, SuggestionKind};
+use super::{AmbientService, Suggestion, SuggestionKind, summarize};
 
 /// How often the automations are polled. The gateway's own minimum fire cadence is
 /// 60 s, so a 30 s poll cannot miss a fire it could have caught.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(30);
-
-/// The longest body the bubble carries. The full answer stays in the thread, which
-/// Accept opens.
-const MAX_BODY: usize = 400;
 
 /// What the watcher remembers between ticks.
 ///
@@ -122,16 +118,6 @@ fn suggestion_for(automation: &Automation, last_run: &str, body: Option<String>)
         body,
         thread_id: None,
     }
-}
-
-/// Shorten a reply to something a speech bubble can hold.
-fn summarize(reply: &str) -> String {
-    let trimmed = reply.trim();
-    if trimmed.chars().count() <= MAX_BODY {
-        return trimmed.to_string();
-    }
-    let short: String = trimmed.chars().take(MAX_BODY).collect();
-    format!("{}…", short.trim_end())
 }
 
 /// Poll the gateway's automations forever, surfacing each completed run once.
@@ -305,14 +291,5 @@ mod tests {
         let second = suggestion_for(&automation("a", Some("t2")), "t2", None);
         assert_ne!(first.key, second.key);
         assert_eq!(first.source, second.source);
-    }
-
-    #[test]
-    fn a_long_reply_is_cut_to_a_bubble() {
-        let long = "x".repeat(MAX_BODY + 50);
-        let short = summarize(&long);
-        assert_eq!(short.chars().count(), MAX_BODY + 1, "cut plus an ellipsis");
-        assert!(short.ends_with('…'));
-        assert_eq!(summarize("  hello  "), "hello");
     }
 }

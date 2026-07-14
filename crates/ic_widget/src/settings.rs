@@ -209,6 +209,91 @@ pub struct Settings {
     /// thread and every draft it surfaces rides the ambient guardrails.
     #[serde(default)]
     pub reflection_enabled: bool,
+    /// Event-driven proactivity (Phase 7d): what the app may watch, and the
+    /// user's "when X happens, ask the agent to Y" rules. Every signal kind is
+    /// individually opt-in and **off by default**, and none of it runs unless
+    /// [`Settings::ambient_enabled`] is also on.
+    #[serde(default)]
+    pub watchers: WatcherSettings,
+}
+
+/// The ambient watchers' configuration (Phase 7d).
+///
+/// Three signal kinds, each with its own switch — a user who wants folder
+/// watching has not agreed to window-title sampling. No screen content is ever
+/// captured, no audio persists, and nothing leaves the machine: a signal is a
+/// window *title*, a file *path*, or the local clock.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatcherSettings {
+    /// May the app sample the foreground window's title?
+    #[serde(default)]
+    pub foreground_enabled: bool,
+    /// May the app watch the folders named by rules?
+    #[serde(default)]
+    pub folders_enabled: bool,
+    /// May time-of-day rules fire?
+    #[serde(default)]
+    pub time_enabled: bool,
+    /// The user's rules. A rule whose signal kind is switched off never fires.
+    #[serde(default)]
+    pub rules: Vec<WatchRule>,
+}
+
+/// One user-defined "when X happens, ask the agent to Y" rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchRule {
+    /// Stable id, minted by whoever creates the rule.
+    pub id: String,
+    /// A rule can be kept but paused.
+    #[serde(default = "default_rule_enabled")]
+    pub enabled: bool,
+    /// The X: what fires it.
+    pub trigger: WatchTrigger,
+    /// The Y: the prompt materialized on a fresh thread when it fires.
+    pub prompt: String,
+}
+
+fn default_rule_enabled() -> bool {
+    true
+}
+
+/// What a [`WatchRule`] watches for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WatchTrigger {
+    /// The foreground window's title starts containing `title_contains`
+    /// (case-insensitive, fires on the transition, not the state).
+    ForegroundApp {
+        /// The substring to look for.
+        title_contains: String,
+    },
+    /// Anything under `path` changes.
+    FolderChanged {
+        /// The folder being watched, recursively.
+        path: String,
+    },
+    /// The local clock reaches `hour:minute`, once per day.
+    TimeOfDay {
+        /// Local hour, 0–23.
+        hour: u32,
+        /// Local minute, 0–59.
+        minute: u32,
+    },
+}
+
+impl WatchTrigger {
+    /// A one-line human description, used as the suggestion headline's stem.
+    pub fn describe(&self) -> String {
+        match self {
+            WatchTrigger::ForegroundApp { title_contains } => {
+                format!("a window with \u{201c}{title_contains}\u{201d} came to front")
+            }
+            WatchTrigger::FolderChanged { path } => format!("{path} changed"),
+            WatchTrigger::TimeOfDay { hour, minute } => {
+                format!("it is {hour:02}:{minute:02}")
+            }
+        }
+    }
 }
 
 /// A character asset folder's name, e.g. `hiyori`.

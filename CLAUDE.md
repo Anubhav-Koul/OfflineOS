@@ -1181,3 +1181,59 @@ the half-install cleanup.
 Next: **Phase 7d — ambient watchers** (opt-in signals, each defaulting OFF;
 v1 gate is rule-based, not LLM-based; wake-word models remain the outstanding
 Phase 6 item).
+
+## Phase 7d notes — ambient watchers (done, recorded 2026-07-14)
+
+`crates/ic_widget` (new `ambient/watch.rs`; `ambient/mod.rs`, `automations.rs`,
+`settings.rs`, `main.rs`) + `ui/` + a new gate
+(`ic_integration_tests/tests/watcher_fire.rs`) + one new dependency (`notify`,
+for folder events). **No core patch.**
+
+- **The engine is a pure state machine** (`WatchEngine`), fed signals by the
+  app, so every firing rule is a unit test rather than a wait. Three kinds:
+  foreground window title (extends the Phase 3 Win32 machinery with a
+  `GetWindowTextW` sampler — a *title*, never screen content), watched folders
+  (`notify`, recursive, recreated when the rule set's paths change), and the
+  local clock. Each kind is its own opt-in, all default OFF, honoured **inside
+  the engine** as well as by the caller — an engine that trusts its caller is
+  one settings refactor away from watching something the user switched off.
+- **Edges, priming, cooldown — the anti-nag rules.** A foreground rule fires on
+  the match *transition* (the first sample only primes); a time rule fires once
+  a day and a mark that already passed at startup is primed as spent (the 9 am
+  rule must not greet a 3 pm launch); every rule has a 30-min cooldown so one
+  noisy folder mid-build cannot spend the hourly guardrail cap alone.
+- **v1 is rule-based, not LLM-based, per spec** — the only inference a watcher
+  runs is the prompt the user wrote. And it runs *after* the guardrail:
+  `AmbientService::would_allow` (a non-recording pre-check) means a firing
+  under quiet hours or a spent cap costs **no thread and no turn** — pinned by
+  `a_suppressed_firing_spends_no_llm_turn`, which asserts the mock saw no
+  request. `propose` still re-checks and records when the answer arrives.
+- **A firing lands in a fresh thread**, like the gateway's own trigger fires —
+  the ambient thread stays the app's private conversation, and Accept opens a
+  transcript holding exactly this rule's question and answer. Surfaced as
+  `SuggestionKind::Watcher`, a calm blue offer (the widget's card predicate now
+  names the two skill kinds as the only red consent prompts).
+- **Rules are config, not LLM data** — editable and deletable in the dashboard
+  panel, unlike the logs. Rule edits and kind toggles are read every 3 s
+  sample, no restart; only the ambient master switch restarts (the gateway's
+  boot-time constraint, not this loop's). Rules are validated on save (a
+  non-folder path, an empty needle, an impossible time are refused with
+  reasons; an empty needle would otherwise fire on every window change).
+
+### Phase 7 definition of done — accounting
+
+- ✅ a scheduled automation surfaces as a character suggestion (7a, gated)
+- ✅ a completed task yields a "want me to remember this?" prompt whose approval
+  installs a skill active in the next session (7b, gated end to end)
+- ✅ a third-party SKILL.md folder imports after review (7c, gated)
+- ✅ every surfacing respects the rate cap and quiet hours (one guardrail path;
+  7d additionally pre-checks before spending turns)
+- ✅ a "Not now" suppresses re-surfacing (7a log; exact-key = once ever)
+- ✅ all gates green + manual smoke on Windows, per sub-phase
+- Outstanding from Phase 6, unchanged: wake-word models (voice as a third
+  sense; push-to-talk remains), certificate/updater/MSI externals.
+
+Next: Phase 7 is complete. The remaining open items are Phase 6's
+external-input gates (cert, updater keypair, MSI on a clean VM, wake-word
+recordings) and the deferred 2b follow-ups (GGUF download UI, tokens/sec);
+`docs/desktop/llm-provider-selection.md` still holds the unmade failover call.

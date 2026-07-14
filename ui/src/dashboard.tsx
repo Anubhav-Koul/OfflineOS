@@ -11,6 +11,9 @@ import {
   type AmbientStatus,
   type Automation,
   type ImportPreview,
+  type WatchRule,
+  type WatchTrigger,
+  type WatcherSettings,
   type GatewayState,
   type InstalledModel,
   type LocalModel,
@@ -1688,6 +1691,234 @@ function AmbientPanel() {
   );
 }
 
+/** A human line for a watch trigger, mirroring `WatchTrigger::describe`. */
+function describeTrigger(trigger: WatchTrigger): string {
+  switch (trigger.type) {
+    case "foreground_app":
+      return `when a window with “${trigger.title_contains}” comes to front`;
+    case "folder_changed":
+      return `when ${trigger.path} changes`;
+    case "time_of_day":
+      return `at ${String(trigger.hour).padStart(2, "0")}:${String(trigger.minute).padStart(2, "0")}`;
+  }
+}
+
+/**
+ * Ambient watchers (Phase 7d): "when X happens, ask the agent to Y".
+ *
+ * Each signal kind is its own opt-in, all off by default, and nothing here runs
+ * unless ambient mode itself is on. The rules are plain config — the gate that
+ * decides whether a firing's answer is *shown* stays the ambient guardrail.
+ */
+function WatchersPanel() {
+  const [watchers, setWatchers] = createSignal<WatcherSettings | null>(null);
+  const [error, setError] = createSignal<string | null>(null);
+  const [kind, setKind] = createSignal<WatchTrigger["type"]>("foreground_app");
+  const [param, setParam] = createSignal("");
+  const [time, setTime] = createSignal("09:00");
+  const [prompt, setPrompt] = createSignal("");
+
+  const refresh = async () => {
+    try {
+      setWatchers(await api.watchersStatus());
+    } catch (problem) {
+      setError(String(problem));
+    }
+  };
+  onMount(() => void refresh());
+
+  const saveKinds = async (foreground: boolean, folders: boolean, timeKind: boolean) => {
+    setError(null);
+    try {
+      await api.setWatcherKinds(foreground, folders, timeKind);
+      await refresh();
+    } catch (problem) {
+      setError(String(problem));
+    }
+  };
+
+  const saveRules = async (rules: WatchRule[]) => {
+    setError(null);
+    try {
+      await api.setWatchRules(rules);
+      await refresh();
+    } catch (problem) {
+      setError(String(problem));
+    }
+  };
+
+  const addRule = async () => {
+    const current = watchers();
+    if (!current) return;
+    let trigger: WatchTrigger;
+    if (kind() === "time_of_day") {
+      const [hour, minute] = time().split(":").map(Number);
+      trigger = { type: "time_of_day", hour: hour ?? 9, minute: minute ?? 0 };
+    } else if (kind() === "folder_changed") {
+      trigger = { type: "folder_changed", path: param().trim() };
+    } else {
+      trigger = { type: "foreground_app", title_contains: param().trim() };
+    }
+    const rule: WatchRule = {
+      id: crypto.randomUUID(),
+      enabled: true,
+      trigger,
+      prompt: prompt().trim(),
+    };
+    await saveRules([...current.rules, rule]);
+    setParam("");
+    setPrompt("");
+  };
+
+  return (
+    <section>
+      <h2>Watchers</h2>
+      <p class="muted small">
+        “When X happens, ask the agent to Y.” Runs only while{" "}
+        <strong>Ambient</strong> is on; every answer respects the interruption
+        caps and quiet hours. Only a window title, a file path, or the clock is
+        ever read — no screen content, and nothing leaves this machine.
+      </p>
+      <Show when={watchers()}>
+        {(current) => (
+          <>
+            <label class="wizard-voice">
+              <input
+                type="checkbox"
+                checked={current().foreground_enabled}
+                onChange={(event) =>
+                  void saveKinds(
+                    event.currentTarget.checked,
+                    current().folders_enabled,
+                    current().time_enabled,
+                  )
+                }
+              />
+              Watch the foreground window's title
+            </label>
+            <label class="wizard-voice">
+              <input
+                type="checkbox"
+                checked={current().folders_enabled}
+                onChange={(event) =>
+                  void saveKinds(
+                    current().foreground_enabled,
+                    event.currentTarget.checked,
+                    current().time_enabled,
+                  )
+                }
+              />
+              Watch the folders named by rules
+            </label>
+            <label class="wizard-voice">
+              <input
+                type="checkbox"
+                checked={current().time_enabled}
+                onChange={(event) =>
+                  void saveKinds(
+                    current().foreground_enabled,
+                    current().folders_enabled,
+                    event.currentTarget.checked,
+                  )
+                }
+              />
+              Allow time-of-day rules
+            </label>
+
+            <Show when={current().rules.length > 0}>
+              <ul class="watch-rules">
+                <For each={current().rules}>
+                  {(rule) => (
+                    <li>
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={rule.enabled}
+                          onChange={(event) =>
+                            void saveRules(
+                              current().rules.map((existing) =>
+                                existing.id === rule.id
+                                  ? { ...existing, enabled: event.currentTarget.checked }
+                                  : existing,
+                              ),
+                            )
+                          }
+                        />
+                        {describeTrigger(rule.trigger)} → <em>{rule.prompt}</em>
+                      </label>{" "}
+                      <button
+                        class="ghost"
+                        onClick={() =>
+                          void saveRules(
+                            current().rules.filter((existing) => existing.id !== rule.id),
+                          )
+                        }
+                      >
+                        Remove
+                      </button>
+                    </li>
+                  )}
+                </For>
+              </ul>
+            </Show>
+
+            <div class="row">
+              <select
+                value={kind()}
+                onChange={(event) =>
+                  setKind(event.currentTarget.value as WatchTrigger["type"])
+                }
+              >
+                <option value="foreground_app">Window title contains…</option>
+                <option value="folder_changed">Folder changes…</option>
+                <option value="time_of_day">At a time of day…</option>
+              </select>
+              <Show
+                when={kind() === "time_of_day"}
+                fallback={
+                  <input
+                    type="text"
+                    placeholder={
+                      kind() === "folder_changed" ? "C:\\path\\to\\folder" : "e.g. Figma"
+                    }
+                    value={param()}
+                    onInput={(event) => setParam(event.currentTarget.value)}
+                  />
+                }
+              >
+                <input
+                  type="time"
+                  value={time()}
+                  onInput={(event) => setTime(event.currentTarget.value)}
+                />
+              </Show>
+            </div>
+            <div class="row">
+              <input
+                type="text"
+                placeholder="…ask the agent to (e.g. summarize what's new in that folder)"
+                value={prompt()}
+                onInput={(event) => setPrompt(event.currentTarget.value)}
+              />
+              <button
+                onClick={() => void addRule()}
+                disabled={
+                  !prompt().trim() || (kind() !== "time_of_day" && !param().trim())
+                }
+              >
+                Add rule
+              </button>
+            </div>
+          </>
+        )}
+      </Show>
+      <Show when={error()}>
+        <p class="error">{error()}</p>
+      </Show>
+    </section>
+  );
+}
+
 /**
  * Importing a third-party skill from a local folder (Phase 7c).
  *
@@ -1820,6 +2051,7 @@ function Dashboard() {
       <ProfilePanel />
       <VoicePanel />
       <AmbientPanel />
+      <WatchersPanel />
       <SkillImportPanel />
 
       <section>

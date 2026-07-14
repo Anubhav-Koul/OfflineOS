@@ -91,6 +91,7 @@ tauri-plugin-single-instance = { version = "2", optional = true }
 tracing-subscriber = { version = "0.3", features = [
     "env-filter",
 ], optional = true }
+notify = "8.2.0"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

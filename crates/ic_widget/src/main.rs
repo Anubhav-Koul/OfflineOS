@@ -142,6 +142,9 @@ struct AppState {
     /// ambient service on purpose: an import is *solicited*, so it must work
     /// with ambient off and must never spend a guardrail slot.
     pending_import: Mutex<Option<PendingImport>>,
+    /// The ambient watcher loop (Phase 7d). Spawned with ambient mode, aborted
+    /// with it — with the master switch off, no signal is even sampled.
+    watcher_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// A reviewed skill import waiting for the user's yes or no.
@@ -1871,6 +1874,10 @@ async fn start_ambient(app: &AppHandle, client: GatewayClient) {
     if let Some(previous) = state.ambient_task.lock().await.replace(task) {
         previous.abort();
     }
+    let watch_task = spawn_watchers(app, Arc::clone(&service));
+    if let Some(previous) = state.watcher_task.lock().await.replace(watch_task) {
+        previous.abort();
+    }
     *state.ambient.lock().await = Some(service);
     tracing::info!("ambient mode is on: the character may speak first");
 }
@@ -1927,9 +1934,220 @@ async fn stop_ambient(app: &AppHandle) {
     if let Some(task) = state.ambient_task.lock().await.take() {
         task.abort();
     }
+    if let Some(task) = state.watcher_task.lock().await.take() {
+        // Aborting drops the task's locals, including the `notify` watcher —
+        // ambient off means not even a folder event is received.
+        task.abort();
+    }
     *state.ambient.lock().await = None;
     *state.ambient_thread.lock().await = None;
     update_character(app, |inputs| inputs.suggestion_pending = false).await;
+}
+
+// ---------------------------------------------------------------- watchers
+
+/// How often the watcher loop samples its signals (Phase 7d). Slow-moving
+/// state: a window switch or a folder drop is just as much news at 3 s.
+const WATCH_POLL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Run the ambient watchers against a live gateway.
+///
+/// Settings are re-read every cycle, so rule edits and kind toggles take effect
+/// on the next sample — only the ambient master switch needs a restart, and
+/// that is the gateway's constraint, not this loop's. A `tokio` spawn (not a
+/// Tauri one) because a firing drives an `EventStream`, `Send` but not `Sync`.
+fn spawn_watchers(app: &AppHandle, service: Arc<AmbientService>) -> tokio::task::JoinHandle<()> {
+    use ic_widget::ambient::watch::{Signal, WatchEngine, run_rule_fire};
+
+    let app = app.clone();
+    tokio::spawn(async move {
+        let state = app.state::<AppState>();
+        let mut engine = WatchEngine::new();
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+        // Held for its Drop: reassigning (or ending the task) unwatches.
+        let mut _folder_watcher: Option<notify::RecommendedWatcher> = None;
+        let mut watched_paths: Vec<String> = Vec::new();
+        let mut poll = tokio::time::interval(WATCH_POLL);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            poll.tick().await;
+            let Ok(settings) = state.settings_store.load() else {
+                continue; // silent-ok: unreadable settings mean no watching, the safe side
+            };
+            if !settings.ambient_enabled {
+                continue;
+            }
+            let watchers = settings.watchers;
+
+            // Reconcile the folder watcher with the rules as they are now.
+            let folders: Vec<String> = if watchers.folders_enabled {
+                watchers
+                    .rules
+                    .iter()
+                    .filter(|rule| rule.enabled)
+                    .filter_map(|rule| match &rule.trigger {
+                        ic_widget::settings::WatchTrigger::FolderChanged { path } => {
+                            Some(path.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            if folders != watched_paths {
+                _folder_watcher = build_folder_watcher(&folders, events_tx.clone());
+                watched_paths = folders;
+            }
+
+            let now = chrono::Local::now();
+            let mut firings = Vec::new();
+            if watchers.foreground_enabled {
+                let title = foreground_title();
+                firings.extend(engine.observe(&watchers, &Signal::Foreground(title), now));
+            }
+            while let Ok(path) = events_rx.try_recv() {
+                firings.extend(engine.observe(&watchers, &Signal::FolderEvent(path), now));
+            }
+            if watchers.time_enabled {
+                firings.extend(engine.observe(&watchers, &Signal::Tick, now));
+            }
+
+            for firing in firings {
+                let service = Arc::clone(&service);
+                tokio::spawn(async move {
+                    run_rule_fire(&service, &firing).await;
+                });
+            }
+        }
+    })
+}
+
+/// One recursive watcher over `paths`, or `None` when there are none (or the
+/// platform refuses). A path that cannot be watched is a warning, not a veto —
+/// one bad rule must not silence the others.
+fn build_folder_watcher(
+    paths: &[String],
+    events: tokio::sync::mpsc::UnboundedSender<PathBuf>,
+) -> Option<notify::RecommendedWatcher> {
+    use notify::Watcher as _;
+
+    if paths.is_empty() {
+        return None;
+    }
+    let mut watcher =
+        match notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
+            match event {
+                Ok(event) => {
+                    for path in event.paths {
+                        let _ = events.send(path);
+                    }
+                }
+                Err(error) => tracing::debug!(%error, "a folder watch event was unreadable"),
+            }
+        }) {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                tracing::warn!(%error, "could not create the folder watcher");
+                return None;
+            }
+        };
+    for path in paths {
+        if let Err(error) = watcher.watch(Path::new(path), notify::RecursiveMode::Recursive) {
+            tracing::warn!(%error, path, "could not watch a folder");
+        }
+    }
+    Some(watcher)
+}
+
+/// The foreground window's title, or empty when there is none. The only thing
+/// ever read is the *title* — no screen content, nothing leaves the machine.
+#[cfg(windows)]
+fn foreground_title() -> String {
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowTextW};
+
+    // SAFETY: no preconditions; may return a null handle.
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.is_invalid() {
+        return String::new();
+    }
+    let mut title = [0u16; 512];
+    // SAFETY: `title` is writable for its whole length.
+    let written = unsafe { GetWindowTextW(foreground, &mut title) }.max(0) as usize;
+    String::from_utf16_lossy(&title[..written.min(title.len())])
+}
+
+/// Windows is the primary target; elsewhere the signal simply never fires.
+#[cfg(not(windows))]
+fn foreground_title() -> String {
+    String::new()
+}
+
+/// What the dashboard shows for the watchers (Phase 7d).
+#[tauri::command]
+async fn watchers_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<ic_widget::settings::WatcherSettings, String> {
+    Ok(state
+        .settings_store
+        .load()
+        .map_err(|error| error.to_string())?
+        .watchers)
+}
+
+/// Switch the signal kinds on or off. Takes effect on the next sample.
+#[tauri::command]
+async fn set_watcher_kinds(
+    state: tauri::State<'_, AppState>,
+    foreground: bool,
+    folders: bool,
+    time: bool,
+) -> Result<(), String> {
+    state.update_settings(|settings| {
+        settings.watchers.foreground_enabled = foreground;
+        settings.watchers.folders_enabled = folders;
+        settings.watchers.time_enabled = time;
+    })?;
+    Ok(())
+}
+
+/// Replace the rule list. Rules are the user's own configuration — editable
+/// and deletable, unlike the logs, which record what was *shown* and stay.
+#[tauri::command]
+async fn set_watch_rules(
+    state: tauri::State<'_, AppState>,
+    rules: Vec<ic_widget::settings::WatchRule>,
+) -> Result<(), String> {
+    for rule in &rules {
+        validate_watch_rule(rule)?;
+    }
+    state.update_settings(|settings| settings.watchers.rules = rules.clone())?;
+    Ok(())
+}
+
+/// Refuse a rule that could never fire sensibly, with a reason the panel shows.
+fn validate_watch_rule(rule: &ic_widget::settings::WatchRule) -> Result<(), String> {
+    use ic_widget::settings::WatchTrigger;
+
+    if rule.id.trim().is_empty() {
+        return Err("a rule needs an id".to_string());
+    }
+    if rule.prompt.trim().is_empty() {
+        return Err("a rule needs a prompt — the thing to ask the agent".to_string());
+    }
+    match &rule.trigger {
+        WatchTrigger::ForegroundApp { title_contains } if title_contains.trim().is_empty() => {
+            Err("a window rule needs text to look for in the title".to_string())
+        }
+        WatchTrigger::FolderChanged { path } if !Path::new(path).is_dir() => {
+            Err(format!("{path} is not a folder"))
+        }
+        WatchTrigger::TimeOfDay { hour, minute } if *hour > 23 || *minute > 59 => {
+            Err("a time rule needs a valid hour and minute".to_string())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// What the dashboard shows for ambient mode.
@@ -3135,6 +3353,9 @@ fn main() {
             set_reflection_enabled,
             preview_skill_import,
             request_skill_import,
+            watchers_status,
+            set_watcher_kinds,
+            set_watch_rules,
             respond_suggestion,
             needs_setup,
             profile,
@@ -3181,6 +3402,7 @@ fn main() {
                 ambient_thread: Mutex::new(None),
                 reflection_runs: Mutex::new(RunWatch::new()),
                 pending_import: Mutex::new(None),
+                watcher_task: Mutex::new(None),
             });
 
             let handle = app.handle().clone();

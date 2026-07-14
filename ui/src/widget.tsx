@@ -263,7 +263,10 @@ function App() {
         */}
         <Show when={!interrupting() && suggestion()}>
           {(pending) => {
-            const installs = () => pending().kind !== "automation";
+            // Only the two skill kinds are consent prompts; an automation or a
+            // watcher result is a calm offer, and Accept just opens the thread.
+            const installs = () =>
+              pending().kind === "skill_draft" || pending().kind === "skill_import";
             return (
               <div class={`ask solid ${installs() ? "ask-install" : "ask-suggest"}`}>
                 <div class="ask-headline">{pending().headline}</div>

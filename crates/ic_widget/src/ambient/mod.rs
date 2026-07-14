@@ -37,6 +37,7 @@ pub mod automations;
 pub mod guardrail;
 pub mod log;
 pub mod reflection;
+pub mod watch;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -70,6 +71,9 @@ pub enum SuggestionKind {
     /// Solicited — the user initiated it in the dashboard — so it is answered
     /// even while ambient mode is off, and it never touches the guardrail.
     SkillImport,
+    /// A watcher rule fired and the agent's answer is worth a look (7d).
+    /// Renders like an automation: a calm offer, Accept opens the thread.
+    Watcher,
 }
 
 /// What the bubble shows when the character speaks first.
@@ -221,6 +225,22 @@ impl AmbientService {
         Some(suggestion)
     }
 
+    /// Whether a surfacing would currently pass the guardrail, recording
+    /// nothing. Watchers (7d) ask this *before* spending an LLM turn on a
+    /// prompt whose answer could never be shown; [`AmbientService::propose`]
+    /// still re-checks and records when the answer arrives.
+    pub async fn would_allow(&self, key: &str, source: &str) -> Result<(), Suppression> {
+        let config = (self.config)();
+        guardrail::check(
+            config.enabled,
+            &config.settings,
+            Local::now(),
+            key,
+            source,
+            self.log.lock().await.entries(),
+        )
+    }
+
     /// Distinct `source` values carrying an `Accepted` entry that starts with
     /// `prefix` — e.g. every `reflection:<name>` the user ever said yes to.
     /// The log is the only durable record of consent, so the self-learned cap
@@ -256,6 +276,20 @@ impl AmbientService {
             TurnResult::NothingToSpeak | TurnResult::SendFailed => None,
         }
     }
+}
+
+/// The longest body the bubble carries. The full answer stays in the thread,
+/// which Accept opens.
+pub(crate) const MAX_BODY: usize = 400;
+
+/// Shorten a reply to something a speech bubble can hold.
+pub(crate) fn summarize(reply: &str) -> String {
+    let trimmed = reply.trim();
+    if trimmed.chars().count() <= MAX_BODY {
+        return trimmed.to_string();
+    }
+    let short: String = trimmed.chars().take(MAX_BODY).collect();
+    format!("{}…", short.trim_end())
 }
 
 /// The ambient thread: the conversation the *app* starts.
@@ -405,6 +439,15 @@ mod tests {
         );
         // Surfaced + Accepted, and no duplicate.
         assert_eq!(service.log.lock().await.entries().len(), 2);
+    }
+
+    #[test]
+    fn a_long_reply_is_cut_to_a_bubble() {
+        let long = "x".repeat(MAX_BODY + 50);
+        let short = summarize(&long);
+        assert_eq!(short.chars().count(), MAX_BODY + 1, "cut plus an ellipsis");
+        assert!(short.ends_with('…'));
+        assert_eq!(summarize("  hello  "), "hello");
     }
 
     #[tokio::test]

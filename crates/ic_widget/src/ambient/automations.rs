@@ -37,7 +37,7 @@ use uuid::Uuid;
 
 use crate::gateway_client::{Automation, AutomationRunStatus, ThreadId};
 
-use super::{AmbientService, Suggestion};
+use super::{AmbientService, Suggestion, SuggestionKind};
 
 /// How often the automations are polled. The gateway's own minimum fire cadence is
 /// 60 s, so a 30 s poll cannot miss a fire it could have caught.
@@ -115,6 +115,7 @@ fn suggestion_for(automation: &Automation, last_run: &str, body: Option<String>)
     });
     Suggestion {
         id: Uuid::new_v4().to_string(),
+        kind: SuggestionKind::Automation,
         key: format!("automation:{}:{last_run}", automation.automation_id),
         source: format!("automation:{}", automation.automation_id),
         headline,

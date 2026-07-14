@@ -36,6 +36,7 @@
 pub mod automations;
 pub mod guardrail;
 pub mod log;
+pub mod reflection;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -51,11 +52,29 @@ use crate::voice::{TurnResult, drive_turn};
 use guardrail::Suppression;
 use log::{LogEntry, LogEvent, SurfacingLog};
 
+/// What kind of thing is being suggested — it decides how the bubble renders
+/// the card and what Accept *does*.
+///
+/// An automation's result is an offer to look (blue; Accept opens the thread).
+/// A skill draft is an offer to **install** (red, the Phase 4 consent-gate
+/// pattern; Accept writes the skill, so the card must read as a consent
+/// prompt, not a notification).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SuggestionKind {
+    /// A completed automation run worth a look.
+    Automation,
+    /// A draft SKILL.md awaiting the user's consent to install (Phase 7b).
+    SkillDraft,
+}
+
 /// What the bubble shows when the character speaks first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Suggestion {
     /// Unique per popup; the id the UI answers with.
     pub id: String,
+    /// What is being offered, and therefore what Accept does.
+    pub kind: SuggestionKind,
     /// The exact thing being suggested — the dedupe key. Shown once, ever.
     pub key: String,
     /// Where it came from, e.g. `automation:01K…`. A "Not now" quiets *this*.
@@ -198,6 +217,28 @@ impl AmbientService {
         Some(suggestion)
     }
 
+    /// Distinct `source` values carrying an `Accepted` entry that starts with
+    /// `prefix` — e.g. every `reflection:<name>` the user ever said yes to.
+    /// The log is the only durable record of consent, so the self-learned cap
+    /// counts from here (intersected with the disk by the caller).
+    pub async fn accepted_sources_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> std::collections::HashSet<String> {
+        self.log
+            .lock()
+            .await
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.event {
+                LogEvent::Accepted { source, .. } if source.starts_with(prefix) => {
+                    Some(source.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Ask the agent something on the ambient thread and return its reply.
     ///
     /// This is the app talking to the agent on its own initiative — a reflection
@@ -286,6 +327,7 @@ mod tests {
     fn suggestion(key: &str) -> Suggestion {
         Suggestion {
             id: format!("s-{key}"),
+            kind: SuggestionKind::Automation,
             key: key.into(),
             source: "automation:a".into(),
             headline: "Nightly digest just ran".into(),

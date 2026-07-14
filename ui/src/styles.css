@@ -192,6 +192,32 @@ body.widget-body {
   background: rgba(22, 28, 38, 0.97);
 }
 
+/* A skill draft asking to be installed (Phase 7b). Red like a sensitive fill,
+   not blue like an offer: saying yes changes what the agent can do from now
+   on, so the card is a consent prompt and must not read as a notification. */
+.ask-install {
+  border-color: var(--danger, #d1524a);
+  background: rgba(38, 22, 22, 0.97);
+}
+.ask-skill-text {
+  margin: 0 0 8px;
+  padding: 8px;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text);
+  background: rgba(0, 0, 0, 0.35);
+  border-radius: 6px;
+  max-height: 180px;
+  overflow: auto;
+}
+.ask-warning {
+  margin: 0 0 8px;
+  font-size: 11px;
+  color: var(--danger, #d1524a);
+}
+
 .widget-header {
   display: flex;
   align-items: center;

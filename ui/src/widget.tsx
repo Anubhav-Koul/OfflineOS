@@ -13,6 +13,7 @@ import {
 import {
   api,
   onAmbientSuggestion,
+  onSkillInstallResult,
   onCharacterActive,
   onCharacterState,
   onCursorPos,
@@ -185,6 +186,10 @@ function App() {
     await api.respondSuggestion(pending.id, accepted).catch(() => undefined);
   };
 
+  /** The one-line receipt after an approved skill draft installs (or fails). */
+  const [installNote, setInstallNote] = createSignal<string | null>(null);
+  let installNoteTimer: ReturnType<typeof setTimeout> | undefined;
+
   createEffect(() => {
     const reply = chat.lastReply();
     clearTimeout(saysTimer);
@@ -210,6 +215,17 @@ function App() {
       cleanups.push(await chat.start());
       cleanups.push(await onProfileChanged(setProfile));
       cleanups.push(await onAmbientSuggestion(setSuggestion));
+      cleanups.push(
+        await onSkillInstallResult((result) => {
+          setInstallNote(
+            result.ok
+              ? `Learned “${result.name}”. I can use it from the next task.`
+              : `I couldn't save that skill: ${result.error}`,
+          );
+          clearTimeout(installNoteTimer);
+          installNoteTimer = setTimeout(() => setInstallNote(null), 8000);
+        }),
+      );
       try {
         setProfile(await api.profile());
       } catch {
@@ -240,25 +256,60 @@ function App() {
           a question, with two answers, and "Not now" is recorded so the same
           source stays quiet for a while. A gate still outranks it — that one is
           blocking a run the user asked for.
+
+          A skill draft (Phase 7b) wears the red consent style, not the blue offer:
+          Accept *installs* — it changes what the agent can do from now on — so the
+          card shows the full text, and No is the default answer.
         */}
         <Show when={!interrupting() && suggestion()}>
           {(pending) => (
-            <div class="ask ask-suggest solid">
+            <div
+              class={`ask solid ${
+                pending().kind === "skill_draft" ? "ask-install" : "ask-suggest"
+              }`}
+            >
               <div class="ask-headline">{pending().headline}</div>
-              <div class="ask-body">{pending().body}</div>
+              <Show
+                when={pending().kind === "skill_draft"}
+                fallback={<div class="ask-body">{pending().body}</div>}
+              >
+                <pre class="ask-skill-text">{pending().body}</pre>
+                <div class="ask-warning">
+                  Installing lets the agent use this in future tasks. Review it
+                  before saying yes.
+                </div>
+              </Show>
               <div class="ask-actions">
-                <button class="deny" onClick={() => void answer(false)}>
-                  Not now
+                <button
+                  class="deny"
+                  autofocus={pending().kind === "skill_draft"}
+                  onClick={() => void answer(false)}
+                >
+                  {pending().kind === "skill_draft" ? "No" : "Not now"}
                 </button>
                 <button class="approve" onClick={() => void answer(true)}>
-                  {pending().thread_id ? "Show me" : "Thanks"}
+                  {pending().kind === "skill_draft"
+                    ? "Install skill"
+                    : pending().thread_id
+                      ? "Show me"
+                      : "Thanks"}
                 </button>
               </div>
             </div>
           )}
         </Show>
 
-        <Show when={says() && !interrupting() && !suggestion()}>
+        {/* The one-line receipt after an approved draft installs (or fails to). */}
+        <Show when={!interrupting() && !suggestion() && installNote()}>
+          {(note) => (
+            <div class="say solid">
+              <div class="say-cloud">{note()}</div>
+              <div class="say-tail" />
+            </div>
+          )}
+        </Show>
+
+        <Show when={says() && !interrupting() && !suggestion() && !installNote()}>
           {(text) => (
             <div class="say solid">
               <div class="say-cloud">{text()}</div>

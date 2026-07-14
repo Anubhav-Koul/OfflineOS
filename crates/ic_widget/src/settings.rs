@@ -203,6 +203,12 @@ pub struct Settings {
     /// The guardrails that bound ambient mode when it *is* on.
     #[serde(default)]
     pub ambient: AmbientSettings,
+    /// Whether a completed task earns a reflection turn that may draft a skill
+    /// (Phase 7b). **Off by default**, and it only matters while
+    /// [`Settings::ambient_enabled`] is also on — reflection runs on the ambient
+    /// thread and every draft it surfaces rides the ambient guardrails.
+    #[serde(default)]
+    pub reflection_enabled: bool,
 }
 
 /// A character asset folder's name, e.g. `hiyori`.

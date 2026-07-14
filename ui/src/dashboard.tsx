@@ -1569,6 +1569,31 @@ function AmbientPanel() {
     }
   };
 
+  const toggleReflection = async (on: boolean) => {
+    setError(null);
+    try {
+      await api.setReflectionEnabled(on);
+      await refresh();
+    } catch (problem) {
+      setError(String(problem));
+    }
+  };
+
+  // The model-quality hint (Phase 7b): a small local model drafts poor skills,
+  // and `LLM_BACKEND` is single-valued so reflection runs on whatever chat runs
+  // on. Surfaced as a hint, not solved — multi-model routing is tracked in
+  // docs/desktop/llm-provider-selection.md.
+  const [localModel, setLocalModel] = createSignal(false);
+  onMount(() => {
+    void (async () => {
+      try {
+        setLocalModel((await api.localModelStatus()) !== null);
+      } catch {
+        /* silent-ok: no hint is just no hint */
+      }
+    })();
+  });
+
   const quietLabel = () => {
     const current = status();
     if (!current || current.quiet_start === null || current.quiet_end === null) return "none";
@@ -1632,6 +1657,27 @@ function AmbientPanel() {
             {status()?.quiet_start === null ? "Quiet 22:00 – 08:00" : "Never go quiet"}
           </button>
         </p>
+
+        <label class="wizard-voice">
+          <input
+            type="checkbox"
+            checked={status()?.reflection_enabled ?? false}
+            onChange={(event) => void toggleReflection(event.currentTarget.checked)}
+          />
+          Learn skills from completed tasks
+        </label>
+        <p class="muted small">
+          After a task finishes, the agent may draft a skill and offer to keep it.
+          Nothing installs without your yes: the draft is shown in full, and No is
+          the default answer.
+        </p>
+        <Show when={localModel() && status()?.reflection_enabled}>
+          <p class="muted small">
+            Skills learn better with a stronger model — a small local model tends
+            to draft poor ones. Consider a cloud provider or a larger model while
+            learning is on.
+          </p>
+        </Show>
       </Show>
 
       <Show when={error()}>

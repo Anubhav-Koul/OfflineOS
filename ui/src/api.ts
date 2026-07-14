@@ -230,6 +230,8 @@ export interface VoiceSettings {
  */
 export interface AmbientStatus {
   enabled: boolean;
+  /** Whether a completed task may earn a skill draft (Phase 7b). */
+  reflection_enabled: boolean;
   /** Whether the watcher is live against a running gateway. */
   running: boolean;
   max_per_hour: number;
@@ -241,15 +243,27 @@ export interface AmbientStatus {
 /**
  * Something the character volunteered. Answer it with Accept or Not now — both are
  * recorded, and a "Not now" quiets that `source` for an hour.
+ *
+ * The `kind` decides what Accept does: an `automation` card opens the run's
+ * thread; a `skill_draft` card **installs the draft in `body`** — it renders as
+ * a red consent prompt, not a blue notification, and defaults to No.
  */
 export interface Suggestion {
   id: string;
+  kind: "automation" | "skill_draft";
   key: string;
   source: string;
   headline: string;
   body: string;
   /** The thread the detail lives in, when one could be identified. */
   thread_id: string | null;
+}
+
+/** What the app reports after an approved skill draft's install attempt. */
+export interface SkillInstallResult {
+  ok: boolean;
+  name: string | null;
+  error: string | null;
 }
 
 /** One recorded take of the wake phrase. */
@@ -351,7 +365,11 @@ export const api = {
     quietStart: number | null,
     quietEnd: number | null,
   ) => invoke<void>("set_ambient_guardrails", { maxPerHour, quietStart, quietEnd }),
-  /** Answer a suggestion. Accept opens the run's thread; both answers are recorded. */
+  /** Turn the reflection pass on or off. No restart. */
+  setReflectionEnabled: (enabled: boolean) =>
+    invoke<void>("set_reflection_enabled", { enabled }),
+  /** Answer a suggestion. Accept opens the run's thread — or, for a skill
+   *  draft, installs it. Both answers are recorded. */
   respondSuggestion: (id: string, accepted: boolean) =>
     invoke<void>("respond_suggestion", { id, accepted }),
 };
@@ -361,6 +379,15 @@ export function onAmbientSuggestion(
   handler: (suggestion: Suggestion) => void,
 ): Promise<UnlistenFn> {
   return listen<Suggestion>("ambient://suggestion", (event) => handler(event.payload));
+}
+
+/** Subscribe to the result of installing an approved skill draft. */
+export function onSkillInstallResult(
+  handler: (result: SkillInstallResult) => void,
+): Promise<UnlistenFn> {
+  return listen<SkillInstallResult>("ambient://install-result", (event) =>
+    handler(event.payload),
+  );
 }
 
 /** The voice UI status (mirrors the Rust `VoiceStatus`). */

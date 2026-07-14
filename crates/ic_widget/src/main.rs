@@ -23,7 +23,8 @@ use ic_llama::{
     Digest, HubModel, LocalLlm, LocalLlmOptions, ModelId, ModelStore, SidecarState, SpawnHook,
     Verdict,
 };
-use ic_widget::ambient::{AmbientConfig, AmbientService, Suggestion};
+use ic_widget::ambient::reflection::RunWatch;
+use ic_widget::ambient::{AmbientConfig, AmbientService, Suggestion, SuggestionKind};
 use ic_widget::canvas::{CallbackSink, CanvasServer};
 use ic_widget::character::{self, CharacterInputs, CharacterState};
 use ic_widget::error::Error;
@@ -133,6 +134,9 @@ struct AppState {
     /// The ambient thread — the conversation the *app* starts, kept apart from the
     /// user's so a turn they never asked for cannot land in their transcript.
     ambient_thread: Mutex<Option<ThreadId>>,
+    /// Which chat runs have already earned a reflection turn (Phase 7b). One watch
+    /// for the whole app: run ids are unique, so it survives thread switches.
+    reflection_runs: Mutex<RunWatch>,
 }
 
 /// The inputs the character state derives from, plus the last state emitted.
@@ -1013,7 +1017,7 @@ enum ChatEvent {
 /// The stream reconnects itself, so this task ends only when the thread changes,
 /// the app exits, or the stream fails terminally.
 async fn pump_events(app: AppHandle, client: GatewayClient, thread_id: ThreadId) {
-    let mut stream = client.events(thread_id);
+    let mut stream = client.events(thread_id.clone());
     while let Some(event) = stream.next().await {
         let translated = match event {
             Ok(GatewayEvent::ProjectionSnapshot(state) | GatewayEvent::ProjectionUpdate(state)) => {
@@ -1030,6 +1034,20 @@ async fn pump_events(app: AppHandle, client: GatewayClient, thread_id: ThreadId)
                         );
                         update_character(&app, |inputs| inputs.run = Some(status.status.clone()))
                             .await;
+
+                        // A user-initiated run just finished — maybe it taught
+                        // something (Phase 7b). The watch fires once per run, only
+                        // on an in-flight → completed edge, so the stream's
+                        // repeats and snapshot replays cannot double-reflect.
+                        let completed = app
+                            .state::<AppState>()
+                            .reflection_runs
+                            .lock()
+                            .await
+                            .observe(status.run_id.as_ref(), &status.status);
+                        if completed {
+                            spawn_reflection(&app, thread_id.clone());
+                        }
                     }
                 }
                 continue;
@@ -1840,6 +1858,51 @@ async fn start_ambient(app: &AppHandle, client: GatewayClient) {
     tracing::info!("ambient mode is on: the character may speak first");
 }
 
+/// Fire one reflection turn for a just-completed chat run (Phase 7b).
+///
+/// Both toggles are read *at fire time*, so flipping either takes effect on the
+/// next completed run rather than the next launch. A `tokio` spawn, not a Tauri
+/// one, for the same reason as the pump: the reflection turn drives an
+/// `EventStream`, which is `Send` but not `Sync`. Always called from inside the
+/// pump task, so the runtime is present.
+fn spawn_reflection(app: &AppHandle, chat_thread: ThreadId) {
+    let app = app.clone();
+    tokio::spawn(async move {
+        let state = app.state::<AppState>();
+        let Ok(settings) = state.settings_store.load() else {
+            return; // silent-ok: unreadable settings mean no reflection, the safe side
+        };
+        if !settings.ambient_enabled || !settings.reflection_enabled {
+            return;
+        }
+        let Some(service) = state.ambient.lock().await.clone() else {
+            return;
+        };
+        let Some(ambient_thread) = state.ambient_thread.lock().await.clone() else {
+            return;
+        };
+        let Ok(skills_root) = skills_root() else {
+            return; // silent-ok: no data dir means nowhere to check or install skills
+        };
+        let outcome = ic_widget::ambient::reflection::reflect(
+            &service,
+            &ambient_thread,
+            &chat_thread,
+            &skills_root,
+            ic_widget::ambient::reflection::DEFAULT_MAX_LEARNED,
+        )
+        .await;
+        tracing::info!(?outcome, "the reflection turn finished");
+    });
+}
+
+/// Where the gateway reads user skills from: plain files under its home.
+/// Verified by the `skill_install` gate — a directory here with a `SKILL.md` is
+/// listed, activatable, and fully injected on activation (the trusted tier).
+fn skills_root() -> Result<PathBuf, String> {
+    reborn_home().map(|home| home.join("local-dev").join("skills"))
+}
+
 /// Wind ambient mode down: stop watching, and take any unanswered suggestion off
 /// the character's face.
 async fn stop_ambient(app: &AppHandle) {
@@ -1856,6 +1919,7 @@ async fn stop_ambient(app: &AppHandle) {
 #[derive(Serialize)]
 struct AmbientStatus {
     enabled: bool,
+    reflection_enabled: bool,
     /// Whether the watcher is actually running against a live gateway.
     running: bool,
     max_per_hour: u32,
@@ -1868,6 +1932,7 @@ async fn ambient_status(state: tauri::State<'_, AppState>) -> Result<AmbientStat
     let settings = state.settings_store.load().map_err(|e| e.to_string())?;
     Ok(AmbientStatus {
         enabled: settings.ambient_enabled,
+        reflection_enabled: settings.reflection_enabled,
         running: state.ambient.lock().await.is_some(),
         max_per_hour: settings.ambient.max_per_hour,
         quiet_start: settings.ambient.quiet_hours.map(|quiet| quiet.start_hour),
@@ -1923,6 +1988,26 @@ async fn set_ambient_guardrails(
     Ok(())
 }
 
+/// Turn the reflection pass on or off (Phase 7b). No restart: the toggle is
+/// read when a run completes, unlike the ambient master switch, which has to
+/// replace the gateway for its environment variable.
+#[tauri::command]
+async fn set_reflection_enabled(
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    state.update_settings(|settings| settings.reflection_enabled = enabled)?;
+    Ok(())
+}
+
+/// What the UI hears after an approved draft's install attempt.
+#[derive(Serialize, Clone)]
+struct SkillInstallResult {
+    ok: bool,
+    name: Option<String>,
+    error: Option<String>,
+}
+
 /// Answer a suggestion: Accept, or Not now.
 ///
 /// Accept means "show me": the app switches both windows to the thread the run
@@ -1940,6 +2025,38 @@ async fn respond_suggestion(
     };
     let answered = service.respond(&id, accepted).await;
     update_character(&app, |inputs| inputs.suggestion_pending = false).await;
+
+    // An accepted skill draft is a consent (Phase 7b): install it now,
+    // deterministically — the user approved this exact text, so no LLM sits
+    // between the yes and the write. The runtime would not have prompted
+    // (Phase 4), which is why this gate lives here and nowhere else.
+    if let Some(suggestion) = &answered
+        && accepted
+        && suggestion.kind == SuggestionKind::SkillDraft
+    {
+        let result = skills_root()
+            .and_then(|root| ic_widget::ambient::reflection::install(&root, &suggestion.body));
+        let installed = match result {
+            Ok(name) => {
+                tracing::info!(skill = %name, "installed an approved skill draft");
+                SkillInstallResult {
+                    ok: true,
+                    name: Some(name),
+                    error: None,
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "the approved skill draft did not install");
+                SkillInstallResult {
+                    ok: false,
+                    name: None,
+                    error: Some(error),
+                }
+            }
+        };
+        let _ = app.emit("ambient://install-result", &installed);
+        return Ok(());
+    }
 
     if let Some(suggestion) = answered
         && accepted
@@ -2860,6 +2977,7 @@ fn main() {
             ambient_status,
             set_ambient_enabled,
             set_ambient_guardrails,
+            set_reflection_enabled,
             respond_suggestion,
             needs_setup,
             profile,
@@ -2904,6 +3022,7 @@ fn main() {
                 ambient: Mutex::new(None),
                 ambient_task: Mutex::new(None),
                 ambient_thread: Mutex::new(None),
+                reflection_runs: Mutex::new(RunWatch::new()),
             });
 
             let handle = app.handle().clone();

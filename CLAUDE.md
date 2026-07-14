@@ -1022,3 +1022,106 @@ and `builtin__skill_list` **are** model-visible in `serve` under `local-dev` (se
 28-tool list during the 7a probe) — so confirm the *install path* end to end against the
 running gateway before building any UI, and remember that `Ask` is not enforced, so the
 consent gate is ours to build (as in Phase 4).
+
+## Phase 7b notes — self-learning skills (done, recorded 2026-07-14)
+
+`crates/ic_widget` (new `ambient/reflection.rs`; `ambient/mod.rs`, `automations.rs`,
+`settings.rs`, `main.rs`) + `ui/` + two new gates
+(`ic_integration_tests/tests/skill_install.rs`, `tests/skill_reflection.rs`) and one
+harness affordance (`RebornServer::start_scripted_in_home` — consecutive servers over
+one caller-owned home, the only way a test can watch a restart). **No core patch.**
+Related upstream filing from this phase: [nearai/ironclaw#6076](https://github.com/nearai/ironclaw/issues/6076)
+(automations carry no thread/run correlation — 7a's weak spot, filed with approval).
+
+### The ⚠️ VERIFY item, answered by a probe before any feature code
+
+`tests/skill_install.rs` drives `builtin__skill_install` through a real `serve`
+(the Phase 4 lesson applied: a listed capability is not a reachable one). Findings,
+each pinned by an assertion:
+
+- **Install is reachable — the opposite of the Phase 4 egress gap.**
+  `local_dev_capability_policy.toml` grants `skill_install` exactly the effects it
+  declares. The agent installed a skill from inline `content` end to end.
+- **`PermissionMode::Ask` ran unprompted** — third confirmation of the Phase 4
+  finding. The consent gate is ours, as the plan assumed.
+- **Skills are plain files**, not libSQL rows:
+  `<IRONCLAW_REBORN_HOME>/local-dev/skills/<name>/SKILL.md`, re-read lazily. They
+  survive a restart iff the home does (ours is stable).
+- **Install ≠ in-context.** The local-dev selector is `ExplicitOnly`; the skill
+  reaches the model only when the agent calls `builtin__skill_activate`. And the
+  decisive fact: an inline-content install lands as **`source: user` — the trusted
+  tier — so activation injects the FULL body**, not the description-only fate of
+  URL-provenance installs. Without that, a learned skill would be a name, not a
+  procedure. Pinned; if upstream changes the trust assignment, the gate says so.
+
+### What 7b is, mechanically
+
+- **`RunWatch` (edge, not level).** The projection stream repeats `run_status`
+  every poll and replays it on every snapshot, so "completed" must be detected as
+  an in-flight → `Completed` **transition**. A run already terminal at first sight
+  is history, not news (the automations watcher's priming rule, same shape).
+  Failed/cancelled runs never fire. Hooked in `pump_events`; both toggles
+  (`ambient_enabled` + the new `settings.reflection_enabled`, default **off**) are
+  read at fire time, so no restart.
+- **The reflection turn rides 7a's plumbing exactly**: `AmbientService::ask` on the
+  ambient thread — and the transcript travels *in the prompt*, because the ambient
+  thread knows nothing of the chat thread (separate conversations, by design).
+  Tail-truncated, whole messages only.
+- **Parsing fails closed.** A draft is a fenced (or bare) SKILL.md with top-level
+  `name:` + `description:` frontmatter and a non-empty body; the name is validated
+  kebab-case, bounded, and not a Windows reserved device name. "NO", prose, or
+  anything malformed proposes nothing.
+- **Dedupe is three layers, cheapest first**: the cap needs no LLM turn (accepted
+  `reflection:*` sources ∩ disk — removing a skill frees its slot, default 50);
+  a name already on disk declines; and the guardrail's exact-key memory makes
+  `skill:<name>` (no per-run component, deliberately) a **once-ever** offer — that
+  existing 7a mechanism *is* "a rejected draft is never re-proposed".
+- **Consent is the red card** (the Phase 4 `ask-fill` pattern, not the blue offer):
+  full draft text in the bubble, No is the default and the focused button. An
+  Accept installs **deterministically — a validated file write** to the skills
+  root, no LLM between the yes and the write. This is the "cleaner seam" the spec
+  allowed: a user-placed skill is *identical* in trust and effect to an
+  inline-content capability install (verified above), and it cannot mangle the
+  text the user just approved. `main.rs` `respond_suggestion` routes
+  `SuggestionKind::SkillDraft` accepts through it and reports via
+  `ambient://install-result`.
+- **The model-quality constraint is surfaced, not solved** (per spec): the ambient
+  panel shows "skills learn better with a stronger model" while a local model is
+  active and reflection is on. Multi-model routing stays tracked in
+  `docs/desktop/llm-provider-selection.md`.
+
+### Two honest limitations, stated rather than papered over
+
+- **The reflection turn runs with the agent's full tool surface and no runtime
+  gate** (Phase 4). A model that disobeys "do NOT install anything" could call
+  `builtin__skill_install` mid-reflection and nothing would stop it. Not
+  preventable from the widget; it **is detected** — `reflect` snapshots the skills
+  root around the turn and logs an error naming any skill that appeared without
+  consent. If upstream ever wires `Decision::RequireApproval`, this becomes
+  defence-in-depth.
+- **Dedupe cannot see bundled system skills** (embedded in the binary, not on
+  disk), so a draft could shadow one by name; `skill_listing` keys on
+  `(name, source)`, so both would list. Low stakes, worth knowing.
+
+### A finding that belongs to 7c
+
+Nothing scans skill text on install: `ironclaw_skills/src/gating.rs` checks only
+*environment requirements* (bins/env/config), and the context-build scan
+(`skill_context.rs`) is structural (control chars, host paths, handle markers,
+byte budgets — fail-closed) not semantic. Combined with content installs landing
+**trusted with full-body injection**, 7c's review-before-install UI is not a
+nicety — it is the only gate a third-party skill passes through.
+
+### The gates
+
+`cargo test -p ic_integration_tests --features webui-v2-beta` now includes
+`skill_install` (install → restart → list → activate → body-injected) and
+`skill_reflection` (task completes → reflection drafts → consent card → install
+into the real skills root → never re-proposed → cap declines before the LLM
+turn). Together they are the 7b definition-of-done chain. Unit tests cover the
+parser's hostile cases, `RunWatch`, the cap arithmetic, and the installer's
+refusals.
+
+Next: **Phase 7c — skill import** (local folder, frontmatter validation,
+review-before-install through the same consent card). Its ⚠️ VERIFY item is
+answered above: treat skill text as untrusted, because the runtime does not.

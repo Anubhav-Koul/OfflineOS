@@ -33,6 +33,10 @@ futures-util = "0.3"
 # a real GGUF on disk. The harness in `src/lib.rs` does not depend on llama.cpp.
 ic_llama = { path = "../ic_llama" }
 
+# `tests/connector_oauth.rs` — the product-auth OAuth start route demands an
+# `expires_at` on the flow, so the test has to be able to say what time it is.
+chrono = "0.4"
+
 # `tests/browser_mcp_contract.rs` — the Phase 4 gate. It drives the real browser
 # sidecar over HTTP and feeds its `tools/list` through the runtime's own
 # discovery code, so the core crates are dev-dependencies here on purpose: the

@@ -324,11 +324,24 @@ pub struct GatePrompt {
 }
 
 /// `AuthPromptView` — a credential or OAuth prompt.
+///
+/// **Verified live (Phase 8b):** when a connector's tool call is refused by its
+/// vendor (a `401`), the runtime does not fail the run — it raises one of these
+/// and *parks* it, so the user can supply a better credential and the turn can
+/// continue. A client that waits only for a terminal run status waits forever.
+///
+/// And what arrives is thinner than this struct suggests: in practice only
+/// `turn_run_id`, `auth_request_ref`, and a **generic** headline
+/// ("Authentication required") are populated. `provider` is `None` — the prompt
+/// does not say *which* connector is asking. The caller must infer that from the
+/// `capability_activity` events on the same stream (the last `capability_id`
+/// before the gate is the one that raised it).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct AuthPrompt {
     /// The run that is parked.
     pub turn_run_id: RunId,
-    /// Opaque reference to the auth request.
+    /// Opaque reference to the auth request. This **is** the `gate_ref` the
+    /// resolve and manual-token-submit routes want.
     pub auth_request_ref: String,
     /// One line: what is being asked.
     pub headline: String,

@@ -71,6 +71,14 @@ pub struct CharacterInputs {
     pub browser_approval_pending: bool,
     /// An ambient suggestion is on screen, unanswered (Phase 7a).
     pub suggestion_pending: bool,
+    /// A run is **parked on an auth gate**: a connector's credential was refused
+    /// and the turn cannot continue until a better one is supplied (Phase 8b).
+    ///
+    /// Its own input, like `browser_approval_pending`, because the projection's
+    /// run status does not carry it — the gate arrives as its own SSE event, and
+    /// without this the character would look like it was still thinking about a
+    /// question it has quietly stopped answering.
+    pub auth_gate_pending: bool,
 }
 
 impl Default for CharacterInputs {
@@ -86,6 +94,7 @@ impl Default for CharacterInputs {
             voice_speaking: false,
             browser_approval_pending: false,
             suggestion_pending: false,
+            auth_gate_pending: false,
         }
     }
 }
@@ -114,7 +123,11 @@ pub fn derive(inputs: &CharacterInputs) -> CharacterState {
 
     // A pending browser fill approval is a gate too: the user must act before the
     // agent can type. It outranks in-flight work, the same as a gateway gate.
-    if inputs.browser_approval_pending {
+    //
+    // So does a parked auth gate (Phase 8b): the run is not thinking, it is
+    // *waiting* — and a character that keeps thinking at the user is how an
+    // endless spinner is built with extra steps.
+    if inputs.browser_approval_pending || inputs.auth_gate_pending {
         return CharacterState::Concerned;
     }
 
@@ -302,6 +315,31 @@ mod tests {
             ..base
         };
         assert_eq!(derive(&gated), CharacterState::Concerned);
+    }
+
+    /// A run parked on an auth gate is *waiting*, not working — the character has
+    /// to show that, or the user watches a thinking face over a stopped turn.
+    #[test]
+    fn a_parked_auth_gate_is_concern_not_thought() {
+        let ready = CharacterInputs {
+            gateway: GatewayState::Ready,
+            ..CharacterInputs::default()
+        };
+
+        // The projection does not carry the gate, so the run still reads as
+        // in-flight. That is precisely why the gate needs an input of its own.
+        let parked = CharacterInputs {
+            run: Some(RunPhase::Running),
+            auth_gate_pending: true,
+            ..ready.clone()
+        };
+        assert_eq!(derive(&parked), CharacterState::Concerned);
+
+        let working = CharacterInputs {
+            run: Some(RunPhase::Running),
+            ..ready
+        };
+        assert_eq!(derive(&working), CharacterState::Thinking);
     }
 
     #[test]

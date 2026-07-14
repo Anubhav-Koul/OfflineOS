@@ -186,6 +186,9 @@ function App() {
     await api.respondSuggestion(pending.id, accepted).catch(() => undefined);
   };
 
+  /** The token being typed into a parked auth gate (Phase 8b). */
+  const [gateToken, setGateToken] = createSignal("");
+
   /** The one-line receipt after an approved skill draft installs (or fails). */
   const [installNote, setInstallNote] = createSignal<string | null>(null);
   let installNoteTimer: ReturnType<typeof setTimeout> | undefined;
@@ -251,6 +254,45 @@ function App() {
         interruption, and both are anchored to the character.
       */}
       <div class="stage">
+        {/*
+          A run parked on a connector auth gate (Phase 8b). The credential was
+          refused and NOTHING moves until this is answered — so it outranks
+          everything, and it carries the fix rather than a spinner.
+        */}
+        <Show when={chat.authGate()}>
+          {(gate) => (
+            <div class="ask ask-install solid">
+              <div class="ask-headline">
+                {gate().connector ?? "A connector"} needs a valid credential
+              </div>
+              <div class="ask-body">
+                The agent stopped mid-answer: {gate().connector ?? "this connector"}{" "}
+                rejected the token it has. Paste a working one and the question is
+                asked again with it.
+              </div>
+              <div class="key-row">
+                <input
+                  type="password"
+                  placeholder="Paste a valid token"
+                  value={gateToken()}
+                  onInput={(event) => setGateToken(event.currentTarget.value)}
+                />
+                <button
+                  class="approve"
+                  disabled={!gateToken().trim()}
+                  onClick={() => {
+                    const token = gateToken();
+                    setGateToken("");
+                    void chat.answerAuthGate(token);
+                  }}
+                >
+                  Continue
+                </button>
+              </div>
+            </div>
+          )}
+        </Show>
+
         {/*
           The character speaking first (Phase 7a). It is not a notification: it is
           a question, with two answers, and "Not now" is recorded so the same

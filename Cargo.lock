@@ -4636,6 +4636,7 @@ name = "ic_integration_tests"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "futures-util",
  "ic_browser_mcp",
  "ic_canvas_mcp",

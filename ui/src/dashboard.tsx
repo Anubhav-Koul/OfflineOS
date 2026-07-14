@@ -10,6 +10,7 @@ import {
   onVoiceTranscript,
   type AmbientStatus,
   type Automation,
+  type Connector,
   type ImportPreview,
   type WatchRule,
   type WatchTrigger,
@@ -2428,6 +2429,263 @@ function WatchersPanel() {
 }
 
 /**
+ * Connectors (Phase 8b): the tools the agent can be given.
+ *
+ * Built on the registry lane, which was verified end to end before a line of this
+ * was written — install → credential → activate → a real tool call that reached
+ * GitHub's API. The stages here mirror that, in order, because each one is a
+ * place it can honestly fail.
+ *
+ * Two things this panel refuses to lie about:
+ *
+ * - **`installed` is not `active`.** Only an active connector's tools reach the
+ *   model, and an active connector with zero tools is broken however cheerful the
+ *   activate call was (the Phase 4 lesson).
+ * - **The credential never touches `settings.json`.** It goes straight to the
+ *   gateway's own secrets vault through the product-auth lane; the widget keeps
+ *   no copy and cannot show it back.
+ */
+function ConnectorsPanel() {
+  const [connectors, setConnectors] = createSignal<Connector[]>([]);
+  const [loading, setLoading] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+  const [tokens, setTokens] = createSignal<Record<string, string>>({});
+  const [busy, setBusy] = createSignal<string | null>(null);
+  const [notice, setNotice] = createSignal<Record<string, string>>({});
+
+  const refresh = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      setConnectors(await api.listConnectors());
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setLoading(false);
+    }
+  };
+  onMount(() => void refresh());
+
+  const token = (id: string) => tokens()[id] ?? "";
+  const setToken = (id: string, value: string) =>
+    setTokens((all) => ({ ...all, [id]: value }));
+  const say = (id: string, message: string) =>
+    setNotice((all) => ({ ...all, [id]: message }));
+
+  const install = async (connector: Connector) => {
+    setBusy(connector.id);
+    try {
+      const outcome = await api.installConnector(connector.id);
+      // Render the gateway's *own* onboarding copy rather than inventing ours —
+      // it knows what the credential is called and where to mint one.
+      say(
+        connector.id,
+        outcome.awaiting_token
+          ? (outcome.instructions ?? outcome.message ?? "This connector needs a token.")
+          : (outcome.message ?? "Installed."),
+      );
+      await refresh();
+    } catch (reason) {
+      say(connector.id, String(reason));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const saveToken = async (connector: Connector) => {
+    const value = token(connector.id).trim();
+    if (!value || !connector.provider) return;
+    setBusy(connector.id);
+    try {
+      const activated = await api.setConnectorToken(
+        connector.provider,
+        connector.id,
+        value,
+      );
+      setToken(connector.id, "");
+      say(
+        connector.id,
+        activated
+          ? "Saved and activated — its tools are now on the agent."
+          : "Saved, but it did not activate. Try enabling it.",
+      );
+      await refresh();
+    } catch (reason) {
+      say(connector.id, String(reason));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const toggle = async (connector: Connector, enabled: boolean) => {
+    setBusy(connector.id);
+    try {
+      await api.setConnectorEnabled(connector.id, enabled);
+      await refresh();
+    } catch (reason) {
+      say(connector.id, String(reason));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  /** How many tools the agent is currently carrying, across all connectors. */
+  const activeTools = () =>
+    connectors()
+      .filter((connector) => connector.active)
+      .reduce((total, connector) => total + connector.tool_count, 0);
+
+  return (
+    <section>
+      <div class="panel-head">
+        <h2>Connectors</h2>
+        <button class="ghost" disabled={loading()} onClick={() => void refresh()}>
+          Refresh
+        </button>
+      </div>
+      <p class="muted small">
+        Tools the agent can use. Install one, give it a credential, and its tools
+        appear on the next question you ask.
+      </p>
+
+      {/*
+        The tool-flood guardrail — and it says what was MEASURED, not what was
+        assumed. The assumption was that a small local model starts picking the
+        wrong tool as the list grows. It does not, at this size: with GitHub's 34
+        tools on top of the 28 built-ins, Qwen3-4B still answered 4/4 correctly
+        (`ic_integration_tests/tests/tool_flood.rs`).
+
+        What it costs is TIME. Every active connector's schemas ride in every
+        prompt, including the ones that need no tool at all, and the same four
+        questions went from ~3.6s to ~10.7s each. That is the honest warning to
+        give: not "your agent will get confused" but "your agent will get slower".
+      */}
+      <Show when={activeTools() > TOOL_FLOOD_WARNING}>
+        <p class="reason-inline">
+          The agent is carrying {activeTools()} tools, and every one of them is
+          described to the model on every question you ask — even the ones that
+          need no tool. Measured on a local Qwen3-4B: adding 34 tools made each
+          answer about 3× slower. Disable what you are not using, or run a
+          stronger model.
+        </p>
+      </Show>
+
+      <Show when={error()}>
+        <p class="reason-inline">{error()}</p>
+      </Show>
+
+      <ul class="rows">
+        <For each={connectors()}>
+          {(connector) => (
+            <li class="row connector">
+              <div class="model-card-main">
+                <span class="row-title">
+                  {connector.name}
+                  <Show when={connector.active}>
+                    {" "}
+                    <span class="badge ready">
+                      active · {connector.tool_count} tools
+                    </span>
+                  </Show>
+                  <Show when={connector.installed && !connector.active}>
+                    {" "}
+                    <span class="badge starting">installed</span>
+                  </Show>
+                  <Show when={connector.installed && !connector.ready}>
+                    {" "}
+                    <span class="badge unhealthy">needs a credential</span>
+                  </Show>
+                </span>
+                <span class="row-meta">{connector.description}</span>
+                <Show when={notice()[connector.id]}>
+                  {(message) => <p class="reason-inline">{message()}</p>}
+                </Show>
+
+                {/* An OAuth connector (Gmail, Drive, Notion) cannot be finished
+                    here, and pretending otherwise would be the cruellest kind of
+                    UI: a token box that accepts a paste and then never works. The
+                    gateway will not even begin the flow without an OAuth client
+                    registered with the vendor — it answers 503 (pinned by
+                    `connector_oauth.rs`) — and that client can only be created by a
+                    human, against a redirect URI Google matches exactly. So the row
+                    says what it needs and stops. */}
+                <Show when={connector.installed && !connector.ready && connector.auth_kind === "oauth"}>
+                  <p class="reason-inline">
+                    {connector.name} signs in with {connector.provider ?? "OAuth"},
+                    not with a token you can paste. That needs an OAuth client
+                    registered with {connector.provider ?? "the vendor"} and a fixed
+                    callback address — neither of which this build ships yet, so the
+                    agent cannot use {connector.name} today.
+                  </p>
+                  <Show when={connector.instructions}>
+                    {(text) => <p class="muted small">{text()}</p>}
+                  </Show>
+                </Show>
+
+                {/* The credential. Only asked for once the connector is installed,
+                    has told us it wants one, and can actually take a pasted token. */}
+                <Show
+                  when={
+                    connector.installed &&
+                    !connector.ready &&
+                    connector.provider &&
+                    connector.auth_kind !== "oauth"
+                  }
+                >
+                  <Show when={connector.setup_url}>
+                    {(url) => (
+                      <p class="muted small">
+                        <a href={url()} target="_blank" rel="noreferrer">
+                          Get a token →
+                        </a>
+                      </p>
+                    )}
+                  </Show>
+                  <div class="key-row">
+                    <input
+                      type="password"
+                      placeholder="Paste the token"
+                      value={token(connector.id)}
+                      onInput={(event) => setToken(connector.id, event.currentTarget.value)}
+                    />
+                    <button
+                      disabled={!token(connector.id).trim() || busy() === connector.id}
+                      onClick={() => void saveToken(connector)}
+                    >
+                      {busy() === connector.id ? "Saving…" : "Save & activate"}
+                    </button>
+                  </div>
+                </Show>
+              </div>
+
+              <Show
+                when={connector.installed}
+                fallback={
+                  <button
+                    disabled={busy() === connector.id}
+                    onClick={() => void install(connector)}
+                  >
+                    {busy() === connector.id ? "Installing…" : "Install"}
+                  </button>
+                }
+              >
+                <button
+                  class="ghost"
+                  disabled={busy() === connector.id}
+                  onClick={() => void toggle(connector, !connector.active)}
+                >
+                  {connector.active ? "Disable" : "Enable"}
+                </button>
+              </Show>
+            </li>
+          )}
+        </For>
+      </ul>
+    </section>
+  );
+}
+
+/**
  * Importing a third-party skill from a local folder (Phase 7c).
  *
  * The dashboard is where the review happens; the final yes lives on the
@@ -2519,8 +2777,23 @@ function SkillImportPanel() {
  * opens an empty panel is worse than no entry. The unavailable-panel list keeps
  * its own entry, with the reasons, because "no route exists" is information.
  */
+/**
+ * Past this many active tools, warn (Phase 8b).
+ *
+ * The runtime's built-ins are 28, and GitHub — the largest registry connector —
+ * adds 34, for 62. So this sits between "built-ins only" (never warn) and "one big
+ * connector" (warn), which is exactly where the measured cost appears:
+ * `tool_flood.rs` on a local Qwen3-4B saw answers stay **correct** at 62 tools but
+ * take ~3× longer, because every schema is re-sent on every turn.
+ *
+ * The number this constant originally carried claimed a measurement that had not
+ * been made, and claimed the wrong effect (bad tool choice). Both are now measured.
+ */
+const TOOL_FLOOD_WARNING = 45;
+
 const SECTIONS = [
   { id: "chats", label: "Chats" },
+  { id: "connectors", label: "Connectors" },
   { id: "automations", label: "Automations" },
   { id: "ambient", label: "Ambient" },
   { id: "voice", label: "Voice" },
@@ -2633,6 +2906,10 @@ function Dashboard() {
         <Show when={section() === "ambient"}>
           <AmbientPanel />
           <WatchersPanel />
+        </Show>
+
+        <Show when={section() === "connectors"}>
+          <ConnectorsPanel />
         </Show>
 
         <Show when={section() === "skills"}>

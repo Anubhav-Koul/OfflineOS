@@ -1750,3 +1750,132 @@ composes the service.
 
 Next: **8b — connectors**, whose first job is its own ⚠️ VERIFY: drive a registry
 connector to a *real tool call* before building any UI.
+
+## Phase 8b notes — connectors (recorded 2026-07-15)
+
+`crates/ic_widget` (`gateway_client`, `main.rs`, `character.rs`) + `crates/ic_llama`
+(`proxy.rs`) + `ui/` (`dashboard.tsx`, `widget.tsx`, `chat.ts`, `api.ts`) + three
+gates (`connector_verify.rs`, `connector_oauth.rs`, `tool_flood.rs`) + C5–C8 in
+`gateway-api-notes.md`. **No core patch.** The registry lane works as upstream built
+it; everything below is additive.
+
+### The ⚠️ VERIFY answered: the registry lane works, all the way to GitHub's API
+
+Install → credential → activate → **a real tool call that leaves the machine**. The
+proof is a `401`: with a deliberately bogus token, the WASM guest reaches
+`api.github.com` and GitHub refuses it (`github_api_error_status_401`). Registration,
+WASM execution, host egress, and credential injection are therefore all working —
+only the key was wrong. 34 GitHub tools reach the model.
+
+### Three things that were true, and none of them what I expected
+
+- **A bad credential does not fail a run. It *parks* it.** The runtime's answer to a
+  `401` is to raise an **auth gate** (`blocked_auth`) and wait, indefinitely, for a
+  better credential. A UI that waits for `completed` therefore spins forever and
+  looks like a hang — which is exactly what an earlier probe of mine concluded, and
+  it nearly became an upstream bug report. Compounding it: `serve` reads
+  **`IRONCLAW_REBORN_LOG`**, not `RUST_LOG`, so I had also been reading an empty log
+  and calling the runtime silent (C5). The gate payload names the run and the gate
+  but **not the connector** (C6), so the widget infers it from the last
+  `capability_activity` seen before the gate.
+- **The gate cannot be answered the documented way.** `/manual-token/submit` exists
+  precisely to answer a live gate — it demands `run_id` + `gate_ref` — and a
+  well-formed call against a real one returns a bare `400 invalid_request`, naming no
+  field, logging nothing. `/secret-submit` yields a `credential_ref` only on the
+  *first* call for a provider, so there is nothing to `resolve_gate` with either.
+  Rather than ship a button over a route that will not answer, the fix-it path is
+  built from primitives that are **proven**: store the new credential, cancel the
+  parked run, re-send the question. The user types their token once and gets their
+  answer; the turn re-runs rather than resumes. Pinned by
+  `a_parked_run_can_be_answered_and_resumed`. If upstream fixes submit, this collapses
+  back into a true resume.
+- **Installing GitHub made the local model stop answering — and it was our bug.**
+  With the connector active, *every* turn 400'd and no run ever terminated. Not
+  tool-flooding: llama.cpp **could not compile the grammar**. GitHub's `owner`/`repo`
+  properties carry `pattern: "[^\\s/?#]+"`; llama.cpp transcribes a JSON-Schema
+  `pattern` into GBNF verbatim; GBNF has no `\s`. And because *all* of a turn's tools
+  compile into **one** grammar, a single unsupported pattern in a single property of
+  a single tool takes down every tool call the model could have made. Fixed in the
+  CP-3 lane — `ic_llama`'s SchemaProxy now drops a `pattern` it cannot prove GBNF can
+  express, exactly as it already drops an oversized repetition bound (fail closed:
+  any `\` or `(?` and it goes). Same question, before: 240 s, no answer. After: 9.2 s,
+  correct.
+
+### The parser bug the whole suite agreed with
+
+`GET /extensions` returns a **flat** `RebornExtensionInfo` (`package_ref`, `active`,
+`tools`). The widget's type had been written from the *internal*
+`LifecycleInstalledExtensionSummary`, which nests all of that under `summary` — so
+`serde` rejected every response, and the Connectors panel would have listed nothing
+while blaming the gateway. The `summary` shape is real, but it belongs to a
+**different route** (`/extensions/{id}/setup`), which is how the confusion started.
+
+What let it through is the part worth keeping: the probe that "verified" the shape
+**printed** its parse instead of asserting it, and hand-walked the JSON — so a wrong
+belief was held in two places that agreed with each other and never met the wire. The
+gate now decodes a live response **through the type the widget ships**
+(`the_panels_parser_decodes_the_live_extensions_route`). *The Phase 4 lesson, a third
+time: a green suite can agree with you and still be wrong about the runtime. Drive the
+shipping code against the real thing, or all you have tested is your own beliefs.*
+
+### The tool-flood warning now says what was measured
+
+The constant carried a comment claiming a measurement that had never been made, and it
+claimed the wrong effect. `tool_flood.rs` (a real Qwen3-4B, GPU-offloaded) makes it
+honest: at 62 tools (28 built-in + GitHub's 34) the model still answered **4/4
+correctly** — it does not get confused. What it gets is **slow**: ~3.6 s → ~10.7 s per
+question, because every schema is re-sent on every turn, including the turns that need
+no tool at all. The panel says that now, and nothing more.
+
+### What the panel does
+
+Registry list → **Install** → credential → **Save & activate** → Enable/Disable, with
+the vendor's own onboarding copy rendered rather than ours. An **OAuth** connector
+shows what it needs and *stops* (below). A parked auth gate surfaces in **both**
+surfaces: a red card in the bubble carrying a token field and a Continue that actually
+recovers, plus the character in `concerned`. Never a spinner.
+
+### Where Gmail stops, exactly (item 5)
+
+It installs, its setup projection is complete (6 capabilities, `setup.kind: "oauth"`,
+3 scopes, a fresh `invocation_id`) — and `POST /extensions/gmail/setup/oauth/start`
+answers **503 `backend_unavailable`**, because `serve` builds its Google OAuth config
+from `IRONCLAW_REBORN_GOOGLE_CLIENT_ID` + `..._REDIRECT_URI` and there is none.
+
+That is not a bug to route around. A Google OAuth **client** can only be created by a
+human in the Cloud console; a client id baked into a public MSI would name *us* on a
+consent screen for someone else's mailbox, and restricted Gmail scopes need a review
+process, not a config value. And the registered **redirect URI** must match exactly,
+while the widget takes a *fresh port* for `serve` at every launch — so this needs a
+stable loopback callback before those variables are worth setting. Both are decisions
+with consequences; neither belongs in a commit that claims Gmail "works". Pinned, with
+the reasoning, by `connector_oauth.rs`. **8c work.**
+
+### The one link not proven end to end (item 4)
+
+The definition of done says GitHub answers "what are my newest repos" with a **real**
+token. Every link in that chain is verified except the last, and the last one is
+GitHub's: a valid PAT returning repositories instead of a `401`. That needs the user's
+own credential — theirs to paste into the panel, not mine to obtain, and not something
+worth faking in a test. The path it would travel is the one `connector_verify.rs`
+drives today.
+
+### Upstream tracking
+
+| Ref | What | State |
+|---|---|---|
+| [PR #6098](https://github.com/nearai/ironclaw/pull/6098) | CP-1: Windows directory fsync (upstream's own catalog test fails on Windows without it) | open |
+| [#6099](https://github.com/nearai/ironclaw/issues/6099) | `/llm/test-connection` reports `ok` for a dead endpoint with a junk key | open |
+| [#5998](https://github.com/nearai/ironclaw/issues/5998) | No transport for a local MCP server — **CP-4/CP-5 get deleted when this lands** | open |
+| [#5999](https://github.com/nearai/ironclaw/issues/5999) | `local-dev-yolo` cannot start on Windows | open |
+| [#6076](https://github.com/nearai/ironclaw/issues/6076) | Cancel does not abort the model's in-flight generation | open |
+| [#6000](https://github.com/nearai/ironclaw/issues/6000) | How to report a security finding (no `SECURITY.md`, private reporting disabled) | **unanswered** — so the Phase 4 `default_permission`-is-never-read finding stays undisclosed |
+
+Two findings from this phase are worth filing once #6000 is answered: the
+`/manual-token/submit` `400`, and the auth-gate payload that names no connector.
+
+Next: **8c — the runtime's own surfaces** (memory, skills, audit, run history), whose
+first job is its own ⚠️ VERIFY: all four have no HTTP route today
+(`docs/desktop/dashboard-gaps.md`), so establish what `serve` will and will not answer
+*before* designing a panel for any of them. Gmail's OAuth callback (a stable loopback
+port) belongs there too.

@@ -511,3 +511,104 @@ kind `duplicate` (`reborn_services.rs:703-710`).
 Both outcomes mean "the message was accepted exactly once". A client retrying a
 send whose response it never saw must treat `409` as success, not as an error to
 show the user. `ic_widget::Error::is_duplicate_action()` exists for this.
+
+---
+
+## Corrections — verified in Phase 8b (connectors), 2026-07-15
+
+### C5 — `serve` reads `IRONCLAW_REBORN_LOG`, **not** `RUST_LOG`
+
+`ironclaw_reborn_cli/src/runtime/mod.rs:34` —
+`EnvFilter::try_from_env("IRONCLAW_REBORN_LOG")`. Set `RUST_LOG` and the binary
+emits nothing but its startup banner.
+
+This is not cosmetic. An empty log next to a stalled run reads as a **wedged
+runtime**, and on that basis the Phase 8b probe was one step away from filing a
+false "WASM tool calls hang forever" bug upstream. The run was not wedged; it was
+parked on an auth gate (C6), and the log would have said so. **Turn the right
+variable on before concluding anything is broken.**
+
+### C6 — a failing credential parks the run on an auth gate; it does not fail it
+
+When a connector's tool call gets a `401` from its vendor, the runtime's answer is
+**not** to fail the run. It raises an `auth_required` gate and parks the run, so
+the user can supply a better credential and the turn can continue.
+
+A client that waits only for `"status":"completed"` therefore **waits forever**,
+and will render an endless spinner over a run that is quietly asking a question.
+
+The `auth_required` SSE payload, verified live:
+
+```jsonc
+{ "type": "auth_required",
+  "prompt": {
+    "turn_run_id":      "55b7f1e5-…",
+    "auth_request_ref": "gate:auth-auth-05aa915f…",   // ← this is the gate_ref
+    "headline":         "Authentication required",
+    "body":             "Authenticate to continue this run."
+  } }
+```
+
+**The prompt does not name the provider.** `headline` is a generic
+"Authentication required" — there is no `provider`, no `challenge_kind`, no
+`setup_url`, despite §4's table suggesting those fields exist. A client must infer
+*which* connector is asking from the `capability_activity` events on the same
+stream: the last `capability_id` before the gate (`github.search_repositories`)
+is the one that raised it. `ic_widget` does exactly this.
+
+### C7 — three manual-token routes, and picking the wrong one costs an afternoon
+
+Credentials for a connector do **not** go through `POST /extensions/{id}/setup`.
+They go through the product-auth lane, and there are three routes whose names
+invite confusion:
+
+| Route | Body | When |
+|---|---|---|
+| `POST /api/reborn/product-auth/manual-token/setup` | `{provider, account_label}` | **Step 1 always.** Mints an interaction. Returns `{interaction_id, invocation_id, expires_at}`. |
+| `POST /api/reborn/product-auth/manual-token/secret-submit` | `{interaction_id, invocation_id, token}` | **Step 2, from a settings page.** The standalone path. Returns `{credential_ref, status: "configured", continuation: {type: "setup_only"}}`. |
+| `POST /api/reborn/product-auth/manual-token/submit` | `{provider, account_label, token, run_id, gate_ref}` | **Step 2, answering an auth gate** (C6). Requires the parked run's ids — which is *why* it demands them. |
+
+Send a settings-page credential to `/submit` and it answers **422 `missing field
+run_id`**. Send a gate answer to `/secret-submit` and the parked run is never
+resumed. The `invocation_id` from step 1 must be carried back into step 2's scope
+or the host cannot re-derive the pending interaction.
+
+After `/submit` answers a gate, resolve it with
+`POST /threads/{t}/runs/{r}/gates/{gate_ref}/resolve` and
+`resolution: "credential_provided"` + the returned `credential_ref` — the raw
+token never goes near gate resolution.
+
+Whether a secret actually landed is readable from the setup projection:
+`GET /extensions/{id}/setup` → `secrets: [{ name: "github_runtime_token",
+provided: true|false, setup: { kind: "manual_token" } }]`.
+
+### C8 — the extension list and registry hide their ids one level down
+
+`GET /extensions/registry` → `{ "entries": [ { "package_ref": { "id": "github" },
+"kind": "wasm_tool" | "mcp_server" | "first_party", "display_name", "version",
+"installed" } ] }`. The id is under **`package_ref.id`**, not a top-level `id` —
+reading the wrong key reports an empty registry when ten entries are present.
+
+`GET /extensions` → `{ "extensions": [ { "package_ref": {"id"}, "display_name",
+"kind", "description", "active": bool, "authenticated": bool, "needs_setup": bool,
+"has_auth": bool, "tools": [ "github.get_repo", … ], "activation_status",
+"version", "onboarding": { … } } ] }`. **Flat**, and the capability ids are the
+**`tools`** array.
+
+> ⚠️ **This paragraph said the opposite when it was first written** — that the
+> entries were `{ phase, summary: { visible_capability_ids, … } }`. That is the
+> shape of the *internal* `LifecycleInstalledExtensionSummary`, not of the wire;
+> the route projects it into a flat `RebornExtensionInfo`
+> (`ironclaw_product_workflow/src/reborn_services/types.rs:363`) on the way out.
+> The widget's typed parser was written from this note, so `serde` rejected every
+> response and the Connectors panel would have listed nothing while blaming the
+> gateway. Nothing caught it because the probe that "verified" the shape *printed*
+> its parse instead of asserting it, and hand-walked the JSON — so a wrong belief
+> was held in two places that agreed with each other and never met the wire.
+> `connector_verify::the_panels_parser_decodes_the_live_extensions_route` now
+> decodes a live response **through the type the widget ships**, which is the only
+> version of this check that can fail for the right reason.
+
+`POST /extensions/install` returns the onboarding copy the UI should render:
+`{ awaiting_token, onboarding_state: "setup_required", instructions,
+onboarding: { credential_instructions, credential_next_step, setup_url } }`.

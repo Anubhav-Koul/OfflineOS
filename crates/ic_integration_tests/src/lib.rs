@@ -393,6 +393,15 @@ impl RebornServer {
         Self::start_inner(llm_env, None, String::new(), None).await
     }
 
+    /// [`RebornServer::start_with_llm`] over a caller-owned home, so a real model
+    /// can be driven against a home a connector was installed into.
+    pub async fn start_with_llm_in_home(
+        llm_env: Vec<(String, String)>,
+        home_root: &Path,
+    ) -> RebornServer {
+        Self::start_inner(llm_env, None, String::new(), Some(home_root.to_path_buf())).await
+    }
+
     async fn start_inner(
         llm_env: Vec<(String, String)>,
         mock: Option<MockLlm>,

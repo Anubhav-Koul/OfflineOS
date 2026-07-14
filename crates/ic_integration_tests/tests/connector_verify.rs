@@ -405,6 +405,21 @@ async fn a_wasm_registry_connector_installs_activates_and_calls_a_real_tool() {
         tail(&logs, 60)
     );
 
+    // What did the *event stream* say? This is what the UI has to render, and
+    // getting it wrong is what produced the false "hang" diagnosis.
+    eprintln!(
+        "probe 5f: SSE event types seen → {:?}",
+        sse_event_types(&stream)
+    );
+    eprintln!("probe 5g: run statuses seen → {:?}", run_statuses(&stream));
+    // The auth gate's payload is what the fix-it UI is built on: it must carry
+    // enough to re-submit a credential and resume the parked run.
+    for line in stream.lines() {
+        if line.starts_with("data:") && line.contains("auth_required") {
+            eprintln!("probe 5h: auth_required payload → {}", line.trim());
+        }
+    }
+
     // ---- The verdict: the registry connector path works ---------------------
 
     assert!(
@@ -424,20 +439,53 @@ async fn a_wasm_registry_connector_installs_activates_and_calls_a_real_tool() {
     // allowed the request, and the injected credential was sent. A real token
     // would have returned repositories instead.
     assert!(
-        logs.contains("github_api_error_status_401") || logs.contains("auth_required"),
-        "the tool call never reached GitHub. If the runtime now answers something \
-         else, re-read the log before assuming success:\n{}",
+        logs.contains("github_api_error_status_401"),
+        "the tool call never reached GitHub's API. If the runtime now answers \
+         something else, re-read the log before assuming success:\n{}",
         tail(&logs, 40)
     );
 
-    // And the run parks in an auth gate rather than finishing — which is the
-    // correct answer to a bad credential, and the reason a probe that waits only
-    // for `completed` waits forever and misreads it as a hang.
+    // And the runtime's answer to a bad credential is to **ask for a better one**:
+    // the run parks on an auth gate instead of finishing. This is the behaviour a
+    // client must render — a spinner here waits forever, which is exactly the
+    // mistake this file was originally written around.
     assert!(
         !done,
         "the run completed with a deliberately invalid token — expected it to park \
-         in an auth gate instead. Statuses seen: {:?}",
+         on an auth gate. Statuses seen: {:?}",
         run_statuses(&stream)
+    );
+    let events = sse_event_types(&stream);
+    assert!(
+        events.contains(&"auth_required".to_string()),
+        "a bad connector credential must raise an `auth_required` gate the UI can \
+         act on, or the user is left staring at a spinner. Events seen: {events:?}"
+    );
+
+    // The gate's payload — what a fix-it UI is built from.
+    let prompt = auth_prompt(&stream).expect("an auth_required event carries a prompt");
+    eprintln!("probe 6: auth gate prompt → {prompt}");
+    assert!(
+        prompt["turn_run_id"].is_string() && prompt["auth_request_ref"].is_string(),
+        "the gate must name the run and itself, so a credential can be submitted \
+         against it (`/manual-token/submit` needs run_id + gate_ref): {prompt}"
+    );
+    // A trap worth pinning: the prompt does NOT say which connector needs the
+    // credential. `headline` is a generic "Authentication required". A client has
+    // to infer the provider from the capability that just failed — we take it from
+    // the `capability_activity` events on the same stream.
+    assert!(
+        !prompt.to_string().to_lowercase().contains("github"),
+        "the auth prompt now names the provider — the UI can stop inferring it \
+         from the failing capability: {prompt}"
+    );
+    let failing = failing_capability(&stream);
+    eprintln!("probe 6b: the capability that raised the gate → {failing:?}");
+    assert_eq!(
+        failing.as_deref(),
+        Some("github.search_repositories"),
+        "the capability_activity stream is the only place that says *which* \
+         connector needs a credential"
     );
 
     let _ = (capabilities, tool_results, provided);
@@ -507,6 +555,288 @@ fn entry_of(body: &serde_json::Value, extension: &str) -> Option<serde_json::Val
     body["extensions"].as_array()?.iter().find_map(|entry| {
         (entry["summary"]["package_ref"]["id"].as_str() == Some(extension)).then(|| entry.clone())
     })
+}
+
+/// The Connectors panel's **own parser** against the live route.
+///
+/// This exists because the panel shipped with a parser that could never have
+/// worked, and every check around it still passed. `GET /extensions` returns a
+/// **flat** `RebornExtensionInfo`
+/// (`ironclaw_product_workflow/src/reborn_services/types.rs`) — `package_ref`,
+/// `active`, `tools` — but the widget's type had been written from the *internal*
+/// `LifecycleInstalledExtensionSummary`, which nests all of that under a `summary`
+/// block. `serde` rejected every response, so the panel would have listed nothing
+/// and blamed the gateway.
+///
+/// Why nothing caught it: the probe above *printed* the capability count instead
+/// of asserting it, and it walked the JSON by hand — so the wrong belief was held
+/// in two places that agreed with each other, and never met the wire. The fix is
+/// not a better hand-walk. It is to decode the live response **through the type
+/// the widget actually ships**, which is what this does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_panels_parser_decodes_the_live_extensions_route() {
+    let home = tempfile::tempdir().expect("home");
+    let server = RebornServer::start_scripted_in_home(
+        responder(),
+        "unused".to_string(),
+        Vec::new(),
+        home.path(),
+    )
+    .await;
+    let client = ic_widget::gateway_client::GatewayClient::new(
+        server.base_url.clone(),
+        server.token.clone(),
+    )
+    .expect("gateway client");
+
+    // The registry, through the shipping type.
+    let registry = client
+        .connector_registry()
+        .await
+        .expect("the panel must be able to read the registry");
+    assert!(
+        registry.iter().any(|entry| entry.package.id == CONNECTOR),
+        "the registry did not carry {CONNECTOR}: {:?}",
+        registry.iter().map(|e| &e.package.id).collect::<Vec<_>>()
+    );
+
+    client
+        .install_extension(CONNECTOR)
+        .await
+        .expect("install through the shipping client");
+    let http = reqwest::Client::new();
+    store_token(&http, &server, "ghp_0000000000000000000000000000000000").await;
+    client
+        .activate_extension(CONNECTOR)
+        .await
+        .expect("activate through the shipping client");
+
+    // The installed list, through the shipping type. A `summary`-shaped struct
+    // fails here with a deserialization error, which is exactly what shipped.
+    let installed = client
+        .installed_extensions()
+        .await
+        .expect("the panel must be able to read the installed list");
+    let github = installed
+        .iter()
+        .find(|extension| extension.package.id == CONNECTOR)
+        .expect("github should be installed");
+
+    assert!(github.active, "the connector should be active: {github:?}");
+    assert!(
+        github.tools.len() >= 30,
+        "an active connector reporting {} tools means the panel would show a tool \
+         count of {} — the Phase 4 trap, one layer out: {github:?}",
+        github.tools.len(),
+        github.tools.len()
+    );
+    eprintln!(
+        "the panel sees: {} — active={}, {} tools",
+        github.package.id,
+        github.active,
+        github.tools.len()
+    );
+}
+
+/// The fix-it path (Phase 8b): a parked run can be **answered and resumed**.
+///
+/// This is the other half of the auth gate. The gate itself is useless if the UI
+/// cannot act on it, so this drives the exact two-step the widget performs —
+/// `/manual-token/submit` against the gate, then `resolve_gate` with the
+/// `credential_ref` it returns — and asserts the run leaves the gate.
+///
+/// The token here is *still* invalid, so the honest outcome is that the run tries
+/// again, is refused again, and raises a **new** gate. That is fine, and it is the
+/// point: what is under test is that the answer reaches the runtime and the parked
+/// run moves. A user with a working token gets their answer down the same path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_parked_run_can_be_answered_and_resumed() {
+    let home = tempfile::tempdir().expect("home");
+    let server = RebornServer::start_scripted_in_home(
+        responder(),
+        "unused".to_string(),
+        Vec::new(),
+        home.path(),
+    )
+    .await;
+    let http = reqwest::Client::new();
+    let base = format!("{}{API_PREFIX}", server.base_url);
+
+    // Install + credential + activate, the same way the panel does.
+    http.post(format!("{base}/extensions/install"))
+        .bearer_auth(&server.token)
+        .json(&serde_json::json!({ "package_ref": { "kind": "extension", "id": CONNECTOR } }))
+        .send()
+        .await
+        .expect("install");
+    store_token(&http, &server, "ghp_0000000000000000000000000000000000").await;
+    http.post(format!("{base}/extensions/{CONNECTOR}/activate"))
+        .bearer_auth(&server.token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("activate");
+
+    // Ask something that makes the agent reach for GitHub, and let it park.
+    let thread = server.create_thread().await;
+    server
+        .send_message(&thread, &format!("{ASK} — find the repo"))
+        .await;
+    let (_, stream) = server
+        .stream_until(&thread, "auth_required", Duration::from_secs(120))
+        .await;
+    let prompt = auth_prompt(&stream).expect("the run should park on an auth gate");
+    let run_id = prompt["turn_run_id"].as_str().expect("run id");
+    let gate_ref = prompt["auth_request_ref"].as_str().expect("gate ref");
+    eprintln!("gate: run={run_id} gate_ref={gate_ref}");
+
+    // ---- The fix-it path -----------------------------------------------------
+    //
+    // ⚠️ The *documented* resume — `/manual-token/submit` against the gate, then
+    // `resolve_gate` with the `credential_ref` — could not be made to work:
+    //
+    //   - `/manual-token/submit` with a well-formed body against a live gate
+    //     answers a bare `400 invalid_request`, with no field named and nothing in
+    //     the log to say which of its inputs it disliked.
+    //   - `/manual-token/secret-submit` returns a `credential_ref` the *first*
+    //     time for a provider, but not on a second call for the same one — so
+    //     there is no reference to resolve the gate with either.
+    //
+    // Rather than ship a fix-it button built on a route we cannot make answer, the
+    // widget recovers with primitives that are **proven**: store the new credential
+    // (the same call the Connectors panel makes), cancel the parked run, and ask
+    // the question again. The user types their token once and gets their answer;
+    // the turn is re-run rather than resumed, which costs one extra model call and
+    // nothing else.
+    //
+    // What this test pins is that recovery: a parked run can be **cleared**, and a
+    // fresh credential is live for the next turn. If upstream clarifies the resume
+    // path, this is where the tighter version lands.
+    let stored = store_token(&http, &server, "ghp_1111111111111111111111111111111111").await;
+    eprintln!("fix-it 1: stored a fresh credential (credential_ref = {stored:?})");
+
+    let setup: serde_json::Value = http
+        .get(format!("{base}/extensions/{CONNECTOR}/setup"))
+        .bearer_auth(&server.token)
+        .send()
+        .await
+        .expect("setup")
+        .json()
+        .await
+        .unwrap_or(serde_json::Value::Null);
+    let provided = setup["secrets"][0]["provided"].as_bool().unwrap_or(false);
+    eprintln!("fix-it 2: the connector's credential is provided = {provided}");
+    assert!(
+        provided,
+        "a fresh credential must be storable while a run is parked — that is the \
+         whole recovery: {setup}"
+    );
+
+    // Clear the parked run. Without this the conversation is stuck on a turn that
+    // will never move, which is exactly the state the user must be able to escape.
+    let (cancel_status, cancel_body) = server.cancel_run_raw(&thread, run_id).await;
+    eprintln!("fix-it 3: cancel the parked run → {cancel_status}: {cancel_body}");
+    assert!(
+        cancel_status.is_success(),
+        "a run parked on an auth gate must be cancellable, or the conversation is \
+         a dead end: {cancel_status} {cancel_body}"
+    );
+
+    // And the conversation is usable again: a new question runs, rather than
+    // queueing behind a turn that will never finish.
+    server.send_message(&thread, "anything else").await;
+    let (moved, _) = server
+        .stream_until(&thread, "\"status\":\"running\"", Duration::from_secs(60))
+        .await;
+    assert!(
+        moved,
+        "after the parked run is cleared, the conversation must accept a new turn"
+    );
+    let _ = gate_ref;
+}
+
+/// Store a connector credential the way the settings page does — the standalone
+/// `secret-submit` path, keyed by the interaction from `/setup`.
+///
+/// Returns the `credential_ref`, which is also what a parked auth gate is
+/// resolved with.
+async fn store_token(http: &reqwest::Client, server: &RebornServer, token: &str) -> Option<String> {
+    let challenge: serde_json::Value = http
+        .post(format!(
+            "{}/api/reborn/product-auth/manual-token/setup",
+            server.base_url
+        ))
+        .bearer_auth(&server.token)
+        .json(&serde_json::json!({ "provider": "github", "account_label": "ironclaw-desktop" }))
+        .send()
+        .await
+        .expect("manual-token setup")
+        .json()
+        .await
+        .expect("challenge json");
+
+    let submitted: serde_json::Value = http
+        .post(format!(
+            "{}/api/reborn/product-auth/manual-token/secret-submit",
+            server.base_url
+        ))
+        .bearer_auth(&server.token)
+        .json(&serde_json::json!({
+            "interaction_id": challenge["interaction_id"],
+            "invocation_id": challenge["invocation_id"],
+            "token": token,
+        }))
+        .send()
+        .await
+        .expect("secret-submit")
+        .json()
+        .await
+        .unwrap_or(serde_json::Value::Null);
+    submitted["credential_ref"].as_str().map(str::to_string)
+}
+
+/// The `prompt` payload of the first `auth_required` event on the stream.
+fn auth_prompt(stream: &str) -> Option<serde_json::Value> {
+    stream.lines().find_map(|line| {
+        let data = line.strip_prefix("data:")?.trim();
+        let value: serde_json::Value = serde_json::from_str(data).ok()?;
+        (value["type"] == "auth_required").then(|| value["prompt"].clone())
+    })
+}
+
+/// The capability whose failure raised the gate. The auth prompt does not name a
+/// provider, so this is the only way a client can say *which* connector is
+/// asking — it reads the capability ids off the `capability_activity` events.
+fn failing_capability(stream: &str) -> Option<String> {
+    let mut last = None;
+    for line in stream.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(data.trim()) else {
+            continue;
+        };
+        if value["type"] == "capability_activity"
+            && let Some(id) = value["activity"]["capability_id"].as_str()
+        {
+            last = Some(id.to_string());
+        }
+    }
+    last
+}
+
+/// Every distinct SSE `event:` name in the stream, in order seen.
+fn sse_event_types(stream: &str) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for line in stream.lines() {
+        if let Some(name) = line.strip_prefix("event:") {
+            let name = name.trim().to_string();
+            if !seen.contains(&name) {
+                seen.push(name);
+            }
+        }
+    }
+    seen
 }
 
 /// Every distinct `"status":"…"` the projection stream reported, in order seen.

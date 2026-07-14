@@ -763,6 +763,218 @@ async fn provider_settings(
     })
 }
 
+// ------------------------------------------------------------- connectors
+
+/// One row in the Connectors panel (Phase 8b).
+///
+/// Merged from two routes, because neither alone is enough: the registry says
+/// what *can* be installed, and `/extensions` says what *is* — with its phase,
+/// its published capabilities, and what it still needs.
+#[derive(Serialize)]
+struct UiConnector {
+    id: String,
+    name: String,
+    description: String,
+    /// `wasm_tool`, `mcp_server`, or `first_party`.
+    kind: Option<String>,
+    installed: bool,
+    /// `installed` (present) vs `active` (its tools actually reach the model).
+    active: bool,
+    /// How many tools it gives the agent. Zero on an active connector means
+    /// something is wrong, whatever the activate call claimed (the Phase 4 trap).
+    tool_count: usize,
+    /// The auth provider its credential belongs to, e.g. `github`.
+    provider: Option<String>,
+    /// `manual_token` — the user pastes a string, which the panel can do. `oauth` —
+    /// it cannot: the gateway will not even start that flow without a Google/Notion
+    /// OAuth client, which only a human can register with the vendor. The panel
+    /// branches on this rather than offering a token box that could never work.
+    auth_kind: Option<String>,
+    /// Whether every required secret has been provided.
+    ready: bool,
+    /// The vendor's own words: what the credential is, where to get it.
+    instructions: Option<String>,
+    setup_url: Option<String>,
+}
+
+/// The connectors: what the gateway offers, and what is installed.
+#[tauri::command]
+async fn list_connectors(state: tauri::State<'_, AppState>) -> Result<Vec<UiConnector>, String> {
+    let client = state.client().await?;
+    let registry = client.connector_registry().await.map_err(user_facing)?;
+    let installed = client.installed_extensions().await.map_err(user_facing)?;
+
+    let mut connectors = Vec::with_capacity(registry.len());
+    for entry in registry {
+        let id = entry.package.id.clone();
+        let live = installed
+            .iter()
+            .find(|extension| extension.package.id == id);
+
+        // A connector is only *ready* when every required secret is provided —
+        // and the setup projection is the only place that says so honestly. It is
+        // also the only place that says *how* the credential is obtained.
+        let (provider, auth_kind, ready) = match live {
+            Some(_) => {
+                let setup = client.extension_setup(&id).await.ok();
+                let secrets = setup.map(|setup| setup.secrets).unwrap_or_default();
+                let provider = secrets.iter().find_map(|secret| secret.provider.clone());
+                let auth_kind = secrets
+                    .iter()
+                    .find_map(|secret| secret.setup.as_ref()?.kind.clone());
+                let ready = secrets
+                    .iter()
+                    .all(|secret| secret.provided || secret.optional);
+                (provider, auth_kind, ready)
+            }
+            None => (None, None, false),
+        };
+
+        let onboarding = live.and_then(|extension| extension.onboarding.clone());
+
+        connectors.push(UiConnector {
+            name: entry.display_name.clone().unwrap_or_else(|| id.clone()),
+            description: entry.description.clone().unwrap_or_default(),
+            kind: entry.kind.clone(),
+            installed: live.is_some(),
+            active: live.is_some_and(|extension| extension.active),
+            tool_count: live.map(|extension| extension.tools.len()).unwrap_or(0),
+            provider,
+            auth_kind,
+            ready,
+            instructions: onboarding
+                .as_ref()
+                .and_then(|copy| copy.credential_instructions.clone()),
+            setup_url: onboarding.as_ref().and_then(|copy| copy.setup_url.clone()),
+            id,
+        });
+    }
+    Ok(connectors)
+}
+
+/// Install a connector. Returns the vendor's onboarding copy, which the panel
+/// renders rather than inventing its own.
+#[derive(Serialize)]
+struct UiInstallOutcome {
+    awaiting_token: bool,
+    message: Option<String>,
+    instructions: Option<String>,
+    setup_url: Option<String>,
+    next_step: Option<String>,
+}
+
+#[tauri::command]
+async fn install_connector(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<UiInstallOutcome, String> {
+    let client = state.client().await?;
+    let outcome = client.install_extension(&id).await.map_err(user_facing)?;
+    let onboarding = outcome
+        .onboarding
+        .unwrap_or(ic_widget::gateway_client::Onboarding {
+            credential_instructions: None,
+            credential_next_step: None,
+            setup_url: None,
+            instructions: None,
+        });
+    Ok(UiInstallOutcome {
+        awaiting_token: outcome.awaiting_token,
+        message: outcome.message,
+        instructions: onboarding
+            .credential_instructions
+            .or(onboarding.instructions),
+        setup_url: onboarding.setup_url,
+        next_step: onboarding.credential_next_step,
+    })
+}
+
+/// Save a connector's credential.
+///
+/// **Not `settings.json`.** The token goes straight to the gateway's own secrets
+/// vault through the product-auth lane and is never written by us; the widget
+/// keeps no copy. Activation follows, because a credential the agent cannot use
+/// yet is not a finished job.
+#[tauri::command]
+async fn set_connector_token(
+    state: tauri::State<'_, AppState>,
+    provider: String,
+    id: String,
+    token: String,
+) -> Result<bool, String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("Paste the token first.".to_string());
+    }
+    let client = state.client().await?;
+    client
+        .store_connector_token(&provider, token)
+        .await
+        .map_err(user_facing)?;
+    // "After saving the token, activate to publish its tools" — the gateway's own
+    // instruction, so do it rather than leaving the user a second button.
+    let activated = client.activate_extension(&id).await.map_err(user_facing)?;
+    Ok(activated)
+}
+
+/// Clear the auth gate a run is parked on, so the question can be asked again.
+///
+/// The fix-it path for the state the user actually hits: they connected GitHub
+/// with a token that has since expired, asked a question, and the agent stopped.
+/// One button: store the new credential, then drop the run that is waiting on the
+/// old one. The frontend still holds the question and re-sends it, and this time
+/// the tool call succeeds.
+///
+/// This is deliberately not the documented gate-resume route. See
+/// `GatewayClient::recover_auth_gate` for why that one could not be made to
+/// answer, and what is proven in its place.
+#[tauri::command]
+async fn recover_auth_gate(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    provider: String,
+    token: String,
+    thread_id: String,
+    run_id: String,
+) -> Result<(), String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("Paste the token first.".to_string());
+    }
+    let client = state.client().await?;
+    let thread_id = ThreadId::new(thread_id).map_err(user_facing)?;
+    let run_id = RunId::new(run_id).map_err(user_facing)?;
+
+    client
+        .recover_auth_gate(&provider, token, &thread_id, &run_id)
+        .await
+        .map_err(user_facing)?;
+    update_character(&app, |inputs| inputs.auth_gate_pending = false).await;
+    Ok(())
+}
+
+/// Publish a connector's tools to the agent, or take them away.
+///
+/// Disable is `remove`, which is the only lever the API offers — but a removed
+/// connector keeps its stored credential, so re-enabling is one click and not a
+/// re-setup.
+#[tauri::command]
+async fn set_connector_enabled(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let client = state.client().await?;
+    match enabled {
+        true => {
+            client.install_extension(&id).await.map_err(user_facing)?;
+            client.activate_extension(&id).await.map_err(user_facing)?;
+        }
+        false => client.remove_extension(&id).await.map_err(user_facing)?,
+    }
+    Ok(())
+}
+
 /// Does this key work, and what can it run? (Phase 8a.5)
 ///
 /// Asked of the **provider itself**, from this process. The gateway cannot
@@ -1297,6 +1509,26 @@ enum ChatEvent {
         capability_id: String,
         status: String,
     },
+    /// A connector's credential was refused and the run is **parked** waiting for
+    /// a better one (Phase 8b).
+    ///
+    /// This is the event that must never become a spinner. The runtime's answer
+    /// to a bad connector credential is not to fail the turn — it raises this and
+    /// waits, indefinitely, for an answer that only the UI can provide.
+    AuthGate {
+        run_id: String,
+        /// `auth_request_ref` — what the resolve and manual-token-submit routes
+        /// want as their `gate_ref`.
+        gate_ref: String,
+        headline: String,
+        body: String,
+        /// Which connector is asking. The gateway **does not say** — this is
+        /// inferred from the capability that failed just before the gate, which
+        /// is the only place the answer exists.
+        connector: Option<String>,
+        /// Its auth provider, for the manual-token routes.
+        provider: Option<String>,
+    },
     StreamError {
         reason: String,
     },
@@ -1308,6 +1540,9 @@ enum ChatEvent {
 /// the app exits, or the stream fails terminally.
 async fn pump_events(app: AppHandle, client: GatewayClient, thread_id: ThreadId) {
     let mut stream = client.events(thread_id.clone());
+    // The last capability the agent ran. An `auth_required` gate does not say
+    // which connector wants the credential, so this is the only answer.
+    let mut last_capability: Option<String> = None;
     while let Some(event) = stream.next().await {
         let translated = match event {
             Ok(GatewayEvent::ProjectionSnapshot(state) | GatewayEvent::ProjectionUpdate(state)) => {
@@ -1348,15 +1583,43 @@ async fn pump_events(app: AppHandle, client: GatewayClient, thread_id: ThreadId)
                 headline: prompt.headline,
                 body: prompt.body,
             },
-            Ok(GatewayEvent::CapabilityActivity(activity)) => ChatEvent::Activity {
-                capability_id: activity.capability_id,
-                status: activity.status,
-            },
+            Ok(GatewayEvent::CapabilityActivity(activity)) => {
+                // Remember it: when an auth gate arrives moments later, this is
+                // the *only* record of which connector raised it.
+                last_capability = Some(activity.capability_id.clone());
+                ChatEvent::Activity {
+                    capability_id: activity.capability_id,
+                    status: activity.status,
+                }
+            }
+            Ok(GatewayEvent::AuthRequired(prompt)) => {
+                // The prompt names no provider (verified — `headline` is a
+                // generic "Authentication required"), so infer the connector from
+                // the capability that just failed: `github.search_repositories`
+                // → `github`.
+                let connector = last_capability
+                    .as_deref()
+                    .and_then(|id| id.split('.').next())
+                    .map(str::to_string);
+                tracing::info!(
+                    run = %prompt.turn_run_id,
+                    connector = ?connector,
+                    "a run is parked on an auth gate; the user must supply a credential"
+                );
+                update_character(&app, |inputs| inputs.auth_gate_pending = true).await;
+                ChatEvent::AuthGate {
+                    run_id: prompt.turn_run_id.to_string(),
+                    gate_ref: prompt.auth_request_ref,
+                    headline: prompt.headline,
+                    body: prompt.body,
+                    provider: prompt.provider.clone().or_else(|| connector.clone()),
+                    connector,
+                }
+            }
             Ok(GatewayEvent::Error(error)) => ChatEvent::StreamError {
                 reason: format!("The agent's event stream failed ({}).", error.kind),
             },
-            // `keep_alive`, previews, auth prompts, and unknown events are not
-            // rendered by the Phase 2a widget.
+            // `keep_alive`, previews, and unknown events are not rendered.
             Ok(_) => continue,
             Err(error) => {
                 tracing::warn!(%error, "the chat event stream ended");
@@ -3745,6 +4008,11 @@ fn main() {
             set_thread_hidden,
             use_thread,
             test_provider,
+            list_connectors,
+            install_connector,
+            set_connector_token,
+            set_connector_enabled,
+            recover_auth_gate,
             respond_suggestion,
             needs_setup,
             profile,

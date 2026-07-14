@@ -53,6 +53,23 @@ export type ChatEvent =
       failure_summary: string | null;
     }
   | { kind: "gate"; run_id: string; gate_ref: string; headline: string; body: string }
+  | {
+      /**
+       * A connector's credential was refused and the run is **parked** (Phase 8b).
+       *
+       * The one event that must never become a spinner: the runtime answers a bad
+       * connector credential by stopping and waiting, indefinitely, for a better
+       * one. `connector` is inferred from the capability that failed — the gateway
+       * does not say who is asking.
+       */
+      kind: "auth_gate";
+      run_id: string;
+      gate_ref: string;
+      headline: string;
+      body: string;
+      connector: string | null;
+      provider: string | null;
+    }
   | { kind: "activity"; capability_id: string; status: string }
   | { kind: "stream_error"; reason: string };
 
@@ -337,6 +354,42 @@ export interface Suggestion {
   thread_id: string | null;
 }
 
+/**
+ * A connector (Phase 8b): a tool the agent can be given, from the gateway's own
+ * registry. `active` means its tools actually reach the model — `installed`
+ * alone does not.
+ */
+export interface Connector {
+  id: string;
+  name: string;
+  description: string;
+  /** `wasm_tool`, `mcp_server`, or `first_party`. */
+  kind: string | null;
+  installed: boolean;
+  active: boolean;
+  /** How many tools it gives the agent. Zero on an active connector is a bug. */
+  tool_count: number;
+  /** The auth provider its credential belongs to, e.g. `github`. */
+  provider: string | null;
+  /** `manual_token` (the user can paste it) or `oauth` (they cannot — the gateway
+   *  refuses to start that flow without a vendor-registered OAuth client). */
+  auth_kind: string | null;
+  /** Whether every required secret has been supplied. */
+  ready: boolean;
+  /** The vendor's own words — what the credential is. */
+  instructions: string | null;
+  setup_url: string | null;
+}
+
+/** What installing a connector reports back — the vendor's onboarding copy. */
+export interface InstallOutcome {
+  awaiting_token: boolean;
+  message: string | null;
+  instructions: string | null;
+  setup_url: string | null;
+  next_step: string | null;
+}
+
 /** What the app reports after an approved skill draft's install attempt. */
 export interface SkillInstallResult {
   ok: boolean;
@@ -456,6 +509,21 @@ export const api = {
     invoke<void>("clear_provider_key", { providerId }),
   applyProvider: (selection: ProviderSelection) =>
     invoke<void>("apply_provider", { selection }),
+  /** The connectors the gateway offers, and what is installed. */
+  listConnectors: () => invoke<Connector[]>("list_connectors"),
+  /** Install a connector; returns the vendor's onboarding copy to render. */
+  installConnector: (id: string) => invoke<InstallOutcome>("install_connector", { id }),
+  /** Save a connector's credential (straight to the gateway's secrets vault,
+   *  never settings.json) and activate it. Returns whether it activated. */
+  setConnectorToken: (provider: string, id: string, token: string) =>
+    invoke<boolean>("set_connector_token", { provider, id, token }),
+  /** Publish a connector's tools to the agent, or take them away. */
+  setConnectorEnabled: (id: string, enabled: boolean) =>
+    invoke<void>("set_connector_enabled", { id, enabled }),
+  /** Store a connector's new credential and clear the run parked on the old one.
+   *  The caller re-asks the question afterwards — see `chat.ts::answerAuthGate`. */
+  recoverAuthGate: (provider: string, token: string, threadId: string, runId: string) =>
+    invoke<void>("recover_auth_gate", { provider, token, threadId, runId }),
   /** Ask the provider itself whether the key works, and what it can run.
    *  `key` is only sent when testing one the user is still typing; otherwise the
    *  stored key is used and never leaves the Rust side. */

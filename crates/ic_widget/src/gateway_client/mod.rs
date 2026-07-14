@@ -146,16 +146,49 @@ impl GatewayClient {
         Ok(response.automations)
     }
 
+    /// The connectors the gateway ships in its registry (Phase 8b).
+    ///
+    /// Ids live under **`package_ref.id`**, not a top-level `id` — see C8 in
+    /// `gateway-api-notes.md`. Reading the wrong key reports an empty registry
+    /// while ten entries sit there.
+    pub async fn connector_registry(&self) -> Result<Vec<RegistryEntry>> {
+        let response: RegistryResponse = self.get("/extensions/registry").await?;
+        Ok(response.entries)
+    }
+
+    /// The extensions currently installed, with their phase and capabilities.
+    pub async fn installed_extensions(&self) -> Result<Vec<InstalledExtension>> {
+        let response: InstalledResponse = self.get("/extensions").await?;
+        Ok(response.extensions)
+    }
+
     /// Install an extension the gateway found in its catalogue.
     ///
     /// The catalogue is scanned **once, at gateway boot**, so this only works for
     /// a manifest that was already on disk when the process started. Installing
     /// an extension that is already installed is not an error.
-    pub async fn install_extension(&self, id: &str) -> Result<()> {
+    ///
+    /// The response carries the **onboarding copy the UI should show**: what the
+    /// credential is, where to get it, and what to do next. Rendering the vendor's
+    /// own words beats inventing our own.
+    pub async fn install_extension(&self, id: &str) -> Result<InstallOutcome> {
         let body = serde_json::json!({
             "package_ref": { "kind": "extension", "id": id },
         });
-        let _: serde_json::Value = self.post("/extensions/install", &body).await?;
+        self.post("/extensions/install", &body).await
+    }
+
+    /// What a connector still needs before it can run: which secrets, and whether
+    /// each is already provided.
+    pub async fn extension_setup(&self, id: &str) -> Result<ExtensionSetup> {
+        self.get(&format!("/extensions/{id}/setup")).await
+    }
+
+    /// Remove an installed connector.
+    pub async fn remove_extension(&self, id: &str) -> Result<()> {
+        let _: serde_json::Value = self
+            .post(&format!("/extensions/{id}/remove"), &serde_json::json!({}))
+            .await?;
         Ok(())
     }
 
@@ -195,6 +228,101 @@ impl GatewayClient {
     pub async fn extension_capabilities(&self, id: &str) -> Result<Vec<String>> {
         let response: serde_json::Value = self.get("/extensions").await?;
         Ok(capability_ids_of(&response, id))
+    }
+
+    // ------------------------------------------------- connector credentials
+    //
+    // A connector's credential does NOT go through `/extensions/{id}/setup`. It
+    // goes through the product-auth lane, which lives outside the WebChat prefix,
+    // and there are three routes whose names invite exactly the wrong choice
+    // (C7 in `gateway-api-notes.md`):
+    //
+    //   /manual-token/setup          — step 1, always. Mints an interaction.
+    //   /manual-token/secret-submit  — step 2 from a settings page (standalone).
+    //   /manual-token/submit         — step 2 answering a parked run's auth gate;
+    //                                  requires run_id + gate_ref, and answers
+    //                                  `422 missing field run_id` without them.
+    //
+    // Both step-2 routes are wrapped below so a caller picks by *intent*, not by
+    // guessing at a URL.
+
+    /// Step 1: ask the gateway for a credential interaction to submit against.
+    async fn manual_token_setup(&self, provider: &str) -> Result<TokenChallenge> {
+        let body = serde_json::json!({
+            "provider": provider,
+            "account_label": "ironclaw-desktop",
+        });
+        self.post_product_auth("/manual-token/setup", &body).await
+    }
+
+    /// Store a connector's credential from the settings page.
+    ///
+    /// This is the standalone path — no run is waiting on it. The raw token rides
+    /// its own dedicated body and is never echoed back; only a `credential_ref`
+    /// comes home.
+    pub async fn store_connector_token(&self, provider: &str, token: &str) -> Result<()> {
+        let challenge = self.manual_token_setup(provider).await?;
+        let body = serde_json::json!({
+            "interaction_id": challenge.interaction_id,
+            "invocation_id": challenge.invocation_id,
+            "token": token,
+        });
+        let _: serde_json::Value = self
+            .post_product_auth("/manual-token/secret-submit", &body)
+            .await?;
+        Ok(())
+    }
+
+    /// Recover from a parked auth gate: store the new credential, then clear the
+    /// run that is waiting on the old one. The caller re-asks the question.
+    ///
+    /// This is *not* the documented resume path, and that is deliberate. The
+    /// documented one — `POST /manual-token/submit` against the gate (it takes
+    /// `run_id` + `gate_ref` for exactly this), then `resolve_gate` with the
+    /// `credential_ref` it hands back — could not be made to answer: a well-formed
+    /// submit against a live gate returns a bare `400 invalid_request` naming no
+    /// field, with nothing in the gateway's log to say what it disliked; and
+    /// `/secret-submit` yields a `credential_ref` only on the *first* call for a
+    /// provider, so a second call leaves nothing to resolve the gate with either.
+    ///
+    /// Rather than ship a button over a route we cannot make work, recovery is
+    /// built from primitives that are *proven* (pinned by
+    /// `ic_integration_tests/tests/connector_verify.rs`): the fresh credential is
+    /// stored (the connector reports `provided: true` immediately), the parked run
+    /// is cancelled, and the question is asked again. The user types their token
+    /// once and gets their answer; the cost is one re-run of the turn.
+    pub async fn recover_auth_gate(
+        &self,
+        provider: &str,
+        token: &str,
+        thread_id: &ThreadId,
+        run_id: &RunId,
+    ) -> Result<()> {
+        self.store_connector_token(provider, token).await?;
+        self.cancel_run(thread_id, run_id).await?;
+        Ok(())
+    }
+
+    /// The product-auth routes sit at `/api/reborn/product-auth/…`, *outside* the
+    /// WebChat v2 prefix every other call uses.
+    async fn post_product_auth<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<T> {
+        let url = format!("{}/api/reborn/product-auth{path}", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(body)
+            .send()
+            .await
+            .map_err(|source| Error::Http {
+                url: url.clone(),
+                source,
+            })?;
+        self.decode("POST", path, &url, response).await
     }
 
     /// Send a user message, starting a turn.
@@ -534,6 +662,187 @@ impl GateResolution {
 #[derive(Debug, Deserialize)]
 struct CreateThreadResponse {
     thread: ThreadSummary,
+}
+
+// ------------------------------------------------------------- connectors
+
+#[derive(Debug, Deserialize)]
+struct RegistryResponse {
+    #[serde(default)]
+    entries: Vec<RegistryEntry>,
+}
+
+/// One connector the gateway offers to install.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RegistryEntry {
+    /// The id lives one level down, under `package_ref` — not at the top.
+    #[serde(rename = "package_ref")]
+    pub package: PackageRef,
+    /// `wasm_tool`, `mcp_server`, or `first_party`.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// The vendor's own name.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// One line of what it does.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The connector's version, as the registry states it.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Whether it is already installed.
+    #[serde(default)]
+    pub installed: bool,
+}
+
+/// `{ "kind": "extension", "id": "github" }`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PackageRef {
+    /// The connector id.
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstalledResponse {
+    #[serde(default)]
+    extensions: Vec<InstalledExtension>,
+}
+
+/// An installed connector, exactly as `GET /extensions` sends it.
+///
+/// **Flat.** An earlier version of this type nested everything under a `summary`
+/// block, copied from the *internal* `LifecycleInstalledExtensionSummary` rather
+/// than from the wire — and `serde` rejected every response, so the panel listed
+/// nothing and said the gateway was broken. The route's real shape is
+/// `RebornExtensionInfo` (`ironclaw_product_workflow/src/reborn_services/types.rs`),
+/// and it is pinned by `ic_integration_tests/tests/connector_verify.rs`, which now
+/// decodes a live response through *this* type instead of a hand-rolled
+/// `serde_json` walk that could agree with a wrong belief.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct InstalledExtension {
+    /// Which connector this is.
+    #[serde(rename = "package_ref")]
+    pub package: PackageRef,
+    /// The vendor's own name for it.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// One line of what it does.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// `wasm_tool`, `mcp_server`, or `first_party`.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Its tools reach the model. `installed` is *not* `active` — the difference
+    /// is the whole point of the activate step.
+    #[serde(default)]
+    pub active: bool,
+    /// Its credential requirements are satisfied.
+    #[serde(default)]
+    pub authenticated: bool,
+    /// It is still waiting for something (a credential, an activation).
+    #[serde(default)]
+    pub needs_setup: bool,
+    /// It wants a credential at all.
+    #[serde(default)]
+    pub has_auth: bool,
+    /// The capability ids the agent can see. Empty on an `active` connector means
+    /// the model got no tools from it, whatever the activate call claimed — the
+    /// Phase 4 trap, and the reason this field is read rather than trusted.
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// The vendor's onboarding copy.
+    #[serde(default)]
+    pub onboarding: Option<Onboarding>,
+}
+
+/// The vendor's own onboarding copy. Rendering this beats inventing our own.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Onboarding {
+    /// What the credential is and how to make one.
+    #[serde(default)]
+    pub credential_instructions: Option<String>,
+    /// What to do after saving it.
+    #[serde(default)]
+    pub credential_next_step: Option<String>,
+    /// Where the user goes to mint the credential.
+    #[serde(default)]
+    pub setup_url: Option<String>,
+    /// The headline instruction.
+    #[serde(default)]
+    pub instructions: Option<String>,
+}
+
+/// What `POST /extensions/install` answers with.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct InstallOutcome {
+    /// True when the connector cannot run until a credential is supplied.
+    #[serde(default)]
+    pub awaiting_token: bool,
+    /// e.g. `setup_required`.
+    #[serde(default)]
+    pub onboarding_state: Option<String>,
+    /// A one-line summary for the user.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// The vendor's onboarding copy.
+    #[serde(default)]
+    pub onboarding: Option<Onboarding>,
+}
+
+/// `GET /extensions/{id}/setup` — what the connector still needs.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ExtensionSetup {
+    /// One entry per secret, each saying whether it has been provided.
+    #[serde(default)]
+    pub secrets: Vec<SetupSecret>,
+    /// The vendor's onboarding copy.
+    #[serde(default)]
+    pub onboarding: Option<Onboarding>,
+}
+
+/// One secret in the setup projection.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SetupSecret {
+    /// The secret's name, e.g. `github_runtime_token`.
+    pub name: String,
+    /// **The** field that says whether the credential actually landed.
+    #[serde(default)]
+    pub provided: bool,
+    /// The auth provider this secret belongs to, e.g. `github` — what the
+    /// manual-token routes are keyed by.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Whether the connector can run without it.
+    #[serde(default)]
+    pub optional: bool,
+    /// How the credential is obtained.
+    #[serde(default)]
+    pub setup: Option<SecretSetup>,
+}
+
+/// How a connector's credential is obtained — and the difference is not cosmetic.
+///
+/// A `manual_token` connector (GitHub) is finished by the user pasting a string,
+/// which the panel can do. An `oauth` one (Gmail, Drive, Notion) needs a
+/// browser round-trip against an OAuth **client** that only a human can register
+/// with the vendor, and the gateway refuses to start the flow without one (503
+/// `backend_unavailable`; pinned by
+/// `ic_integration_tests/tests/connector_oauth.rs`). Offering a token box for that
+/// connector would be inviting the user to paste something that can never work.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SecretSetup {
+    /// `manual_token` or `oauth`.
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
+/// `/manual-token/setup` — the interaction a token is submitted against.
+#[derive(Debug, Deserialize)]
+struct TokenChallenge {
+    interaction_id: String,
+    /// Must be carried back into step 2, or the host cannot re-derive the
+    /// pending interaction.
+    invocation_id: String,
 }
 
 #[derive(Debug, Deserialize)]

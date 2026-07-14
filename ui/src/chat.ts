@@ -52,6 +52,23 @@ export interface Gate {
   body: string;
 }
 
+/**
+ * A run parked because a connector's credential was refused (Phase 8b).
+ *
+ * The vendor said no (a 401), and the runtime's answer is to stop and ask for a
+ * better credential rather than fail the turn. Nothing moves until this is
+ * answered — so the UI must offer the fix, not a spinner.
+ *
+ * `connector` is inferred from the capability that failed: the gateway's auth
+ * prompt is generic and does not say who is asking.
+ */
+export interface AuthGate {
+  runId: string;
+  gateRef: string;
+  connector: string | null;
+  provider: string | null;
+}
+
 export type Chat = ReturnType<typeof createChat>;
 
 /**
@@ -65,6 +82,11 @@ export function createChat(options: { speaks?: boolean } = {}) {
   const [phase, setPhase] = createSignal<RunPhase | null>(null);
   /** A Stop is in flight. The button must not fire twice, and the UI says so. */
   const [stopping, setStopping] = createSignal(false);
+  /**
+   * A run parked on a connector auth gate (Phase 8b) — it is not working, it is
+   * waiting for a credential, and it will wait forever if nobody answers.
+   */
+  const [authGate, setAuthGate] = createSignal<AuthGate | null>(null);
   const [activity, setActivity] = createSignal<string | null>(null);
   const [gate, setGate] = createSignal<Gate | null>(null);
   const [gateway, setGateway] = createSignal<GatewayState>({ state: "starting" });
@@ -178,6 +200,19 @@ export function createChat(options: { speaks?: boolean } = {}) {
           headline: event.headline,
           body: event.body,
         });
+        break;
+      case "auth_gate":
+        // The run has STOPPED and is waiting for a credential. Showing a spinner
+        // here is the bug this whole event exists to prevent: the agent is not
+        // thinking, it is asking.
+        setAuthGate({
+          runId: event.run_id,
+          gateRef: event.gate_ref,
+          connector: event.connector,
+          provider: event.provider,
+        });
+        setPhase(null);
+        setActivity(null);
         break;
       case "activity":
         setActivity(event.status === "completed" ? null : event.capability_id);
@@ -306,6 +341,44 @@ export function createChat(options: { speaks?: boolean } = {}) {
     }
   }
 
+  /**
+   * Answer the parked auth gate with a fresh credential, and get the answer the
+   * user asked for.
+   *
+   * The whole point of the feature: their token expired, the agent stopped
+   * mid-question, and this is the one action that finishes the job.
+   *
+   * It does not *resume* the parked run — it replaces it. The gateway's documented
+   * resume route could not be made to answer (see `GatewayClient::recover_auth_gate`
+   * for the evidence), so recovery is built from what is proven: store the new
+   * credential, cancel the run waiting on the old one, and ask the same question
+   * again. The user types their token once and it looks like a resume; the cost is
+   * that the turn re-runs from the top, which for a parked run is nearly all of it
+   * anyway.
+   */
+  async function answerAuthGate(token: string) {
+    const gate = authGate();
+    const id = threadId();
+    if (!gate || !id || !gate.provider) return;
+    const question = [...bubbles()].reverse().find((bubble) => bubble.role === "user")?.text;
+    try {
+      // The cancelled run must not be collected: its "reply" is a half-finished
+      // turn that stopped at a 401, and pushing it into the transcript would
+      // narrate the failure right before the real answer arrives.
+      collected.add(gate.runId);
+      await api.recoverAuthGate(gate.provider, token, id, gate.runId);
+      setAuthGate(null);
+      setActiveRun(null);
+      setPhase(null);
+    } catch (error) {
+      push({ role: "error", text: `That credential was not accepted: ${error}` });
+      return;
+    }
+    // Re-ask. `send` pushes the question again, which is honest: it *is* being
+    // asked again, and a transcript that hid that would be lying about what ran.
+    if (question) await send(question);
+  }
+
   /** Start a fresh conversation in *both* windows. */
   async function newSession() {
     try {
@@ -371,6 +444,8 @@ export function createChat(options: { speaks?: boolean } = {}) {
     phase,
     busy,
     stopping,
+    authGate,
+    answerAuthGate,
     ready,
     statusLine,
     start,

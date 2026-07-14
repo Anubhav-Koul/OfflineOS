@@ -478,6 +478,11 @@ remaining pieces are **explicitly-deferred follow-ups — GGUF download UI and
 tokens/sec** (see below); with those outstanding, 2b is functionally complete
 but not feature-complete.
 
+> ⚠️ **Superseded (2026-07-14).** Both follow-ups are done, and so is the failover
+> decision this section leaves open — see **"Closing the open items"** at the
+> bottom of this file. The paragraphs below are kept as the record of what was
+> true in July; where they conflict with that note, the note wins.
+
 ### The seam that had to be closed first
 
 - **The widget never started a local model.** `ic_widget` depended on `ic_llama`
@@ -528,6 +533,7 @@ but not feature-complete.
 Next: finish 2b's deferred follow-ups (**GGUF download UI**, **tokens/sec**) and
 do the **manual smoke run**, then **Phase 3 — animated character companion**
 (Live2D, `ren_en/` model), then **Phase 4 — browser automation**.
+*(All three follow-ups landed — see "Closing the open items" at the bottom.)*
 
 ## Phase 3 notes — animated character companion (done, recorded 2026-07-11)
 
@@ -1237,3 +1243,82 @@ Next: Phase 7 is complete. The remaining open items are Phase 6's
 external-input gates (cert, updater keypair, MSI on a clean VM, wake-word
 recordings) and the deferred 2b follow-ups (GGUF download UI, tokens/sec);
 `docs/desktop/llm-provider-selection.md` still holds the unmade failover call.
+
+## Closing the open items (recorded 2026-07-14)
+
+Everything that was outstanding except the **installer itself**. Two of the four
+turned out to be *mostly built already* — the notes above were stale, which is
+its own lesson: check the code before believing a TODO.
+
+`crates/ic_llama` (`proxy.rs`, `local_llm.rs`, `lib.rs`) + `crates/ic_widget`
+(`providers.rs`, `settings.rs`, `main.rs`) + `ui/` + `docs/desktop/llm-provider-selection.md`.
+**No core patch.**
+
+### 1. Cloud failover — decided (option 2) and built
+
+The v1 promise ("answer with a local GGUF model — with cloud failover when a key
+is configured") is now kept, without touching a core crate. **The proxy owns the
+retry**, exactly as `llm-provider-selection.md` recommended: `CloudFallback` names
+an OpenAI-shaped endpoint + key + model, and `relay()` retries a **chat completion**
+there when the sidecar refuses the connection or answers `5xx`. The full write-up
+is in that doc; the load-bearing findings:
+
+- **The gateway never learns it happened.** One `openai_compatible` endpoint, no
+  second `LLM_BACKEND`, no restart, no core patch.
+- **The cloud key never enters the gateway's environment** — it is read from the
+  credential store into the widget's own process. The predicted security win, real.
+- **The sidecar's throwaway bearer is stripped** before the cloud call: forwarding
+  it would leak a local secret to a third party and authenticate nothing.
+- **Only a chat completion fails over.** A failing `/v1/models` probe means the
+  local server is down; answering it from the cloud would advertise models the
+  sidecar does not have.
+- **Not every provider can serve.** The proxy forwards the body the gateway already
+  built, so a fallback must speak OpenAI Chat Completions. `providers.json` says
+  `anthropic` speaks `anthropic` and `deepseek` speaks `deep_seek` — so the picker
+  offers only `open_ai_completions` providers **plus Anthropic via its documented
+  OpenAI-compatible layer**. `Provider::can_fail_over()` is the one place that
+  decides, and `set_cloud_fallback` refuses a keyless or incompatible choice at the
+  command boundary rather than storing a setting that silently never fires.
+- **With no fallback, a dead local model is still an honest `502`.**
+
+Pinned by three end-to-end proxy tests (dead sidecar → cloud answers; no fallback
+→ 502; healthy sidecar → the cloud never sees the request *or* the key).
+
+### 2. tokens/sec — built, in the only place that can see it
+
+The gateway's event stream carries **no token usage at all**, so nothing downstream
+of it can count. The proxy can: it reads `llama-server`'s `timings.predicted_per_second`
+off each non-streamed completion (falling back to tokens-over-wall-clock, which reads
+a little low because it includes the prompt pass). Surfaced in the model panel as
+Speed / Last turn, polled every 3 s **only while a model is loaded**. The panel also
+flags when the last answer came from the cloud — a silent failover would otherwise
+look like a suspiciously fast GPU.
+
+### 3. GGUF download UI — was already built; the missing half added
+
+The panel (catalog, progress, cancel, resume, digest verify, custom repo/file,
+remove) shipped in `de702a9`; the notes above never got updated. What was actually
+missing: **nothing let the user choose which installed model runs.** `launch_local_model`
+took "the first one that isn't suspect". Added `settings.default_model` + a **Use this**
+button per installed model, which pins it and restarts the sidecar onto it (a model is
+chosen at launch, so a new choice needs a new sidecar — and the gateway behind it,
+which holds the proxy URL). A pin that no longer resolves (removed, or gone suspect)
+falls back to the old rule rather than refusing to start.
+
+### 4. Wake word — was already built; the last hop closed
+
+Record → train → `.rpw` → `RustpotterWake` all existed, and `voice.rs` already swaps
+`NullWakeWord` for the real spotter automatically when a model is present. The gap:
+**the pipeline reads its models once, at start**, so a word trained under a running
+pipeline did nothing until the next launch — the feature looked broken at exactly the
+moment the user tried it. `train_wake_word` now restarts voice itself (new
+`restart_voice` helper) and clears the banked takes, so a retrain is not trained on
+both voices. Still outstanding and **genuinely external**: the user must speak the
+recordings, and the `#[ignore]`d detection test needs a real `.rpw` + WAV.
+
+### What remains
+
+**Only the installer**, and what it needs from outside the repo: a code-signing
+certificate, an updater keypair + endpoint, and a clean-VM MSI build with the manual
+failure drills (`docs/desktop/packaging.md` has the checklist and the config
+templates). No code is blocked on any of it.

@@ -116,6 +116,26 @@ export interface LocalModel {
   estimated_vram_mb: number;
   estimated_host_mb: number;
   warnings: string[];
+  /** Live counters from the proxy — the only thing here that moves. */
+  metrics: ModelMetrics;
+  /** The cloud provider this model falls back to, if one is configured. */
+  fallback: string | null;
+}
+
+/**
+ * What the `ic_llama` proxy has seen. Everything but the counters describes the
+ * most recent completion; `null` means none has happened yet (the gateway's own
+ * event stream carries no token counts at all, so this is the only source).
+ */
+export interface ModelMetrics {
+  tokens_per_second: number | null;
+  completion_tokens: number | null;
+  prompt_tokens: number | null;
+  latency_ms: number | null;
+  completions: number;
+  /** How many requests the local model could not answer and the cloud did. */
+  failovers: number;
+  last_was_cloud: boolean;
 }
 
 /**
@@ -132,12 +152,29 @@ export interface Provider {
   description: string;
   default_model: string;
   has_key: boolean;
+  /** Whether it can be the local model's fallback (OpenAI-shaped providers only). */
+  can_fail_over: boolean;
 }
 
 /** The provider panel's data: the active selection and the cloud catalog. */
 export interface ProviderSettings {
   active: ProviderSelection;
   providers: Provider[];
+  /** The cloud provider the local model falls back to, if any. */
+  fallback: FallbackProvider | null;
+}
+
+/**
+ * The cloud provider a *local* model falls back to when it cannot answer.
+ *
+ * Not a second `LLM_BACKEND`: the gateway only ever knows about one provider.
+ * The `ic_llama` proxy owns the retry, so the cloud key never reaches the
+ * gateway's environment. Only providers that speak the OpenAI-compatible API
+ * can serve here — see `Provider::failover_base_url` in Rust.
+ */
+export interface FallbackProvider {
+  id: string;
+  model?: string | null;
 }
 
 /** A downloadable model the panel suggests. */
@@ -371,6 +408,13 @@ export const api = {
     invoke<void>("clear_provider_key", { providerId }),
   applyProvider: (selection: ProviderSelection) =>
     invoke<void>("apply_provider", { selection }),
+  /** Pin which installed GGUF the local model runs (`null` unpins). Restarts
+   *  the gateway when the local model is the active provider. */
+  useModel: (modelId: string | null) => invoke<void>("use_model", { modelId }),
+  /** Choose the cloud provider the local model falls back to (`null` for none).
+   *  Refused if the provider has no key, or cannot speak the OpenAI shape. */
+  setCloudFallback: (fallback: FallbackProvider | null) =>
+    invoke<void>("set_cloud_fallback", { fallback }),
   recommendedModels: () => invoke<RecommendedModel[]>("recommended_models"),
   installedModels: () => invoke<InstalledModel[]>("installed_models"),
   downloadModel: (repo: string, file: string) =>

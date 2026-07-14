@@ -13,7 +13,7 @@ use crate::hardware::{GpuAdapter, probe_gpus, system_memory};
 use crate::ids::ModelId;
 use crate::models::{InstalledModel, ModelStore};
 use crate::placement::{Placement, PlacementPolicy, PlacementRequest, plan};
-use crate::proxy::SchemaProxy;
+use crate::proxy::{CloudFallback, Metrics, SchemaProxy};
 use crate::release::Backend;
 use crate::runtime::{InstallProgressFn, LlamaRuntime};
 use crate::server::{Sidecar, SidecarConfig, SidecarState, SpawnHook};
@@ -36,6 +36,10 @@ pub struct LocalLlmOptions {
     /// passes this to enlist the child in its process job, so it dies with the
     /// app even on a hard kill. See [`SpawnHook`].
     pub on_sidecar_spawn: Option<SpawnHook>,
+    /// Where a request goes when the local model cannot answer it. `None` means
+    /// a local failure is reported as a failure, which is the honest answer when
+    /// there is nowhere else to ask. See [`crate::proxy::CloudFallback`].
+    pub cloud_fallback: Option<CloudFallback>,
 }
 
 /// A running local model.
@@ -146,7 +150,13 @@ impl LocalLlm {
         // llama.cpp cannot compile IronClaw's tool schemas as they stand, so
         // IronClaw is pointed at a proxy that repairs them in flight. The
         // sidecar's port is stable across restarts, so this upstream stays valid.
-        let proxy = SchemaProxy::start(format!("http://127.0.0.1:{}", sidecar.port())).await?;
+        // The same proxy owns cloud failover and the token metrics — it is the
+        // only thing that sees every request and every response.
+        let proxy = SchemaProxy::start_with(
+            format!("http://127.0.0.1:{}", sidecar.port()),
+            options.cloud_fallback,
+        )
+        .await?;
 
         Ok(Self {
             runtime,
@@ -192,6 +202,13 @@ impl LocalLlm {
     /// The supervised server, for health badges and diagnostics.
     pub fn sidecar(&self) -> &Sidecar {
         &self.sidecar
+    }
+
+    /// Tokens/sec and token counts from the last completion, plus how many
+    /// requests the cloud has had to answer. Read by the dashboard's model
+    /// panel; the gateway's own event stream carries no usage data at all.
+    pub fn metrics(&self) -> Metrics {
+        self.proxy.metrics()
     }
 
     /// Stop the server and wait for it to exit.

@@ -40,6 +40,21 @@ impl Default for ProviderSelection {
     }
 }
 
+/// The cloud provider the *local* model falls back to when it cannot answer.
+///
+/// Deliberately not a [`ProviderSelection`]: a fallback is only meaningful
+/// alongside a local model, it is reached through the `ic_llama` proxy rather
+/// than through `LLM_BACKEND`, and it must be a provider that can be spoken to
+/// in the OpenAI shape (`providers::Provider::can_fail_over`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FallbackProvider {
+    /// The provider id, e.g. `anthropic`.
+    pub id: String,
+    /// A model override, or `None` for the provider's catalog default.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
 /// How a reply reaches the user.
 ///
 /// The user may want to *read* the answer, *hear* it, or both. Before this,
@@ -170,6 +185,20 @@ pub struct Settings {
     /// The LLM the gateway starts with.
     #[serde(default)]
     pub active_provider: ProviderSelection,
+    /// Which installed GGUF the local model runs, by id. `None` means "the first
+    /// usable one", which is what the app did before a model could be pinned.
+    /// A pinned model that is missing or suspect falls back to that same rule
+    /// rather than refusing to start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    /// The cloud provider a local model falls back to when it cannot answer.
+    ///
+    /// This is **not** a second `LLM_BACKEND` — the gateway only ever knows
+    /// about one provider. The `ic_llama` proxy owns the retry, so the cloud key
+    /// never enters the gateway's environment at all. See
+    /// `docs/desktop/llm-provider-selection.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_fallback: Option<FallbackProvider>,
     /// Which character asset folder the widget renders, or `None` for the
     /// default. A character is data (Phase 3): swapping folders needs no code.
     #[serde(default, skip_serializing_if = "Option::is_none")]

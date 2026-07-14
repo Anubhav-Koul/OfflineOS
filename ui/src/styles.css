@@ -218,6 +218,14 @@ body.widget-body {
   color: var(--danger, #d1524a);
 }
 
+/* A heading inside a panel, for a second concern that belongs with the first
+   (the local model's cloud fallback lives under Provider). */
+.subhead {
+  margin: 16px 0 4px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
 /* The watcher rule list (Phase 7d). */
 .watch-rules {
   margin: 8px 0;

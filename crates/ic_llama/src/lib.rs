@@ -67,7 +67,7 @@ pub use ids::{ModelId, Sha256Hex};
 pub use local_llm::{LocalLlm, LocalLlmOptions};
 pub use models::{Digest, HubModel, InstalledModel, ModelStore};
 pub use placement::{Placement, PlacementPolicy, Verdict};
-pub use proxy::SchemaProxy;
+pub use proxy::{CloudFallback, Metrics, SchemaProxy};
 pub use release::{Backend, LLAMA_CPP_TAG};
 pub use runtime::LlamaRuntime;
 pub use server::{Sidecar, SidecarConfig, SidecarState, SpawnHook};

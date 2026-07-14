@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use ic_llama::download::{Downloader, Progress, ProgressFn};
 use ic_llama::{
-    Digest, HubModel, LocalLlm, LocalLlmOptions, ModelId, ModelStore, SidecarState, SpawnHook,
-    Verdict,
+    CloudFallback, Digest, HubModel, LocalLlm, LocalLlmOptions, ModelId, ModelStore, SidecarState,
+    SpawnHook, Verdict,
 };
 use ic_widget::ambient::reflection::RunWatch;
 use ic_widget::ambient::{AmbientConfig, AmbientService, Suggestion, SuggestionKind};
@@ -496,6 +496,12 @@ struct UiModel {
     estimated_host_mb: u64,
     /// Placement advisories, already human-readable.
     warnings: Vec<String>,
+    /// What the proxy has actually seen: tokens/sec, token counts, failovers.
+    /// Everything above is a decision made at launch; this is the only part that
+    /// moves while the model runs.
+    metrics: ic_llama::Metrics,
+    /// The cloud provider this model falls back to, if one is configured.
+    fallback: Option<String>,
 }
 
 /// Read-only status of the running local model. Reflects placement decided at
@@ -522,6 +528,13 @@ async fn local_model_status(state: tauri::State<'_, AppState>) -> Result<Option<
             .iter()
             .map(|warning| warning.to_string())
             .collect(),
+        metrics: llm.metrics(),
+        fallback: state
+            .settings_store
+            .load()
+            .ok()
+            .and_then(|settings| settings.cloud_fallback)
+            .map(|fallback| fallback.id),
     }))
 }
 
@@ -548,6 +561,10 @@ struct UiProvider {
     default_model: String,
     /// Whether an API key is stored for it. **Never the key itself.**
     has_key: bool,
+    /// Whether it can serve as the local model's cloud fallback. False for
+    /// providers whose wire dialect is not OpenAI-shaped: the proxy forwards
+    /// the body the gateway already built, so they could never answer it.
+    can_fail_over: bool,
 }
 
 /// The provider panel's data: what is active, and the configurable providers.
@@ -558,6 +575,8 @@ struct UiProviderSettings {
     /// The cloud providers that take an API key. The local model is a separate,
     /// always-available choice the UI offers alongside these.
     providers: Vec<UiProvider>,
+    /// The cloud provider the local model falls back to, if any.
+    fallback: Option<ic_widget::settings::FallbackProvider>,
 }
 
 /// The active selection and the configurable cloud providers, each flagged with
@@ -566,11 +585,7 @@ struct UiProviderSettings {
 async fn provider_settings(
     state: tauri::State<'_, AppState>,
 ) -> Result<UiProviderSettings, String> {
-    let active = state
-        .settings_store
-        .load()
-        .map_err(user_facing)?
-        .active_provider;
+    let settings = state.settings_store.load().map_err(user_facing)?;
 
     let secrets = SecretStore::new();
     let catalog = ic_widget::providers::api_key_providers().map_err(user_facing)?;
@@ -584,9 +599,14 @@ async fn provider_settings(
             description: provider.description.clone(),
             default_model: provider.default_model.clone(),
             has_key,
+            can_fail_over: provider.can_fail_over(),
         });
     }
-    Ok(UiProviderSettings { active, providers })
+    Ok(UiProviderSettings {
+        active: settings.active_provider,
+        providers,
+        fallback: settings.cloud_fallback,
+    })
 }
 
 /// Resolve a provider id from the catalog, or a user-facing error.
@@ -632,6 +652,69 @@ async fn apply_provider(
     // rebuilt literal here would silently reset the rest.
     state.update_settings(|settings| settings.active_provider = selection.clone())?;
     restart_gateway(app.clone(), selection).await;
+    Ok(())
+}
+
+/// Pin which installed GGUF the local model runs, and restart onto it.
+///
+/// `None` unpins — back to "the first usable model". The restart is the same
+/// machinery the provider switch uses: the sidecar's model is chosen at launch,
+/// so a new choice needs a new sidecar (and the gateway behind it, which holds
+/// the proxy URL).
+#[tauri::command]
+async fn use_model(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    model_id: Option<String>,
+) -> Result<(), String> {
+    let settings = state.update_settings(|settings| settings.default_model = model_id.clone())?;
+    // Only a *local* selection is affected: pinning a GGUF while a cloud provider
+    // is active changes what happens when the user switches back, not now.
+    if settings.active_provider == ProviderSelection::Local {
+        restart_gateway(app, ProviderSelection::Local).await;
+    }
+    Ok(())
+}
+
+/// Choose the cloud provider the local model falls back to, or `None` for none.
+///
+/// The proxy owns the retry, so this restarts the gateway (the proxy is built
+/// with the model). It does **not** change `LLM_BACKEND`: the gateway keeps
+/// seeing exactly one provider, and the cloud key never enters its environment.
+#[tauri::command]
+async fn set_cloud_fallback(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    fallback: Option<ic_widget::settings::FallbackProvider>,
+) -> Result<(), String> {
+    // Refuse a provider that cannot actually serve a fallback rather than
+    // storing a setting that silently never fires.
+    if let Some(chosen) = &fallback {
+        let provider = ic_widget::providers::find(&chosen.id)
+            .map_err(user_facing)?
+            .ok_or_else(|| format!("Unknown provider \u{201c}{}\u{201d}.", chosen.id))?;
+        if !provider.can_fail_over() {
+            return Err(format!(
+                "{} cannot be a fallback: it does not speak the OpenAI-compatible API the \
+                 local model's proxy forwards.",
+                chosen.id
+            ));
+        }
+        if !SecretStore::new()
+            .has_provider_key(&provider)
+            .map_err(user_facing)?
+        {
+            return Err(format!(
+                "Add an API key for {} first — a fallback with no key would never answer.",
+                chosen.id
+            ));
+        }
+    }
+
+    let settings = state.update_settings(|settings| settings.cloud_fallback = fallback.clone())?;
+    if settings.active_provider == ProviderSelection::Local {
+        restart_gateway(app, ProviderSelection::Local).await;
+    }
     Ok(())
 }
 
@@ -1490,7 +1573,10 @@ fn llama_root() -> Result<PathBuf, String> {
 ///
 /// The child `llama-server` is enlisted in `job` on every (re)spawn, so it dies
 /// with the widget even under a hard kill — the same guarantee the gateway has.
-async fn launch_local_model(job: Arc<ProcessJob>) -> Option<LocalLlm> {
+async fn launch_local_model(
+    job: Arc<ProcessJob>,
+    settings: &ic_widget::settings::Settings,
+) -> Option<LocalLlm> {
     let root = match llama_root() {
         Ok(root) => root,
         Err(error) => {
@@ -1516,10 +1602,24 @@ async fn launch_local_model(job: Arc<ProcessJob>) -> Option<LocalLlm> {
         }
     };
 
-    // The first model that isn't marked suspect. A richer selection (a
-    // user-pinned default) lands with the model panel; until then, first usable
-    // wins, deterministically ordered by the store.
-    let Some(model) = installed.into_iter().find(|model| model.is_loadable()) else {
+    // The model the user pinned, when it is still installed and usable. A pin
+    // that no longer resolves (removed, or gone suspect since) falls back to the
+    // old rule — first usable, deterministically ordered by the store — rather
+    // than refusing to run any model at all.
+    let pinned = settings.default_model.as_deref().and_then(|id| {
+        let found = installed
+            .iter()
+            .find(|model| model.id.as_str() == id && model.is_loadable());
+        if found.is_none() {
+            tracing::warn!(
+                model = id,
+                "the pinned model is missing or suspect; using another"
+            );
+        }
+        found.cloned()
+    });
+    let Some(model) = pinned.or_else(|| installed.into_iter().find(|model| model.is_loadable()))
+    else {
         tracing::info!("no installed local model; the gateway will start without one");
         return None;
     };
@@ -1527,6 +1627,7 @@ async fn launch_local_model(job: Arc<ProcessJob>) -> Option<LocalLlm> {
     tracing::info!(model = %model.id, "bringing up the local model");
     let options = LocalLlmOptions {
         on_sidecar_spawn: Some(enlist_in_job(job)),
+        cloud_fallback: cloud_fallback(settings),
         ..Default::default()
     };
     match LocalLlm::launch(&root, &model.id, options).await {
@@ -1542,6 +1643,63 @@ async fn launch_local_model(job: Arc<ProcessJob>) -> Option<LocalLlm> {
             None
         }
     }
+}
+
+/// The cloud endpoint the local model falls back to, or `None`.
+///
+/// This is how the v1 promise — "answer with a local GGUF model, with cloud
+/// failover when a key is configured" — is kept without a core patch. The
+/// gateway is told about exactly one provider (the proxy); the proxy itself
+/// retries a failed completion against the cloud. Consequently **the cloud key
+/// is never put in the gateway's environment**, which is strictly better than
+/// the alternatives (`docs/desktop/llm-provider-selection.md`, option 2).
+///
+/// A configured fallback whose key is missing, or whose provider cannot be
+/// spoken to in the OpenAI shape, degrades to `None` with a warning: running
+/// locally with no safety net beats refusing to start.
+fn cloud_fallback(settings: &ic_widget::settings::Settings) -> Option<CloudFallback> {
+    let configured = settings.cloud_fallback.as_ref()?;
+    let provider = match ic_widget::providers::find(&configured.id) {
+        Ok(Some(provider)) => provider,
+        Ok(None) => {
+            tracing::warn!(
+                provider = configured.id,
+                "unknown fallback provider; ignoring it"
+            );
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!(%error, "could not read the provider catalog");
+            return None;
+        }
+    };
+    let base_url = provider.failover_base_url()?;
+    let key = match SecretStore::new().provider_key(&provider) {
+        Ok(Some(key)) => key,
+        Ok(None) => {
+            tracing::warn!(
+                provider = configured.id,
+                "the fallback provider has no stored key; running with no fallback"
+            );
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!(provider = configured.id, %error, "could not read the fallback key");
+            return None;
+        }
+    };
+    tracing::info!(
+        provider = configured.id,
+        "the local model has a cloud fallback"
+    );
+    Some(CloudFallback {
+        base_url,
+        api_key: key,
+        model: configured
+            .model
+            .clone()
+            .unwrap_or(provider.default_model.clone()),
+    })
 }
 
 /// A spawn hook that puts `llama-server` in the widget's process job. Mirrors the
@@ -1564,10 +1722,11 @@ fn enlist_in_job(job: Arc<ProcessJob>) -> SpawnHook {
 async fn resolve_provider(
     job: Arc<ProcessJob>,
     selection: &ProviderSelection,
+    settings: &ic_widget::settings::Settings,
 ) -> (Vec<(String, String)>, Option<LocalLlm>) {
     match selection {
         ProviderSelection::Local => {
-            let local = launch_local_model(job).await;
+            let local = launch_local_model(job, settings).await;
             let env = local
                 .as_ref()
                 .map(|llm| {
@@ -1643,10 +1802,20 @@ fn spawn_gateway(app: AppHandle) {
 /// port before this reserves a new one.
 async fn bring_up_gateway(app: AppHandle, selection: ProviderSelection) {
     let job = Arc::clone(&app.state::<AppState>().job);
+    let settings = app
+        .state::<AppState>()
+        .settings_store
+        .load()
+        .unwrap_or_else(|error| {
+            // silent-ok: unreadable settings mean defaults — no pinned model and
+            // no fallback — which is the same as a fresh install.
+            tracing::warn!(%error, "could not read settings; using defaults for the model");
+            ic_widget::settings::Settings::default()
+        });
 
     // The gateway reads `LLM_BASE_URL` once at startup and never re-reads it, so
     // the model must be up — and its proxy URL known — before the gateway spawns.
-    let (llm_env, local) = resolve_provider(job.clone(), &selection).await;
+    let (llm_env, local) = resolve_provider(job.clone(), &selection, &settings).await;
     // Keep the model alive for the app's lifetime; its `Drop` stops the sidecar
     // and proxy on a graceful exit. Storing `None` drops any previous model.
     *app.state::<AppState>().local_llm.lock().await = local;
@@ -2898,10 +3067,13 @@ async fn reset_wake_samples(state: tauri::State<'_, AppState>) -> Result<(), Str
     Ok(())
 }
 
-/// Train the wake word from the recordings and save it.
+/// Train the wake word from the recordings, save it, and start listening for it.
 ///
-/// The model lands in the directory the voice pipeline already scans, so the next
-/// start swaps push-to-talk for a real wake word with no further wiring.
+/// The model lands in the directory the voice pipeline scans at start — so
+/// training it under a *running* pipeline changes nothing until that pipeline is
+/// replaced. This restarts voice itself rather than telling the user to toggle
+/// it: "record three takes, and now it answers to its name" is the whole feature,
+/// and a wake word that only works after the next launch is one that looks broken.
 #[tauri::command]
 async fn train_wake_word(
     app: AppHandle,
@@ -2917,11 +3089,31 @@ async fn train_wake_word(
     let wake_dir = voice_wake_dir(&app);
     let path = ic_voice::train_wake_word(&wake_dir, &name, &takes).map_err(|e| e.to_string())?;
 
-    // The pipeline reads its models at start, so a model trained while voice is
-    // already running does not take until voice restarts. Say so rather than leaving
-    // the user wondering why the name does nothing.
-    tracing::info!(%name, "wake word trained; it takes effect when voice next starts");
+    // The takes are spent. Keeping them would stack this training's recordings
+    // onto the next one's, so a retrain would silently be trained on both voices.
+    state.wake_takes.lock().await.clear();
+
+    // Swap the running pipeline (which is holding a `NullWakeWord`, since there
+    // was no model when it started) for one that spots the phrase.
+    if state.settings_store.load().is_ok_and(|s| s.voice_enabled) {
+        restart_voice(&app).await;
+        tracing::info!(%name, "wake word trained; the pipeline is now listening for it");
+    } else {
+        tracing::info!(%name, "wake word trained; it takes effect when voice is switched on");
+    }
     Ok(path.display().to_string())
+}
+
+/// Replace the running voice pipeline with a fresh one.
+///
+/// The pipeline resolves its wake-word models, input device, and TTS voice when
+/// it starts, so anything that changes those needs the pipeline rebuilt rather
+/// than reconfigured — the same shape as the gateway's boot-time environment.
+async fn restart_voice(app: &AppHandle) {
+    if let Some(service) = app.state::<AppState>().voice.lock().await.take() {
+        service.shutdown().await;
+    }
+    start_voice(app.clone()).await;
 }
 
 /// How long one wake-phrase take records for. A name is a word or two; a longer
@@ -3351,6 +3543,8 @@ fn main() {
             set_ambient_enabled,
             set_ambient_guardrails,
             set_reflection_enabled,
+            use_model,
+            set_cloud_fallback,
             preview_skill_import,
             request_skill_import,
             watchers_status,

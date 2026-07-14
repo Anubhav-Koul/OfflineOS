@@ -114,8 +114,47 @@ the ability to use a cloud provider's *native* API surface, since everything
 must round-trip through the OpenAI-compatible shape — acceptable for Anthropic
 and OpenAI, which both have compatible endpoints.
 
-Decide before Phase 6; the packaging story ("cloud failover when a key is
-configured") is a first-run-wizard promise.
+## ✅ Decided and built: option 2 (2026-07-14)
+
+The proxy owns the failover. `ic_llama::proxy::CloudFallback` names an
+OpenAI-shaped endpoint, a key, and a model; `SchemaProxy::start_with` takes one;
+`relay()` retries a **chat completion** there when the sidecar refuses the
+connection or answers `5xx`. Nothing in a core crate changed.
+
+What fell out of building it, worth knowing:
+
+- **The gateway never learns any of this happened.** It sees one
+  `openai_compatible` endpoint, and a failed local answer becomes a cloud answer
+  with the same shape. No restart, no second `LLM_BACKEND`, no core patch.
+- **The cloud key never enters the gateway's environment.** It is read from the
+  credential store into the proxy, in the widget's own process. This is the
+  concrete security win option 2 was predicted to have.
+- **Only a chat completion fails over.** A `/v1/models` probe that fails means
+  the local server is down; answering it from the cloud would advertise models
+  the sidecar does not have.
+- **The sidecar's throwaway bearer is stripped before the cloud call** and
+  replaced with the provider's key — forwarding it would leak a local secret to
+  a third party, and it would not authenticate anything anyway.
+- **The request is retargeted at the cloud's model name.** The local model's id
+  (`Qwen3-4B-Q4_K_M`) means nothing to Anthropic, which would answer
+  `404 model_not_found`.
+- **Not every provider can serve.** The proxy forwards the body the gateway
+  already built, so a fallback must speak the OpenAI Chat Completions dialect.
+  `providers.json` says `deepseek` speaks `deep_seek` and `anthropic` speaks
+  `anthropic` — so the dashboard offers only providers whose `protocol` is
+  `open_ai_completions`, **plus Anthropic through its documented OpenAI-compatible
+  layer** (`https://api.anthropic.com/v1`). That is exactly the predicted cost:
+  a fallback reaches a provider's *compatible* surface, not its native one.
+  `Provider::can_fail_over()` is the single place that decides.
+- **With no fallback configured, a dead local model is still an honest `502`.**
+  Inventing an answer would be worse than saying so.
+
+The user picks the fallback in the dashboard's Provider panel; it is stored as
+`settings.cloud_fallback` and refused at the command boundary if the provider
+has no key or cannot be spoken to. The model panel shows how many times it has
+been used, and flags when the last answer came from the cloud rather than the
+local model — a silent failover would otherwise look like a suspiciously fast
+GPU.
 
 ## References
 

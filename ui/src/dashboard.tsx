@@ -139,6 +139,31 @@ function ModelsPanel() {
   const [notice, setNotice] = createSignal<string | null>(null);
   const [repo, setRepo] = createSignal("");
   const [file, setFile] = createSignal("");
+  /** Which installed model the sidecar is actually serving right now. */
+  const [running, setRunning] = createSignal<string | null>(null);
+  const [switching, setSwitching] = createSignal(false);
+
+  const refreshRunning = async () => {
+    try {
+      setRunning((await api.localModelStatus())?.model_id ?? null);
+    } catch {
+      /* silent-ok: no running model is a fine answer here */
+    }
+  };
+
+  /** Pin a model and restart the sidecar onto it. */
+  const use = async (id: string) => {
+    setNotice(null);
+    setSwitching(true);
+    try {
+      await api.useModel(id);
+      await refreshRunning();
+    } catch (reason) {
+      setNotice(String(reason));
+    } finally {
+      setSwitching(false);
+    }
+  };
 
   onMount(async () => {
     try {
@@ -147,6 +172,7 @@ function ModelsPanel() {
       setNotice(String(reason));
     }
     void installed.refresh();
+    void refreshRunning();
 
     const unlisten = await onModelEvent((event) => {
       if (event.kind === "progress") {
@@ -303,7 +329,13 @@ function ModelsPanel() {
               {(model) => (
                 <li class="row">
                   <div class="model-card-main">
-                    <span class="row-title">{model.id}</span>
+                    <span class="row-title">
+                      {model.id}
+                      <Show when={running() === model.id}>
+                        {" "}
+                        <span class="badge ready">running</span>
+                      </Show>
+                    </span>
                     <span class="row-meta">
                       {model.size_mb >= 1024
                         ? `${(model.size_mb / 1024).toFixed(1)} GiB`
@@ -313,6 +345,13 @@ function ModelsPanel() {
                       {(reason) => <p class="reason-inline">{reason()}</p>}
                     </Show>
                   </div>
+                  {/* Switching model means a new sidecar, and the gateway holds
+                      the proxy URL it was booted with — so this restarts both. */}
+                  <Show when={running() !== model.id && !model.suspect}>
+                    <button disabled={switching()} onClick={() => void use(model.id)}>
+                      {switching() ? "Switching…" : "Use this"}
+                    </button>
+                  </Show>
                   <button class="ghost danger" onClick={() => void remove(model.id)}>
                     Remove
                   </button>
@@ -488,6 +527,17 @@ function ProviderPanel() {
     }
   };
 
+  /** Set (or clear) the cloud provider the local model falls back to. */
+  const chooseFallback = async (id: string) => {
+    setNotice(null);
+    try {
+      await api.setCloudFallback(id ? { id } : null);
+      await data.refresh();
+    } catch (reason) {
+      setNotice(String(reason));
+    }
+  };
+
   return (
     <section>
       <div class="panel-head">
@@ -543,6 +593,35 @@ function ProviderPanel() {
                 <button disabled={!canApply()} onClick={() => void apply()}>
                   {applying() ? "Applying…" : "Apply & restart"}
                 </button>
+              </div>
+
+              {/*
+                Cloud failover. Not a second active provider — the agent still
+                knows about exactly one. The local model's proxy retries a failed
+                answer against this endpoint, so the key never reaches the agent's
+                environment at all. Only OpenAI-compatible providers can serve.
+              */}
+              <h3 class="subhead">Fallback for the local model</h3>
+              <p class="muted small">
+                When the local model can't answer — it crashed, or ran out of
+                memory — the request is retried here instead of failing. Needs a
+                key, and only providers with an OpenAI-compatible API can serve.
+              </p>
+              <div class="row">
+                <select
+                  value={settings().fallback?.id ?? ""}
+                  onChange={(event) => void chooseFallback(event.currentTarget.value)}
+                >
+                  <option value="">No fallback — fail honestly</option>
+                  <For each={settings().providers.filter((p) => p.can_fail_over)}>
+                    {(provider) => (
+                      <option value={provider.id} disabled={!provider.has_key}>
+                        {provider.id}
+                        {provider.has_key ? "" : " (add a key first)"}
+                      </option>
+                    )}
+                  </For>
+                </select>
               </div>
             </>
           )}
@@ -2034,6 +2113,14 @@ function Dashboard() {
     setLog(await api.gatewayLog());
     if (current.state === "ready") loadAll();
 
+    // The model panel's metrics move while the model runs — everything else on
+    // it was decided at launch. Poll only while a model is actually loaded, so
+    // an app on a cloud provider does no work at all.
+    const metricsPoll = setInterval(() => {
+      if (model.value()) void model.refresh();
+    }, 3000);
+    onCleanup(() => clearInterval(metricsPoll));
+
     // Show the first-run wizard until the user completes it.
     setShowWizard(await api.needsSetup().catch(() => false));
   });
@@ -2199,7 +2286,45 @@ function Dashboard() {
                       <dt>Est. RAM</dt>
                       <dd>{m().estimated_host_mb} MiB</dd>
                     </div>
+                    {/* The only live numbers here: the proxy counts them as the
+                        answers pass through, because the gateway's event stream
+                        carries no token usage at all. */}
+                    <div>
+                      <dt>Speed</dt>
+                      <dd>
+                        {m().metrics.tokens_per_second !== null
+                          ? `${m().metrics.tokens_per_second!.toFixed(1)} tok/s`
+                          : "—"}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Last turn</dt>
+                      <dd>
+                        {m().metrics.completion_tokens !== null
+                          ? `${m().metrics.completion_tokens} out / ${m().metrics.prompt_tokens ?? "?"} in`
+                          : "—"}
+                      </dd>
+                    </div>
+                    <Show when={m().fallback}>
+                      {(fallback) => (
+                        <div>
+                          <dt>Fallback</dt>
+                          <dd>
+                            {fallback()}
+                            {m().metrics.failovers > 0
+                              ? ` · used ${m().metrics.failovers}×`
+                              : ""}
+                          </dd>
+                        </div>
+                      )}
+                    </Show>
                   </dl>
+                  <Show when={m().metrics.last_was_cloud}>
+                    <p class="reason-inline">
+                      The last answer came from the cloud fallback, not the local
+                      model.
+                    </p>
+                  </Show>
                   <Show when={m().warnings.length > 0}>
                     <ul class="warnings">
                       <For each={m().warnings}>{(warning) => <li>{warning}</li>}</For>

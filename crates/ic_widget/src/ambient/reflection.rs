@@ -123,29 +123,41 @@ pub struct Draft {
 /// name that could not be a directory — is `None`. **Fail closed:** an
 /// unparseable reply means nothing is proposed, never a guess.
 pub fn parse_draft(reply: &str) -> Option<Draft> {
+    // The whole reply is always the last candidate: a bare SKILL.md whose *body*
+    // contains fenced code blocks would otherwise be shredded into those inner
+    // blocks (none of which is a skill) and never tried whole.
     let mut candidates = fenced_blocks(reply);
-    if candidates.is_empty() {
-        candidates.push(reply.trim().to_string());
+    candidates.push(reply.trim().to_string());
+    candidates
+        .into_iter()
+        .find_map(|candidate| candidate_draft(&candidate))
+}
+
+/// Validate one complete SKILL.md text — no fence extraction, the file *is* the
+/// candidate. What the skill-import path (7c) uses on a user-picked file.
+pub fn parse_skill_md(content: &str) -> Option<Draft> {
+    candidate_draft(content.trim())
+}
+
+/// The one candidate → draft rule shared by both entry points.
+fn candidate_draft(candidate: &str) -> Option<Draft> {
+    let candidate = candidate.trim();
+    if candidate.len() > MAX_DRAFT_BYTES {
+        return None;
     }
-    candidates.into_iter().find_map(|candidate| {
-        let candidate = candidate.trim().to_string();
-        if candidate.len() > MAX_DRAFT_BYTES {
-            return None;
-        }
-        let (front, body) = split_frontmatter(&candidate)?;
-        if body.trim().is_empty() {
-            return None; // a skill with no body is a name, not a procedure
-        }
-        let name = frontmatter_value(front, "name")?;
-        let description = frontmatter_value(front, "description")?;
-        if !valid_skill_name(&name) || description.is_empty() || description.len() > 1_000 {
-            return None;
-        }
-        Some(Draft {
-            name,
-            description,
-            content: candidate,
-        })
+    let (front, body) = split_frontmatter(candidate)?;
+    if body.trim().is_empty() {
+        return None; // a skill with no body is a name, not a procedure
+    }
+    let name = frontmatter_value(front, "name")?;
+    let description = frontmatter_value(front, "description")?;
+    if !valid_skill_name(&name) || description.is_empty() || description.len() > 1_000 {
+        return None;
+    }
+    Some(Draft {
+        name,
+        description,
+        content: candidate.to_string(),
     })
 }
 
@@ -489,6 +501,28 @@ mod tests {
     #[test]
     fn a_bare_draft_parses_too() {
         assert!(parse_draft(DRAFT).is_some());
+    }
+
+    #[test]
+    fn a_bare_skill_with_fenced_blocks_in_its_body_still_parses() {
+        // Real skills carry code examples. The inner fences are not skills, and
+        // they must not stop the whole file from being tried as one.
+        let skill = format!("{DRAFT}\nRun this:\n\n```bash\ncargo test\n```\n\nThen stop.\n");
+        let parsed = parse_draft(&skill).expect("the whole file is the skill");
+        assert_eq!(parsed.name, "release-notes");
+        assert!(parse_skill_md(&skill).is_some());
+    }
+
+    #[test]
+    fn parse_skill_md_never_extracts_an_inner_fence() {
+        // For an imported *file*, the file is the candidate — a prose file with
+        // a fenced skill inside is not itself a skill.
+        let prose = format!("Some notes.\n\n{}", fenced(DRAFT));
+        assert!(parse_skill_md(&prose).is_none());
+        assert!(
+            parse_draft(&prose).is_some(),
+            "the reply parser still finds it"
+        );
     }
 
     #[test]

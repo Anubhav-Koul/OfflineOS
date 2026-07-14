@@ -66,6 +66,10 @@ pub enum SuggestionKind {
     Automation,
     /// A draft SKILL.md awaiting the user's consent to install (Phase 7b).
     SkillDraft,
+    /// A third-party skill folder awaiting the user's consent to import (7c).
+    /// Solicited — the user initiated it in the dashboard — so it is answered
+    /// even while ambient mode is off, and it never touches the guardrail.
+    SkillImport,
 }
 
 /// What the bubble shows when the character speaks first.

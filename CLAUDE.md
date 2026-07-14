@@ -1125,3 +1125,59 @@ refusals.
 Next: **Phase 7c — skill import** (local folder, frontmatter validation,
 review-before-install through the same consent card). Its ⚠️ VERIFY item is
 answered above: treat skill text as untrusted, because the runtime does not.
+
+## Phase 7c notes — skill import (done, recorded 2026-07-14)
+
+`crates/ic_widget` (new `skill_import.rs`; `ambient/mod.rs`, `ambient/reflection.rs`,
+`main.rs`, `lib.rs`) + `ui/` + a new gate
+(`ic_integration_tests/tests/skill_import_gate.rs`). **No core patch.**
+
+- **The ⚠️ VERIFY item was answered in 7b and it is the whole design**: the runtime
+  scans skill text for *nothing* on install (`gating.rs` = environment requirements
+  only; the context-build scan is structural, not semantic), and an installed skill
+  is the trusted tier with full-body injection. So the review is the only gate a
+  third-party skill ever passes through — which is why the dashboard shows the
+  **entire SKILL.md**, not a summary, under a warning that says exactly that.
+- **Two steps, both explicit.** The dashboard is the review (path in → `preview`,
+  a pure read: name, description, full text, bundle file list with sizes); the
+  final consent is the **red card on the character's bubble** — the same
+  `SkillDraft` machinery, a new `SuggestionKind::SkillImport`. An import is
+  *solicited*, so it lives outside the ambient service on purpose: it works with
+  ambient off, never consults the guardrail, and never spends a rate-cap slot.
+  Its consent trail is its own append-only `skill-import-log.jsonl` — writing it
+  into the ambient log would desync the running service's in-memory view and
+  let solicited imports eat unsolicited-surfacing slots on the next launch.
+- **What installs is what was reviewed, verbatim.** `install` takes the reviewed
+  SKILL.md *text* back in and writes it — never a re-read of the folder, which
+  could have changed between the review and the yes (pinned by
+  `install_writes_the_reviewed_text_not_the_folder`). Bundle data files are
+  copied fresh (their names and sizes were the reviewed part) with caps
+  re-checked, and a failed install removes the half-written directory.
+- **The runtime's own bundle limits are mirrored and enforced** —
+  `MAX_INSTALL_BUNDLE_*` (256 files / 2 MiB per file / 20 MiB total), so an
+  import can never admit more than `builtin__skill_install` would have. Path
+  rules per component (no control chars, no `:`, no Windows reserved device
+  names), and **symlinks are refused outright**: a link inside the folder can
+  point anywhere on the machine, and "import this folder" must never quietly
+  become "import whatever this folder points at".
+- **A parser fix this surfaced (also benefits 7b):** `parse_draft` shredded a
+  bare SKILL.md whose *body* contained fenced code blocks — real skills carry
+  code examples — into inner candidates and never tried the whole. The whole
+  reply is now always the last candidate, and imports use the stricter
+  `parse_skill_md` (the file *is* the candidate; a prose file with a fenced
+  skill inside is not itself a skill).
+- **No new plugin for folder picking**: the panel takes a typed/pasted path. A
+  native dialog means adding `tauri-plugin-dialog`; worth it later, not
+  load-bearing now.
+
+The gate (`skill_import_gate`) drives the shipping `preview` + `install` pair
+against a **running** `serve` and asserts the agent's very next `skill_list`
+names the import — no restart, because the skills root is read lazily. Together
+with the 7b chain (root → listed → activatable → body injected) that closes the
+import path end to end. Unit tests cover the refusals: no SKILL.md, invalid
+frontmatter, oversized file/bundle, reserved names, symlinks, overwrite, and
+the half-install cleanup.
+
+Next: **Phase 7d — ambient watchers** (opt-in signals, each defaulting OFF;
+v1 gate is rule-based, not LLM-based; wake-word models remain the outstanding
+Phase 6 item).

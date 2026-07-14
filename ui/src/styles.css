@@ -218,6 +218,22 @@ body.widget-body {
   color: var(--danger, #d1524a);
 }
 
+/* The dashboard's skill-import review (Phase 7c): the whole SKILL.md, because
+   this review is the only gate a third-party skill passes through. */
+.import-preview {
+  margin: 8px 0;
+  padding: 10px;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--danger, #d1524a);
+  border-radius: 6px;
+  max-height: 320px;
+  overflow: auto;
+}
+
 .widget-header {
   display: flex;
   align-items: center;

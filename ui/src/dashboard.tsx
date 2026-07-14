@@ -10,6 +10,7 @@ import {
   onVoiceTranscript,
   type AmbientStatus,
   type Automation,
+  type ImportPreview,
   type GatewayState,
   type InstalledModel,
   type LocalModel,
@@ -1687,6 +1688,91 @@ function AmbientPanel() {
   );
 }
 
+/**
+ * Importing a third-party skill from a local folder (Phase 7c).
+ *
+ * The dashboard is where the review happens; the final yes lives on the
+ * character's bubble as a red consent card, the same gate a self-learned draft
+ * passes through. The warning below is load-bearing: the runtime scans skill
+ * content for nothing, and an installed skill runs at the agent's full trust,
+ * so this review is the only gate a third-party skill ever passes through.
+ */
+function SkillImportPanel() {
+  const [path, setPath] = createSignal("");
+  const [preview, setPreview] = createSignal<ImportPreview | null>(null);
+  const [error, setError] = createSignal<string | null>(null);
+  const [asked, setAsked] = createSignal(false);
+
+  const review = async () => {
+    setError(null);
+    setPreview(null);
+    setAsked(false);
+    try {
+      setPreview(await api.previewSkillImport(path().trim()));
+    } catch (problem) {
+      setError(String(problem));
+    }
+  };
+
+  const ask = async () => {
+    setError(null);
+    try {
+      await api.requestSkillImport(path().trim());
+      setAsked(true);
+    } catch (problem) {
+      setError(String(problem));
+    }
+  };
+
+  return (
+    <section>
+      <h2>Import a skill</h2>
+      <p class="muted small">
+        A local folder containing a <code>SKILL.md</code>. An installed skill runs
+        with the agent's <strong>full trust</strong> and nothing scans its content
+        — this review is the only gate, so read it before you say yes.
+      </p>
+      <div class="row">
+        <input
+          type="text"
+          placeholder="C:\path\to\skill-folder"
+          value={path()}
+          onInput={(event) => setPath(event.currentTarget.value)}
+        />
+        <button onClick={() => void review()} disabled={!path().trim()}>
+          Review
+        </button>
+      </div>
+      <Show when={preview()}>
+        {(ready) => (
+          <>
+            <p>
+              <strong>{ready().name}</strong> — {ready().description}
+            </p>
+            <Show when={ready().files.length > 0}>
+              <p class="muted small">
+                Brings {ready().files.length} bundled file(s):{" "}
+                {ready()
+                  .files.map((file) => file.path)
+                  .join(", ")}
+              </p>
+            </Show>
+            <pre class="import-preview">{ready().skill_md}</pre>
+            <button onClick={() => void ask()} disabled={asked()}>
+              {asked()
+                ? "Waiting for your answer on the character…"
+                : "Ask to install"}
+            </button>
+          </>
+        )}
+      </Show>
+      <Show when={error()}>
+        <p class="error">{error()}</p>
+      </Show>
+    </section>
+  );
+}
+
 function Dashboard() {
   const [gateway, setGateway] = createSignal<GatewayState>({ state: "starting" });
   const [log, setLog] = createSignal("");
@@ -1734,6 +1820,7 @@ function Dashboard() {
       <ProfilePanel />
       <VoicePanel />
       <AmbientPanel />
+      <SkillImportPanel />
 
       <section>
         <h2>Gateway</h2>

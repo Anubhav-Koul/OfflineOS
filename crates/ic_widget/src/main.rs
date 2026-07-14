@@ -15,7 +15,7 @@
 // Release builds must not pop a console window behind the widget.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ic_llama::download::{Downloader, Progress, ProgressFn};
@@ -137,6 +137,23 @@ struct AppState {
     /// Which chat runs have already earned a reflection turn (Phase 7b). One watch
     /// for the whole app: run ids are unique, so it survives thread switches.
     reflection_runs: Mutex<RunWatch>,
+    /// The skill import awaiting its bubble answer (Phase 7c), if any. One at a
+    /// time — a new request replaces an unanswered one. Lives outside the
+    /// ambient service on purpose: an import is *solicited*, so it must work
+    /// with ambient off and must never spend a guardrail slot.
+    pending_import: Mutex<Option<PendingImport>>,
+}
+
+/// A reviewed skill import waiting for the user's yes or no.
+struct PendingImport {
+    /// The suggestion id the bubble answers with.
+    id: String,
+    /// The folder being imported.
+    folder: PathBuf,
+    /// The skill's validated name.
+    name: String,
+    /// The exact reviewed SKILL.md text — what an approval installs, verbatim.
+    skill_md: String,
 }
 
 /// The inputs the character state derives from, plus the last state emitted.
@@ -2008,6 +2025,89 @@ struct SkillInstallResult {
     error: Option<String>,
 }
 
+// ------------------------------------------------------------ skill import
+
+/// The record of every import consent card and its answer (Phase 7c). Its own
+/// file, deliberately not the ambient log: that one is the guardrail's rate
+/// memory, and a solicited import must never spend (or later replay into) an
+/// unsolicited-surfacing slot.
+fn import_log_path() -> Result<PathBuf, String> {
+    data_root()
+        .map(|base| base.join("skill-import-log.jsonl"))
+        .ok_or_else(|| "could not locate the local application data directory".to_string())
+}
+
+/// Append one event to the import log. Best-effort — an import the user can
+/// see and answer beats one refused because a log line failed — but loud,
+/// because the log is the audit trail of what was consented to.
+fn record_import_event(event: ic_widget::ambient::log::LogEvent) {
+    let outcome = import_log_path().and_then(|path| {
+        let mut log =
+            ic_widget::ambient::log::SurfacingLog::open(path).map_err(|error| error.to_string())?;
+        log.record(ic_widget::ambient::log::LogEntry {
+            at: chrono::Utc::now(),
+            event,
+        })
+        .map_err(|error| error.to_string())
+    });
+    if let Err(error) = outcome {
+        tracing::error!(%error, "could not record a skill-import event");
+    }
+}
+
+/// Read a skill folder and return everything the review needs. Pure — nothing
+/// is stored and nothing can install from here.
+#[tauri::command]
+async fn preview_skill_import(
+    path: String,
+) -> Result<ic_widget::skill_import::ImportPreview, String> {
+    ic_widget::skill_import::preview(Path::new(&path))
+}
+
+/// Put a reviewed import on the bubble as a consent card (Phase 7c).
+///
+/// The folder is re-read here — the preview the dashboard showed is advisory;
+/// what the card carries is what this call read, and what an approval installs
+/// is exactly the card's text. Works with ambient off: an import is solicited,
+/// so it neither needs the ambient service nor touches the guardrail.
+#[tauri::command]
+async fn request_skill_import(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<(), String> {
+    let folder = PathBuf::from(&path);
+    let preview = ic_widget::skill_import::preview(&folder)?;
+
+    let suggestion = Suggestion {
+        id: uuid::Uuid::new_v4().to_string(),
+        kind: SuggestionKind::SkillImport,
+        key: format!("skill-import:{}", preview.name),
+        source: format!("import:{}", preview.name),
+        headline: format!(
+            "Install the skill \u{201c}{}\u{201d} from this folder?",
+            preview.name
+        ),
+        body: preview.skill_md.clone(),
+        thread_id: None,
+    };
+    record_import_event(ic_widget::ambient::log::LogEvent::Surfaced {
+        id: suggestion.id.clone(),
+        key: suggestion.key.clone(),
+        source: suggestion.source.clone(),
+        headline: suggestion.headline.clone(),
+    });
+    *state.pending_import.lock().await = Some(PendingImport {
+        id: suggestion.id.clone(),
+        folder,
+        name: preview.name,
+        skill_md: preview.skill_md,
+    });
+    let _ = app.emit("ambient://suggestion", &suggestion);
+    update_character(&app, |inputs| inputs.suggestion_pending = true).await;
+    Ok(())
+}
+
 /// Answer a suggestion: Accept, or Not now.
 ///
 /// Accept means "show me": the app switches both windows to the thread the run
@@ -2020,6 +2120,61 @@ async fn respond_suggestion(
     id: String,
     accepted: bool,
 ) -> Result<(), String> {
+    // A pending skill import is answered first (Phase 7c): it exists even with
+    // ambient off, and its consent must not depend on the ambient service.
+    {
+        let mut pending = state.pending_import.lock().await;
+        if pending.as_ref().is_some_and(|import| import.id == id) {
+            let import = pending.take().expect("just matched");
+            drop(pending);
+            update_character(&app, |inputs| inputs.suggestion_pending = false).await;
+
+            let event = if accepted {
+                ic_widget::ambient::log::LogEvent::Accepted {
+                    id: import.id.clone(),
+                    key: format!("skill-import:{}", import.name),
+                    source: format!("import:{}", import.name),
+                }
+            } else {
+                ic_widget::ambient::log::LogEvent::Dismissed {
+                    id: import.id.clone(),
+                    key: format!("skill-import:{}", import.name),
+                    source: format!("import:{}", import.name),
+                }
+            };
+            record_import_event(event);
+            if !accepted {
+                return Ok(());
+            }
+
+            // The approved text installs verbatim — the folder is only re-read
+            // for its bundle files, never for the SKILL.md the user consented to.
+            let result = skills_root().and_then(|root| {
+                ic_widget::skill_import::install(&import.folder, &import.skill_md, &root)
+            });
+            let installed = match result {
+                Ok(name) => {
+                    tracing::info!(skill = %name, "imported a skill with the user's consent");
+                    SkillInstallResult {
+                        ok: true,
+                        name: Some(name),
+                        error: None,
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "the approved skill import did not install");
+                    SkillInstallResult {
+                        ok: false,
+                        name: None,
+                        error: Some(error),
+                    }
+                }
+            };
+            let _ = app.emit("ambient://install-result", &installed);
+            return Ok(());
+        }
+    }
+
     let Some(service) = state.ambient.lock().await.clone() else {
         return Ok(());
     };
@@ -2978,6 +3133,8 @@ fn main() {
             set_ambient_enabled,
             set_ambient_guardrails,
             set_reflection_enabled,
+            preview_skill_import,
+            request_skill_import,
             respond_suggestion,
             needs_setup,
             profile,
@@ -3023,6 +3180,7 @@ fn main() {
                 ambient_task: Mutex::new(None),
                 ambient_thread: Mutex::new(None),
                 reflection_runs: Mutex::new(RunWatch::new()),
+                pending_import: Mutex::new(None),
             });
 
             let handle = app.handle().clone();

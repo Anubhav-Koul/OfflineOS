@@ -257,46 +257,45 @@ function App() {
           source stays quiet for a while. A gate still outranks it — that one is
           blocking a run the user asked for.
 
-          A skill draft (Phase 7b) wears the red consent style, not the blue offer:
-          Accept *installs* — it changes what the agent can do from now on — so the
-          card shows the full text, and No is the default answer.
+          A skill draft (7b) or a skill import (7c) wears the red consent style,
+          not the blue offer: Accept *installs* — it changes what the agent can do
+          from now on — so the card shows the full text, and No is the default.
         */}
         <Show when={!interrupting() && suggestion()}>
-          {(pending) => (
-            <div
-              class={`ask solid ${
-                pending().kind === "skill_draft" ? "ask-install" : "ask-suggest"
-              }`}
-            >
-              <div class="ask-headline">{pending().headline}</div>
-              <Show
-                when={pending().kind === "skill_draft"}
-                fallback={<div class="ask-body">{pending().body}</div>}
-              >
-                <pre class="ask-skill-text">{pending().body}</pre>
-                <div class="ask-warning">
-                  Installing lets the agent use this in future tasks. Review it
-                  before saying yes.
-                </div>
-              </Show>
-              <div class="ask-actions">
-                <button
-                  class="deny"
-                  autofocus={pending().kind === "skill_draft"}
-                  onClick={() => void answer(false)}
+          {(pending) => {
+            const installs = () => pending().kind !== "automation";
+            return (
+              <div class={`ask solid ${installs() ? "ask-install" : "ask-suggest"}`}>
+                <div class="ask-headline">{pending().headline}</div>
+                <Show
+                  when={installs()}
+                  fallback={<div class="ask-body">{pending().body}</div>}
                 >
-                  {pending().kind === "skill_draft" ? "No" : "Not now"}
-                </button>
-                <button class="approve" onClick={() => void answer(true)}>
-                  {pending().kind === "skill_draft"
-                    ? "Install skill"
-                    : pending().thread_id
-                      ? "Show me"
-                      : "Thanks"}
-                </button>
+                  <pre class="ask-skill-text">{pending().body}</pre>
+                  <div class="ask-warning">
+                    Installing lets the agent use this in future tasks. Review it
+                    before saying yes.
+                  </div>
+                </Show>
+                <div class="ask-actions">
+                  <button
+                    class="deny"
+                    autofocus={installs()}
+                    onClick={() => void answer(false)}
+                  >
+                    {installs() ? "No" : "Not now"}
+                  </button>
+                  <button class="approve" onClick={() => void answer(true)}>
+                    {installs()
+                      ? "Install skill"
+                      : pending().thread_id
+                        ? "Show me"
+                        : "Thanks"}
+                  </button>
+                </div>
               </div>
-            </div>
-          )}
+            );
+          }}
         </Show>
 
         {/* The one-line receipt after an approved draft installs (or fails to). */}

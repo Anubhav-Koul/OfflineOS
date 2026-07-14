@@ -250,7 +250,7 @@ export interface AmbientStatus {
  */
 export interface Suggestion {
   id: string;
-  kind: "automation" | "skill_draft";
+  kind: "automation" | "skill_draft" | "skill_import";
   key: string;
   source: string;
   headline: string;
@@ -264,6 +264,25 @@ export interface SkillInstallResult {
   ok: boolean;
   name: string | null;
   error: string | null;
+}
+
+/** One file riding along with an imported skill. */
+export interface ImportFile {
+  path: string;
+  bytes: number;
+}
+
+/**
+ * A skill folder's review (Phase 7c). The runtime scans skill text for
+ * nothing, and an installed skill runs at full trust — this review is the only
+ * gate a third-party skill passes through, which is why it carries the whole
+ * text and not a summary.
+ */
+export interface ImportPreview {
+  name: string;
+  description: string;
+  skill_md: string;
+  files: ImportFile[];
 }
 
 /** One recorded take of the wake phrase. */
@@ -368,6 +387,13 @@ export const api = {
   /** Turn the reflection pass on or off. No restart. */
   setReflectionEnabled: (enabled: boolean) =>
     invoke<void>("set_reflection_enabled", { enabled }),
+  /** Read a skill folder for review. Pure — nothing stores, nothing installs. */
+  previewSkillImport: (path: string) =>
+    invoke<ImportPreview>("preview_skill_import", { path }),
+  /** Put a reviewed import on the bubble as a consent card. The final yes/no
+   *  happens there, and only a yes installs. */
+  requestSkillImport: (path: string) =>
+    invoke<void>("request_skill_import", { path }),
   /** Answer a suggestion. Accept opens the run's thread — or, for a skill
    *  draft, installs it. Both answers are recorded. */
   respondSuggestion: (id: string, accepted: boolean) =>

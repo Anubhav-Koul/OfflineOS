@@ -16,7 +16,7 @@
 //! for how CI builds the `serve` binary before running it.
 
 use std::io::Read as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -65,6 +65,13 @@ pub fn reborn_bin() -> PathBuf {
 pub fn free_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     listener.local_addr().expect("local_addr").port()
+}
+
+/// The `IRONCLAW_REBORN_HOME` a server started over `home_root` uses. Lets a
+/// restart probe locate on-disk state — installed skills live under
+/// `<reborn home>/local-dev/skills/<name>/SKILL.md`.
+pub fn reborn_home_dir(home_root: &Path) -> PathBuf {
+    home_root.join("reborn-home")
 }
 
 /// What the mock LLM answers one Chat Completions request with.
@@ -297,7 +304,9 @@ pub struct RebornServer {
     /// Kept alive for the lifetime of the server. `None` when a real provider
     /// is in use.
     _mock: Option<MockLlm>,
-    _home: tempfile::TempDir,
+    /// The server's on-disk state, deleted on drop. `None` when the caller owns
+    /// the home directory (a restart probe reusing one home across two servers).
+    _home: Option<tempfile::TempDir>,
     client: reqwest::Client,
 }
 
@@ -308,7 +317,7 @@ impl RebornServer {
     pub async fn start() -> RebornServer {
         let answer = format!("icinteg-ok-{}", Uuid::new_v4().simple());
         let mock = MockLlm::start(answer.clone()).await;
-        Self::start_with_mock(mock, answer, Vec::new()).await
+        Self::start_with_mock(mock, answer, Vec::new(), None).await
     }
 
     /// Spawn `serve` against a mock LLM you built yourself (so the test can drive
@@ -322,13 +331,30 @@ impl RebornServer {
         extra_env: Vec<(String, String)>,
     ) -> RebornServer {
         let mock = MockLlm::start_responding(responder).await;
-        Self::start_with_mock(mock, answer, extra_env).await
+        Self::start_with_mock(mock, answer, extra_env, None).await
+    }
+
+    /// Like [`RebornServer::start_scripted`], but over a caller-owned home
+    /// directory instead of a fresh tempdir. Two consecutive servers over the
+    /// same directory share all on-disk state (the libSQL store, installed
+    /// skills) — the only way a test can observe what survives a gateway
+    /// restart. Drop the first server before starting the second: it holds the
+    /// libSQL write lock and the home is not built for two writers.
+    pub async fn start_scripted_in_home(
+        responder: MockResponder,
+        answer: String,
+        extra_env: Vec<(String, String)>,
+        home_root: &Path,
+    ) -> RebornServer {
+        let mock = MockLlm::start_responding(responder).await;
+        Self::start_with_mock(mock, answer, extra_env, Some(home_root.to_path_buf())).await
     }
 
     async fn start_with_mock(
         mock: MockLlm,
         answer: String,
         extra_env: Vec<(String, String)>,
+        external_home: Option<PathBuf>,
     ) -> RebornServer {
         // Force the hermetic mock; `LLM_BACKEND` set means no other provider env
         // (a developer's real keys) is consulted.
@@ -339,7 +365,7 @@ impl RebornServer {
             ("LLM_MODEL".to_string(), "mock-model".to_string()),
         ];
         env.extend(extra_env);
-        Self::start_inner(env, Some(mock), answer).await
+        Self::start_inner(env, Some(mock), answer, external_home).await
     }
 
     /// Spawn `serve` wired to whatever provider `llm_env` describes — in
@@ -349,13 +375,14 @@ impl RebornServer {
     /// [`RebornServer::answer`] is empty here: a real model's reply is not known
     /// ahead of time, so callers assert on its content instead.
     pub async fn start_with_llm(llm_env: Vec<(String, String)>) -> RebornServer {
-        Self::start_inner(llm_env, None, String::new()).await
+        Self::start_inner(llm_env, None, String::new(), None).await
     }
 
     async fn start_inner(
         llm_env: Vec<(String, String)>,
         mock: Option<MockLlm>,
         answer: String,
+        external_home: Option<PathBuf>,
     ) -> RebornServer {
         let bin = reborn_bin();
         assert!(
@@ -366,7 +393,13 @@ impl RebornServer {
             bin.display()
         );
 
-        let home = tempfile::tempdir().expect("tempdir");
+        let (home_root, home_guard) = match external_home {
+            Some(root) => (root, None),
+            None => {
+                let dir = tempfile::tempdir().expect("tempdir");
+                (dir.path().to_path_buf(), Some(dir))
+            }
+        };
         // Any non-empty token works for the single-operator env-bearer auth
         // (SSO, which imposes a 32-byte minimum, is not enabled here).
         let token = format!("icinteg-token-{}", Uuid::new_v4().simple());
@@ -380,10 +413,10 @@ impl RebornServer {
             .arg("127.0.0.1")
             .arg("--port")
             .arg(port.to_string())
-            // Isolate all on-disk state to the tempdir.
-            .env("IRONCLAW_REBORN_HOME", home.path().join("reborn-home"))
-            .env("HOME", home.path().join("home"))
-            .env("USERPROFILE", home.path().join("home"))
+            // Isolate all on-disk state to the home root.
+            .env("IRONCLAW_REBORN_HOME", reborn_home_dir(&home_root))
+            .env("HOME", home_root.join("home"))
+            .env("USERPROFILE", home_root.join("home"))
             .env("IRONCLAW_REBORN_PROFILE", "local-dev")
             // Single-operator env-bearer auth.
             .env("IRONCLAW_REBORN_WEBUI_TOKEN", &token)
@@ -458,7 +491,7 @@ impl RebornServer {
             answer,
             stderr,
             _mock: mock,
-            _home: home,
+            _home: home_guard,
             client,
         }
     }

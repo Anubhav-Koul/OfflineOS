@@ -228,7 +228,7 @@ async fn a_fired_automation_surfaces_once_with_its_reply() {
     // The gateway's own poller fires it. The cron minimum is 60 s, so the first fire
     // lands at the next minute boundary.
     let fired = server
-        .wait_for_new_thread(&[chat.clone()], Duration::from_secs(150))
+        .wait_for_new_thread(std::slice::from_ref(&chat), Duration::from_secs(150))
         .await
         .unwrap_or_else(|| {
             panic!(

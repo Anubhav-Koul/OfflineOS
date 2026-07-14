@@ -532,6 +532,31 @@ impl RebornServer {
         body
     }
 
+    /// The raw timeline body with paging — `{ messages: [...], next_cursor? }`.
+    /// Note `next_cursor` is **omitted** (not null) when there is no next page.
+    pub async fn timeline_raw(
+        &self,
+        thread_id: &str,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+    ) -> serde_json::Value {
+        let mut request = self
+            .client
+            .get(self.url(&format!("/threads/{thread_id}/timeline")))
+            .bearer_auth(&self.token);
+        if let Some(limit) = limit {
+            request = request.query(&[("limit", limit.to_string())]);
+        }
+        if let Some(cursor) = cursor {
+            request = request.query(&[("cursor", cursor)]);
+        }
+        let response = request.send().await.expect("timeline request");
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.expect("timeline json");
+        assert!(status.is_success(), "timeline failed ({status}): {body}");
+        body
+    }
+
     /// Poll the timeline until `needle` appears in it or `timeout` elapses.
     /// The assistant reply is persisted as a thread message and read back from
     /// the timeline (it is not carried as a `text` item in the projection SSE
@@ -585,6 +610,61 @@ impl RebornServer {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// The raw `GET /threads` body, with optional paging — the shape the Chats
+    /// panel reads (`{ threads: [...], next_cursor: "…"|null }`).
+    pub async fn threads_raw(
+        &self,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+    ) -> serde_json::Value {
+        let mut request = self.client.get(self.url("/threads")).bearer_auth(&self.token);
+        if let Some(limit) = limit {
+            request = request.query(&[("limit", limit.to_string())]);
+        }
+        if let Some(cursor) = cursor {
+            request = request.query(&[("cursor", cursor)]);
+        }
+        let response = request.send().await.expect("list threads request");
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.expect("threads json");
+        assert!(status.is_success(), "list threads failed ({status}): {body}");
+        body
+    }
+
+    /// Cancel a run — the Stop button. Panics on a non-success status; use
+    /// [`RebornServer::cancel_run_raw`] to inspect the failure modes.
+    pub async fn cancel_run(&self, thread_id: &str, run_id: &str) -> serde_json::Value {
+        let (status, body) = self.cancel_run_raw(thread_id, run_id).await;
+        assert!(status.is_success(), "cancel failed ({status}): {body}");
+        body
+    }
+
+    /// Cancel a run, returning the status alongside the body — for the races the
+    /// Stop button actually lives in (already-terminal, unknown run).
+    pub async fn cancel_run_raw(
+        &self,
+        thread_id: &str,
+        run_id: &str,
+    ) -> (reqwest::StatusCode, serde_json::Value) {
+        let response = self
+            .client
+            .post(self.url(&format!("/threads/{thread_id}/runs/{run_id}/cancel")))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({
+                "client_action_id": Uuid::new_v4().to_string(),
+                "reason": "user_requested",
+            }))
+            .send()
+            .await
+            .expect("cancel request");
+        let status = response.status();
+        let body = response
+            .json()
+            .await
+            .unwrap_or(serde_json::Value::Null);
+        (status, body)
     }
 
     /// The raw `GET /automations` body.

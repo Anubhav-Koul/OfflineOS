@@ -603,12 +603,60 @@ button.stop {
 }
 
 /* Dashboard */
+/* The two-pane dashboard shell (Phase 8a): a fixed sidebar, and the selected
+   panel scrolling on the right. The panel column keeps the old `.dashboard`
+   rules so every existing panel renders exactly as it did. */
+.dashboard-shell {
+  display: grid;
+  grid-template-columns: 200px 1fr;
+  min-height: 100vh;
+  background: var(--bg);
+}
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 16px 8px;
+  background: var(--panel);
+  border-right: 1px solid #262a33;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+}
+.sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px 14px;
+  font-weight: 600;
+}
+.nav-item {
+  text-align: left;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+}
+.nav-item:hover {
+  background: #22262e;
+  color: var(--text);
+}
+.nav-item.active {
+  background: #2b3140;
+  color: var(--text);
+}
+
 .dashboard {
   max-width: 860px;
   margin: 0 auto;
   padding: 24px;
   background: var(--bg);
   min-height: 100vh;
+  width: 100%;
 }
 
 /* First-run wizard: a dimmed overlay with a centered welcome card. */

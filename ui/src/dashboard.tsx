@@ -2083,10 +2083,31 @@ function SkillImportPanel() {
   );
 }
 
+/**
+ * The sidebar's sections (Phase 8a).
+ *
+ * Connectors is deliberately absent: it arrives with 8b, and a nav entry that
+ * opens an empty panel is worse than no entry. The unavailable-panel list keeps
+ * its own entry, with the reasons, because "no route exists" is information.
+ */
+const SECTIONS = [
+  { id: "chats", label: "Chats" },
+  { id: "automations", label: "Automations" },
+  { id: "ambient", label: "Ambient" },
+  { id: "voice", label: "Voice" },
+  { id: "models", label: "Models & Providers" },
+  { id: "skills", label: "Skills" },
+  { id: "settings", label: "Settings" },
+  { id: "unavailable", label: "Not available yet" },
+] as const;
+
+type SectionId = (typeof SECTIONS)[number]["id"];
+
 function Dashboard() {
   const [gateway, setGateway] = createSignal<GatewayState>({ state: "starting" });
   const [log, setLog] = createSignal("");
   const [showWizard, setShowWizard] = createSignal(false);
+  const [section, setSection] = createSignal<SectionId>("chats");
 
   const sessions = createPanelData<Thread>(api.listThreads);
   const automations = createPanelData<Automation>(api.listAutomations);
@@ -2128,19 +2149,59 @@ function Dashboard() {
   const refreshLog = async () => setLog(await api.gatewayLog());
 
   return (
-    <div class="dashboard">
+    <div class="dashboard-shell">
       <Show when={showWizard()}>
         <SetupWizard onDone={() => setShowWizard(false)} />
       </Show>
-      <h1>IronClaw Desktop</h1>
 
-      <ChatPane />
-      <ProfilePanel />
-      <VoicePanel />
-      <AmbientPanel />
-      <WatchersPanel />
-      <SkillImportPanel />
+      {/*
+        Two-pane shell (Phase 8a). The panels below are unchanged — each is
+        wrapped in a nav `Show` rather than extracted, so this layout commit
+        cannot alter any panel's behaviour. A hidden panel unmounts, which means
+        it refetches when reopened; that is the wanted behaviour, since several
+        panels restart the gateway underneath us.
+      */}
+      <nav class="sidebar">
+        <div class="sidebar-brand">
+          IronClaw
+          <span class={`badge ${gateway().state}`}>{gateway().state}</span>
+        </div>
+        <For each={SECTIONS}>
+          {(entry) => (
+            <button
+              type="button"
+              class={`nav-item ${section() === entry.id ? "active" : ""}`}
+              onClick={() => setSection(entry.id)}
+            >
+              {entry.label}
+            </button>
+          )}
+        </For>
+      </nav>
 
+      <main class="dashboard">
+        <Show when={section() === "chats"}>
+          <ChatPane />
+        </Show>
+
+        <Show when={section() === "settings"}>
+          <ProfilePanel />
+        </Show>
+
+        <Show when={section() === "voice"}>
+          <VoicePanel />
+        </Show>
+
+        <Show when={section() === "ambient"}>
+          <AmbientPanel />
+          <WatchersPanel />
+        </Show>
+
+        <Show when={section() === "skills"}>
+          <SkillImportPanel />
+        </Show>
+
+      <Show when={section() === "settings"}>
       <section>
         <h2>Gateway</h2>
         <p>
@@ -2154,7 +2215,9 @@ function Dashboard() {
         <button onClick={() => void refreshLog()}>Refresh log</button>
         <pre class="log">{log() || "(no output yet)"}</pre>
       </section>
+      </Show>
 
+      <Show when={section() === "chats"}>
       <section>
         <div class="panel-head">
           <h2>Sessions</h2>
@@ -2181,7 +2244,9 @@ function Dashboard() {
           </ul>
         </PanelBody>
       </section>
+      </Show>
 
+      <Show when={section() === "automations"}>
       <section>
         <div class="panel-head">
           <h2>Automations</h2>
@@ -2227,7 +2292,9 @@ function Dashboard() {
           </ul>
         </PanelBody>
       </section>
+      </Show>
 
+      <Show when={section() === "models"}>
       <section>
         <div class="panel-head">
           <h2>Local model</h2>
@@ -2339,10 +2406,14 @@ function Dashboard() {
 
       <ModelsPanel />
 
-      <CharacterPanel />
-
       <ProviderPanel />
+      </Show>
 
+      <Show when={section() === "settings"}>
+        <CharacterPanel />
+      </Show>
+
+      <Show when={section() === "unavailable"}>
       <section>
         <h2>Not available yet</h2>
         <p class="muted">
@@ -2357,6 +2428,8 @@ function Dashboard() {
           ))}
         </ul>
       </section>
+      </Show>
+      </main>
     </div>
   );
 }

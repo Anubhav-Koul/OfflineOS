@@ -12,6 +12,7 @@ import {
 
 import {
   api,
+  onAmbientSuggestion,
   onCharacterActive,
   onCharacterState,
   onCursorPos,
@@ -21,6 +22,7 @@ import {
   type GatewayState,
   type HitMask,
   type Profile,
+  type Suggestion,
   type VoiceState,
 } from "./api";
 import { createChat } from "./chat";
@@ -170,6 +172,19 @@ function App() {
   const [says, setSays] = createSignal<string | null>(null);
   let saysTimer: ReturnType<typeof setTimeout> | undefined;
 
+  /**
+   * What the character has volunteered and is waiting on an answer for. Only ever
+   * one: the guardrail caps surfacings at a couple an hour, and a stack of unread
+   * suggestions is a notification centre, which is the thing this is not.
+   */
+  const [suggestion, setSuggestion] = createSignal<Suggestion | null>(null);
+  const answer = async (accepted: boolean) => {
+    const pending = suggestion();
+    if (!pending) return;
+    setSuggestion(null);
+    await api.respondSuggestion(pending.id, accepted).catch(() => undefined);
+  };
+
   createEffect(() => {
     const reply = chat.lastReply();
     clearTimeout(saysTimer);
@@ -194,6 +209,7 @@ function App() {
     void (async () => {
       cleanups.push(await chat.start());
       cleanups.push(await onProfileChanged(setProfile));
+      cleanups.push(await onAmbientSuggestion(setSuggestion));
       try {
         setProfile(await api.profile());
       } catch {
@@ -219,7 +235,30 @@ function App() {
         interruption, and both are anchored to the character.
       */}
       <div class="stage">
-        <Show when={says() && !interrupting()}>
+        {/*
+          The character speaking first (Phase 7a). It is not a notification: it is
+          a question, with two answers, and "Not now" is recorded so the same
+          source stays quiet for a while. A gate still outranks it — that one is
+          blocking a run the user asked for.
+        */}
+        <Show when={!interrupting() && suggestion()}>
+          {(pending) => (
+            <div class="ask ask-suggest solid">
+              <div class="ask-headline">{pending().headline}</div>
+              <div class="ask-body">{pending().body}</div>
+              <div class="ask-actions">
+                <button class="deny" onClick={() => void answer(false)}>
+                  Not now
+                </button>
+                <button class="approve" onClick={() => void answer(true)}>
+                  {pending().thread_id ? "Show me" : "Thanks"}
+                </button>
+              </div>
+            </div>
+          )}
+        </Show>
+
+        <Show when={says() && !interrupting() && !suggestion()}>
           {(text) => (
             <div class="say solid">
               <div class="say-cloud">{text()}</div>
@@ -228,7 +267,7 @@ function App() {
           )}
         </Show>
 
-        <Show when={!says() && chat.statusLine() && !interrupting()}>
+        <Show when={!says() && chat.statusLine() && !interrupting() && !suggestion()}>
           {(line) => (
             <div class="say say-thinking solid">
               <div class="say-cloud">{line()}</div>
@@ -237,7 +276,7 @@ function App() {
           )}
         </Show>
 
-        <Show when={chat.gateway().state !== "ready" && !interrupting()}>
+        <Show when={chat.gateway().state !== "ready" && !interrupting() && !suggestion()}>
           <div class="say say-status solid">
             <div class="say-cloud">
               <HealthBadge state={chat.gateway()} />
@@ -305,7 +344,7 @@ function App() {
       </div>
 
       <CharacterView
-        speaking={() => says() !== null || interrupting()}
+        speaking={() => says() !== null || interrupting() || suggestion() !== null}
         onHeadTap={() => void api.openDashboard().catch(() => undefined)}
       />
     </div>

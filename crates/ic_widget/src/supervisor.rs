@@ -114,6 +114,13 @@ pub struct GatewayConfig {
     /// Provider environment, e.g. what `ic_llama::LlmEnv` emits for a local
     /// model. Applied on top of the inherited environment.
     pub llm_env: Vec<(String, String)>,
+    /// Runtime switches the widget decides per launch — today, whether the trigger
+    /// poller runs (`IRONCLAW_TRIGGER_POLLER_ENABLED`, which the runtime leaves
+    /// **off** by default, so a scheduled automation never fires without it).
+    ///
+    /// Separate from [`Self::llm_env`] because it is not a provider choice and is
+    /// not rebuilt when the provider changes.
+    pub extra_env: Vec<(String, String)>,
     /// How long one spawn has to become ready.
     pub startup_timeout: Duration,
     /// Consecutive failures before giving up.
@@ -137,6 +144,7 @@ impl GatewayConfig {
             token,
             user_id: DEFAULT_OWNER_USER_ID.to_string(),
             llm_env: Vec::new(),
+            extra_env: Vec::new(),
             // The first boot installs bundled skills and runs migrations.
             startup_timeout: Duration::from_secs(90),
             max_crashes: 3,
@@ -191,6 +199,7 @@ impl GatewayConfig {
             ("IRONCLAW_REBORN_WEBUI_USER_ID".into(), self.user_id.clone()),
         ];
         env.extend(self.llm_env.iter().cloned());
+        env.extend(self.extra_env.iter().cloned());
         env
     }
 }
@@ -662,6 +671,20 @@ mod tests {
         let env: std::collections::HashMap<_, _> = config.env().into_iter().collect();
         assert_eq!(env["LLM_BACKEND"], "openai_compatible");
         assert_eq!(env["IRONCLAW_REBORN_PROFILE"], "local-dev");
+    }
+
+    #[test]
+    fn the_trigger_poller_is_only_on_when_the_widget_asks_for_it() {
+        // The runtime's own default is *off*, so a scheduled automation never fires
+        // unless this variable is in the child's environment. Ambient mode is the
+        // only thing that puts it there — see `ambient`.
+        let plain: std::collections::HashMap<_, _> = config().env().into_iter().collect();
+        assert!(!plain.contains_key("IRONCLAW_TRIGGER_POLLER_ENABLED"));
+
+        let mut ambient = config();
+        ambient.extra_env = vec![("IRONCLAW_TRIGGER_POLLER_ENABLED".into(), "true".into())];
+        let env: std::collections::HashMap<_, _> = ambient.env().into_iter().collect();
+        assert_eq!(env["IRONCLAW_TRIGGER_POLLER_ENABLED"], "true");
     }
 
     #[test]

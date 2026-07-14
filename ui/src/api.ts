@@ -179,6 +179,7 @@ export type CharacterState =
   | "listening"
   | "thinking"
   | "speaking"
+  | "suggesting"
   | "concerned"
   | "error";
 
@@ -219,6 +220,36 @@ export type ReplyMode = "read" | "hear" | "both";
 export interface VoiceSettings {
   /** `null` follows the OS default — which is often a deaf Bluetooth headset. */
   input_device: string | null;
+}
+
+/**
+ * Ambient mode: whether the character may speak first, and the guardrails on it.
+ *
+ * `enabled` is also what runs the gateway's trigger poller, so with it off a
+ * scheduled automation is listed but never fires. Toggling it restarts the gateway.
+ */
+export interface AmbientStatus {
+  enabled: boolean;
+  /** Whether the watcher is live against a running gateway. */
+  running: boolean;
+  max_per_hour: number;
+  /** Local hours; both `null` means no quiet window. */
+  quiet_start: number | null;
+  quiet_end: number | null;
+}
+
+/**
+ * Something the character volunteered. Answer it with Accept or Not now — both are
+ * recorded, and a "Not now" quiets that `source` for an hour.
+ */
+export interface Suggestion {
+  id: string;
+  key: string;
+  source: string;
+  headline: string;
+  body: string;
+  /** The thread the detail lives in, when one could be identified. */
+  thread_id: string | null;
 }
 
 /** One recorded take of the wake phrase. */
@@ -309,7 +340,28 @@ export const api = {
   needsSetup: () => invoke<boolean>("needs_setup"),
   /** Mark first-run setup complete. */
   completeSetup: () => invoke<void>("complete_setup"),
+  /** Whether the character may speak first, and under what limits. */
+  ambientStatus: () => invoke<AmbientStatus>("ambient_status"),
+  /** Turn ambient mode on or off. Restarts the gateway (the trigger poller is a
+   *  boot-time switch), so both windows reload. */
+  setAmbientEnabled: (enabled: boolean) => invoke<void>("set_ambient_enabled", { enabled }),
+  /** Change the interruption limits. Takes effect on the next tick, no restart. */
+  setAmbientGuardrails: (
+    maxPerHour: number,
+    quietStart: number | null,
+    quietEnd: number | null,
+  ) => invoke<void>("set_ambient_guardrails", { maxPerHour, quietStart, quietEnd }),
+  /** Answer a suggestion. Accept opens the run's thread; both answers are recorded. */
+  respondSuggestion: (id: string, accepted: boolean) =>
+    invoke<void>("respond_suggestion", { id, accepted }),
 };
+
+/** Subscribe to suggestions the character volunteers. */
+export function onAmbientSuggestion(
+  handler: (suggestion: Suggestion) => void,
+): Promise<UnlistenFn> {
+  return listen<Suggestion>("ambient://suggestion", (event) => handler(event.payload));
+}
 
 /** The voice UI status (mirrors the Rust `VoiceStatus`). */
 export interface VoiceStatus {

@@ -67,6 +67,33 @@ pub fn free_port() -> u16 {
     listener.local_addr().expect("local_addr").port()
 }
 
+/// What the mock LLM answers one Chat Completions request with.
+///
+/// A plain [`MockReply::Text`] ends the turn. A [`MockReply::ToolCall`] makes the
+/// agent execute a real tool and come back for another completion — which is the
+/// only way a test can reach a capability the agent alone can invoke (there is no
+/// HTTP route that creates a trigger; see `docs/desktop/dashboard-gaps.md`).
+#[derive(Debug, Clone)]
+pub enum MockReply {
+    /// A final assistant message.
+    Text(String),
+    /// A tool call. `name` is the **model-visible** tool name (capability id with
+    /// `.` folded to `__`, e.g. `builtin__trigger_create`).
+    ToolCall {
+        /// Model-visible tool name.
+        name: String,
+        /// The tool arguments, serialized into the OpenAI `arguments` string.
+        arguments: serde_json::Value,
+    },
+}
+
+/// Decides what the mock answers, given the raw request body IronClaw sent.
+///
+/// Content-conditioned rather than a fixed script, because more than one thread
+/// (chat, ambient, a trigger-fired run) can be in flight against the same mock and
+/// a positional script would depend on their interleaving.
+pub type MockResponder = Arc<dyn Fn(&str) -> MockReply + Send + Sync>;
+
 /// A minimal OpenAI-compatible mock LLM server.
 pub struct MockLlm {
     /// The localhost port the mock is listening on.
@@ -78,6 +105,12 @@ pub struct MockLlm {
 impl MockLlm {
     /// Start the mock, answering every Chat Completions request with `answer`.
     pub async fn start(answer: String) -> MockLlm {
+        let reply = MockReply::Text(answer);
+        Self::start_responding(Arc::new(move |_| reply.clone())).await
+    }
+
+    /// Start the mock with a responder that inspects each request body.
+    pub async fn start_responding(responder: MockResponder) -> MockLlm {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock llm");
@@ -89,12 +122,12 @@ impl MockLlm {
                 let Ok((socket, _)) = listener.accept().await else {
                     break;
                 };
-                let answer = answer.clone();
+                let responder = Arc::clone(&responder);
                 let sink = Arc::clone(&sink);
                 tokio::spawn(async move {
                     // Best-effort: a broken connection just means the client
                     // gave up; nothing for the test to do about it.
-                    let _ = serve_mock_connection(socket, &answer, sink).await;
+                    let _ = serve_mock_connection(socket, responder, sink).await;
                 });
             }
         });
@@ -133,7 +166,7 @@ impl Drop for MockLlm {
 /// responding avoids a request-side broken-pipe error on the client.
 async fn serve_mock_connection(
     mut socket: tokio::net::TcpStream,
-    answer: &str,
+    responder: MockResponder,
     requests: Arc<Mutex<Vec<String>>>,
 ) -> std::io::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
@@ -170,12 +203,13 @@ async fn serve_mock_connection(
     }
 
     let is_chat = request_line.contains("chat/completions");
+    let request_body = String::from_utf8_lossy(&buf[header_end..]).into_owned();
     if is_chat && let Ok(mut guard) = requests.lock() {
-        guard.push(String::from_utf8_lossy(&buf[header_end..]).into_owned());
+        guard.push(request_body.clone());
     }
 
     let body = if is_chat {
-        chat_completion_json(answer)
+        chat_completion_json(&responder(&request_body))
     } else {
         // `/v1/models` and anything else the provider probes.
         models_json()
@@ -191,17 +225,31 @@ async fn serve_mock_connection(
     Ok(())
 }
 
-fn chat_completion_json(answer: &str) -> String {
+fn chat_completion_json(reply: &MockReply) -> String {
+    let (message, finish_reason) = match reply {
+        MockReply::Text(answer) => (
+            serde_json::json!({ "role": "assistant", "content": answer }),
+            "stop",
+        ),
+        MockReply::ToolCall { name, arguments } => (
+            serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-mock-1",
+                    "type": "function",
+                    "function": { "name": name, "arguments": arguments.to_string() }
+                }]
+            }),
+            "tool_calls",
+        ),
+    };
     serde_json::json!({
         "id": "chatcmpl-mock",
         "object": "chat.completion",
         "created": 0,
         "model": "mock-model",
-        "choices": [{
-            "index": 0,
-            "message": { "role": "assistant", "content": answer },
-            "finish_reason": "stop"
-        }],
+        "choices": [{ "index": 0, "message": message, "finish_reason": finish_reason }],
         "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
     })
     .to_string()
@@ -260,15 +308,38 @@ impl RebornServer {
     pub async fn start() -> RebornServer {
         let answer = format!("icinteg-ok-{}", Uuid::new_v4().simple());
         let mock = MockLlm::start(answer.clone()).await;
+        Self::start_with_mock(mock, answer, Vec::new()).await
+    }
+
+    /// Spawn `serve` against a mock LLM you built yourself (so the test can drive
+    /// tool calls), plus any extra environment the runtime should see.
+    ///
+    /// `answer` is only what [`RebornServer::answer`] reports; the mock's own
+    /// responder decides what it actually replies with.
+    pub async fn start_scripted(
+        responder: MockResponder,
+        answer: String,
+        extra_env: Vec<(String, String)>,
+    ) -> RebornServer {
+        let mock = MockLlm::start_responding(responder).await;
+        Self::start_with_mock(mock, answer, extra_env).await
+    }
+
+    async fn start_with_mock(
+        mock: MockLlm,
+        answer: String,
+        extra_env: Vec<(String, String)>,
+    ) -> RebornServer {
         // Force the hermetic mock; `LLM_BACKEND` set means no other provider env
         // (a developer's real keys) is consulted.
-        let llm_env = vec![
+        let mut env = vec![
             ("LLM_BACKEND".to_string(), "openai_compatible".to_string()),
             ("LLM_BASE_URL".to_string(), mock.base_url()),
             ("LLM_API_KEY".to_string(), "test-key".to_string()),
             ("LLM_MODEL".to_string(), "mock-model".to_string()),
         ];
-        Self::start_inner(llm_env, Some(mock), answer).await
+        env.extend(extra_env);
+        Self::start_inner(env, Some(mock), answer).await
     }
 
     /// Spawn `serve` wired to whatever provider `llm_env` describes — in
@@ -447,6 +518,75 @@ impl RebornServer {
             }
             if Instant::now() >= deadline {
                 return (false, timeline);
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    /// Every thread id `GET /threads` reports for the authenticated caller.
+    ///
+    /// A trigger-fired run lands in a thread the *poller* created, not one the
+    /// caller created, so this is the only way the widget can find it: automations
+    /// carry no thread id or run id on the wire.
+    pub async fn thread_ids(&self) -> Vec<String> {
+        let response = self
+            .client
+            .get(self.url("/threads"))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .expect("list threads request");
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.expect("threads json");
+        assert!(
+            status.is_success(),
+            "list threads failed ({status}): {body}"
+        );
+        body["threads"]
+            .as_array()
+            .map(|threads| {
+                threads
+                    .iter()
+                    .filter_map(|thread| thread["thread_id"].as_str())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The raw `GET /automations` body.
+    pub async fn automations(&self) -> serde_json::Value {
+        let response = self
+            .client
+            .get(self.url("/automations"))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .expect("list automations request");
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.expect("automations json");
+        assert!(
+            status.is_success(),
+            "list automations failed ({status}): {body}"
+        );
+        body
+    }
+
+    /// Poll `GET /threads` until a thread id appears that is not in `known`, or
+    /// `timeout` elapses. Returns the new thread id.
+    pub async fn wait_for_new_thread(&self, known: &[String], timeout: Duration) -> Option<String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let found = self
+                .thread_ids()
+                .await
+                .into_iter()
+                .find(|id| !known.contains(id));
+            if found.is_some() {
+                return found;
+            }
+            if Instant::now() >= deadline {
+                return None;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }

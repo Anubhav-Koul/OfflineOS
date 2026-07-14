@@ -182,6 +182,16 @@ body.widget-body {
   background: rgba(38, 22, 22, 0.97);
 }
 
+/*
+ * An ambient suggestion. Deliberately the calmest of the three cards: an approval
+ * is amber and a sensitive fill is red because they block something; this one is
+ * only an offer, and it must never read as an alarm.
+ */
+.ask-suggest {
+  border-color: var(--accent, #4a7fd1);
+  background: rgba(22, 28, 38, 0.97);
+}
+
 .widget-header {
   display: flex;
   align-items: center;

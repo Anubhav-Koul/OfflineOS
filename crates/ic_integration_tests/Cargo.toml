@@ -40,6 +40,11 @@ ic_llama = { path = "../ic_llama" }
 # expectations of it drift.
 ic_browser_mcp = { path = "../ic_browser_mcp" }
 ic_canvas_mcp = { path = "../ic_canvas_mcp" }
+# `tests/ambient_surfacing.rs` — the Phase 7a gate. It drives the widget's *own*
+# ambient watcher over a real trigger fire on a real gateway, so a change in where
+# a fired run lands fails here rather than in a user's face. The lib builds without
+# Tauri (the `app` feature is off), so this costs no WebView.
+ic_widget = { path = "../ic_widget" }
 ironclaw_extensions = { path = "../ironclaw_extensions" }
 ironclaw_host_api = { path = "../ironclaw_host_api" }
 # For `default_host_port_catalog()` — the same catalog the runtime validates

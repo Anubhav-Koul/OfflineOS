@@ -6,6 +6,7 @@
 //!
 //! | Module | Responsibility |
 //! |---|---|
+//! | [`ambient`] | The character speaking first: suggestions, guardrails, the log |
 //! | [`browser`] | Supervising the browser MCP sidecar; registering its tools |
 //! | [`canvas`] | The in-process canvas MCP server; rendering agent HTML/SVG |
 //! | [`gateway_client`] | The only place we talk to `ironclaw-reborn serve` |
@@ -18,6 +19,7 @@
 
 #![deny(missing_docs)]
 
+pub mod ambient;
 pub mod browser;
 pub mod canvas;
 pub mod character;

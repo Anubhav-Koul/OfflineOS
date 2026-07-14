@@ -73,6 +73,13 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 hex = "0.4.3"
+# Ambient guardrails: quiet hours are a *local* wall-clock question and the rate
+# cap is an elapsed-time one, so both readings come from one chrono instant.
+chrono = { version = "0.4", default-features = false, features = [
+    "clock",
+    "serde",
+    "std",
+] }
 keyring = { version = "3", features = ["windows-native"] }
 dirs = "6"
 

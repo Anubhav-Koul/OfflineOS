@@ -4631,6 +4631,7 @@ dependencies = [
  "ic_browser_mcp",
  "ic_canvas_mcp",
  "ic_llama",
+ "ic_widget",
  "ironclaw_extensions",
  "ironclaw_host_api",
  "ironclaw_host_runtime",
@@ -4691,6 +4692,7 @@ name = "ic_widget"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "chrono",
  "dirs",
  "futures-util",
  "hex",

@@ -76,6 +76,77 @@ impl ReplyMode {
     }
 }
 
+/// A window of the local day in which the character never speaks first.
+///
+/// Half-open `[start, end)` in **local** hours, and it may wrap past midnight
+/// (`22 → 8` is a night). `start == end` is an empty window, not a full day — a
+/// quiet period that silenced everything forever would be indistinguishable from
+/// the feature being broken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuietHours {
+    /// First quiet hour, local, `0..=23`.
+    pub start_hour: u32,
+    /// First hour that is loud again, local, `0..=23`.
+    pub end_hour: u32,
+}
+
+impl QuietHours {
+    /// Whether `hour` (local, `0..=23`) falls inside the window.
+    pub fn contains(&self, hour: u32) -> bool {
+        let (start, end) = (self.start_hour % 24, self.end_hour % 24);
+        if start == end {
+            return false;
+        }
+        if start < end {
+            (start..end).contains(&hour)
+        } else {
+            // Wraps midnight: 22..24 or 0..8.
+            hour >= start || hour < end
+        }
+    }
+}
+
+/// How the ambient companion is allowed to interrupt (Phase 7a).
+///
+/// Everything here is a *guardrail*, not a feature switch — the master switch is
+/// [`Settings::ambient_enabled`], which is off until the user asks for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AmbientSettings {
+    /// Hard cap on unsolicited surfacings per rolling hour.
+    #[serde(default = "default_max_per_hour")]
+    pub max_per_hour: u32,
+    /// When the character stays quiet, or `None` for no quiet window.
+    #[serde(default = "default_quiet_hours")]
+    pub quiet_hours: Option<QuietHours>,
+    /// The ambient thread — the conversation the *app* starts, not the user.
+    ///
+    /// Persisted so it survives a restart (threads outlive the gateway process).
+    /// `None` until ambient mode is first switched on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+}
+
+fn default_max_per_hour() -> u32 {
+    2
+}
+
+fn default_quiet_hours() -> Option<QuietHours> {
+    Some(QuietHours {
+        start_hour: 22,
+        end_hour: 8,
+    })
+}
+
+impl Default for AmbientSettings {
+    fn default() -> Self {
+        Self {
+            max_per_hour: default_max_per_hour(),
+            quiet_hours: default_quiet_hours(),
+            thread_id: None,
+        }
+    }
+}
+
 /// Everything persisted between launches.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
@@ -123,6 +194,15 @@ pub struct Settings {
     /// install shows the wizard (pick a model / provider, optionally enable voice).
     #[serde(default)]
     pub setup_complete: bool,
+    /// Whether the character may speak first (Phase 7). **Off by default**, and it
+    /// is the only thing that lets the agent run a turn nobody asked for: it also
+    /// switches on the gateway's trigger poller, which is what makes a scheduled
+    /// automation actually fire. Off means no unprompted run happens at all.
+    #[serde(default)]
+    pub ambient_enabled: bool,
+    /// The guardrails that bound ambient mode when it *is* on.
+    #[serde(default)]
+    pub ambient: AmbientSettings,
 }
 
 /// A character asset folder's name, e.g. `hiyori`.

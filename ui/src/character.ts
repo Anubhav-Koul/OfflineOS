@@ -223,6 +223,7 @@ export const PLACEHOLDER_CONFIG: CharacterConfig = {
     listening: {},
     thinking: {},
     speaking: {},
+    suggesting: {},
     concerned: {},
     error: {},
   },
@@ -234,6 +235,7 @@ const FACES: Record<CharacterState, string> = {
   listening: "👂",
   thinking: "🤔",
   speaking: "🗣️",
+  suggesting: "💡",
   concerned: "😟",
   error: "😵",
 };

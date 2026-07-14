@@ -23,6 +23,7 @@ use ic_llama::{
     Digest, HubModel, LocalLlm, LocalLlmOptions, ModelId, ModelStore, SidecarState, SpawnHook,
     Verdict,
 };
+use ic_widget::ambient::{AmbientConfig, AmbientService, Suggestion};
 use ic_widget::canvas::{CallbackSink, CanvasServer};
 use ic_widget::character::{self, CharacterInputs, CharacterState};
 use ic_widget::error::Error;
@@ -31,7 +32,9 @@ use ic_widget::gateway_client::{
     ThreadId,
 };
 use ic_widget::hit_test::HitMask;
-use ic_widget::settings::{CharacterId, ProviderSelection, ReplyMode, SettingsStore};
+use ic_widget::settings::{
+    AmbientSettings, CharacterId, ProviderSelection, QuietHours, ReplyMode, SettingsStore,
+};
 use ic_widget::supervisor::{GatewayConfig, GatewayState, GatewaySupervisor};
 use ic_widget::window_state::{LayoutHash, MonitorInfo, WindowPosition};
 use ic_widget::{BrowserSidecar, ProcessJob, RunPhase, SecretStore, WindowState, WindowStateStore};
@@ -121,6 +124,15 @@ struct AppState {
     /// tray mute racing a dashboard toggle silently reverted one of them). A `std`
     /// mutex, held only across synchronous file IO — never an await.
     settings_write: std::sync::Mutex<()>,
+    /// The proactive side of the app (Phase 7a). `None` while ambient mode is off —
+    /// which is the default, and which also means the gateway is running without its
+    /// trigger poller, so nothing can run a turn nobody asked for.
+    ambient: Mutex<Option<Arc<AmbientService>>>,
+    /// The automation watch loop. Aborted when ambient mode is switched off.
+    ambient_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The ambient thread — the conversation the *app* starts, kept apart from the
+    /// user's so a turn they never asked for cannot land in their transcript.
+    ambient_thread: Mutex<Option<ThreadId>>,
 }
 
 /// The inputs the character state derives from, plus the last state emitted.
@@ -595,6 +607,17 @@ async fn apply_provider(
     // Load-modify-save (serialised): settings carry more than the provider, and a
     // rebuilt literal here would silently reset the rest.
     state.update_settings(|settings| settings.active_provider = selection.clone())?;
+    restart_gateway(app.clone(), selection).await;
+    Ok(())
+}
+
+/// Tear the gateway (and its local model) down and bring it back up on `selection`.
+///
+/// Shared by the provider switch and the ambient toggle: both change something the
+/// runtime reads **once at boot** — `LLM_BASE_URL` for one, the trigger-poller
+/// switch for the other — so both need the process replaced, not reconfigured.
+async fn restart_gateway(app: AppHandle, selection: ProviderSelection) {
+    let state = app.state::<AppState>();
 
     // Tell the UI we are restarting before the teardown, so the badge is honest
     // during the gap. The old run, if any, is gone with the old gateway.
@@ -618,7 +641,6 @@ async fn apply_provider(
     // mount, which re-reads gateway state and re-creates the thread and its pump
     // against the new gateway.
     reload_webviews(&app);
-    Ok(())
 }
 
 /// Reload every webview, after the gateway behind them has been replaced.
@@ -1628,6 +1650,16 @@ async fn bring_up_gateway(app: AppHandle, selection: ProviderSelection) {
         *app.state::<AppState>().canvas.lock().await = canvas;
     }
 
+    // Ambient mode is what switches the gateway's trigger poller on. It is read
+    // here, at spawn, because the runtime reads its environment once and never
+    // again — which is why the toggle restarts the gateway.
+    let ambient_enabled = app
+        .state::<AppState>()
+        .settings_store
+        .load()
+        .map(|settings| settings.ambient_enabled)
+        .unwrap_or(false); // silent-ok: unreadable settings mean no ambient, the safe side
+
     let started = async {
         let token = SecretStore::new()
             .gateway_token()
@@ -1635,6 +1667,7 @@ async fn bring_up_gateway(app: AppHandle, selection: ProviderSelection) {
         let mut config = GatewayConfig::new(reborn_binary(), reborn_home()?, token)
             .map_err(|error| error.to_string())?;
         config.llm_env = llm_env;
+        config.extra_env = ambient_env(ambient_enabled);
         GatewaySupervisor::start(config, job)
             .await
             .map_err(|error| error.to_string())
@@ -1679,6 +1712,10 @@ async fn bring_up_gateway(app: AppHandle, selection: ProviderSelection) {
                 }
             });
 
+            // Ambient mode watches *this* gateway, so it is (re)started with it. A
+            // no-op when the toggle is off.
+            let client = gateway.client().clone();
+
             // Store *before* emitting. A UI that has not subscribed yet will miss
             // the event and fall back to reading `gateway_state`, and that read
             // must already see `Ready` — otherwise the widget waits forever for an
@@ -1686,6 +1723,8 @@ async fn bring_up_gateway(app: AppHandle, selection: ProviderSelection) {
             *app.state::<AppState>().gateway.lock().await = Some(gateway);
             let _ = app.emit("gateway://state", GatewayState::Ready);
             update_character(&app, |inputs| inputs.gateway = GatewayState::Ready).await;
+
+            start_ambient(&app, client).await;
         }
         Err(reason) => {
             tracing::error!(%reason, "the gateway did not start");
@@ -1698,6 +1737,235 @@ async fn bring_up_gateway(app: AppHandle, selection: ProviderSelection) {
             let _ = app.emit("gateway://state", GatewayState::Unhealthy { reason });
         }
     }
+}
+
+// ---------------------------------------------------------------- ambient
+
+/// The append-only record of every time the character spoke first.
+fn ambient_log_path() -> Result<PathBuf, String> {
+    data_root()
+        .map(|base| base.join("ambient-log.jsonl"))
+        .ok_or_else(|| "could not locate the local application data directory".to_string())
+}
+
+/// The environment the gateway needs for ambient mode.
+///
+/// Exactly one variable, and it is the whole reason a toggle restarts the gateway:
+/// `serve` leaves its trigger poller **off** by default, so a scheduled automation
+/// is listed by `GET /automations` and *never fires*. The runtime reads its
+/// environment once at boot, so this cannot be turned on under a running gateway.
+///
+/// Tying it to the ambient toggle is deliberate. `builtin__trigger_create` runs with
+/// no approval prompt (the runtime never enforces `default_permission` — Phase 4),
+/// so an agent talked into arming a recurring prompt would otherwise have a
+/// heartbeat the user never granted. Ambient off ⇒ no unprompted run exists.
+fn ambient_env(enabled: bool) -> Vec<(String, String)> {
+    match enabled {
+        true => vec![("IRONCLAW_TRIGGER_POLLER_ENABLED".into(), "true".into())],
+        false => Vec::new(),
+    }
+}
+
+/// Bring ambient mode up against a ready gateway. A no-op when it is switched off.
+///
+/// Called on every gateway start (first boot and every provider/ambient restart), so
+/// the watcher is always bound to the gateway that is actually running.
+async fn start_ambient(app: &AppHandle, client: GatewayClient) {
+    let state = app.state::<AppState>();
+    let Ok(settings) = state.settings_store.load() else {
+        return;
+    };
+    if !settings.ambient_enabled {
+        return;
+    }
+
+    let log = match ambient_log_path().and_then(|path| {
+        ic_widget::ambient::log::SurfacingLog::open(path).map_err(|error| error.to_string())
+    }) {
+        Ok(log) => log,
+        Err(error) => {
+            // The log is the rate limiter's memory. Without it the character could
+            // talk without a cap, so ambient mode stays off rather than uncapped.
+            tracing::error!(%error, "could not open the ambient log; ambient mode stays off");
+            return;
+        }
+    };
+
+    // Settings are re-read on every check, so changing the cap or the quiet hours
+    // takes effect on the next tick rather than the next launch.
+    let store = state.settings_store.clone();
+    let config: ic_widget::ambient::ConfigFn = Arc::new(move || match store.load() {
+        Ok(settings) => AmbientConfig {
+            enabled: settings.ambient_enabled,
+            settings: settings.ambient,
+        },
+        Err(error) => {
+            // Unreadable settings must not mean "no limits". Fail closed.
+            tracing::warn!(%error, "could not read the ambient settings; staying quiet");
+            AmbientConfig {
+                enabled: false,
+                settings: AmbientSettings::default(),
+            }
+        }
+    });
+
+    let sink: ic_widget::ambient::SuggestionSink = {
+        let handle = app.clone();
+        Arc::new(move |suggestion: Suggestion| {
+            let _ = handle.emit("ambient://suggestion", &suggestion);
+            let handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                update_character(&handle, |inputs| inputs.suggestion_pending = true).await;
+            });
+        })
+    };
+
+    let service = Arc::new(AmbientService::new(client.clone(), config, sink, log));
+
+    // The ambient thread, reused across launches (threads outlive the gateway).
+    let saved = settings.ambient.thread_id.clone();
+    if let Some(thread_id) = ic_widget::ambient::ensure_thread(&client, saved.as_deref()).await {
+        if saved.as_deref() != Some(thread_id.as_str()) {
+            let id = thread_id.to_string();
+            let _ = state.update_settings(|settings| settings.ambient.thread_id = Some(id));
+        }
+        *state.ambient_thread.lock().await = Some(thread_id);
+    }
+
+    let task = tokio::spawn(ic_widget::ambient::automations::watch(Arc::clone(&service)));
+    if let Some(previous) = state.ambient_task.lock().await.replace(task) {
+        previous.abort();
+    }
+    *state.ambient.lock().await = Some(service);
+    tracing::info!("ambient mode is on: the character may speak first");
+}
+
+/// Wind ambient mode down: stop watching, and take any unanswered suggestion off
+/// the character's face.
+async fn stop_ambient(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if let Some(task) = state.ambient_task.lock().await.take() {
+        task.abort();
+    }
+    *state.ambient.lock().await = None;
+    *state.ambient_thread.lock().await = None;
+    update_character(app, |inputs| inputs.suggestion_pending = false).await;
+}
+
+/// What the dashboard shows for ambient mode.
+#[derive(Serialize)]
+struct AmbientStatus {
+    enabled: bool,
+    /// Whether the watcher is actually running against a live gateway.
+    running: bool,
+    max_per_hour: u32,
+    quiet_start: Option<u32>,
+    quiet_end: Option<u32>,
+}
+
+#[tauri::command]
+async fn ambient_status(state: tauri::State<'_, AppState>) -> Result<AmbientStatus, String> {
+    let settings = state.settings_store.load().map_err(|e| e.to_string())?;
+    Ok(AmbientStatus {
+        enabled: settings.ambient_enabled,
+        running: state.ambient.lock().await.is_some(),
+        max_per_hour: settings.ambient.max_per_hour,
+        quiet_start: settings.ambient.quiet_hours.map(|quiet| quiet.start_hour),
+        quiet_end: settings.ambient.quiet_hours.map(|quiet| quiet.end_hour),
+    })
+}
+
+/// Turn ambient mode on or off.
+///
+/// **This restarts the gateway**, because the trigger poller is an environment
+/// switch the runtime reads once at boot (see [`ambient_env`]). The provider panel
+/// already restarts for the same reason, so the machinery is shared.
+#[tauri::command]
+async fn set_ambient_enabled(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let settings = state.update_settings(|settings| settings.ambient_enabled = enabled)?;
+    stop_ambient(&app).await;
+    restart_gateway(app, settings.active_provider).await;
+    Ok(())
+}
+
+/// Change the guardrails. Takes effect on the next tick — no restart: only the
+/// poller is an environment switch, and the caps are read fresh on every check.
+#[tauri::command]
+async fn set_ambient_guardrails(
+    state: tauri::State<'_, AppState>,
+    max_per_hour: u32,
+    quiet_start: Option<u32>,
+    quiet_end: Option<u32>,
+) -> Result<(), String> {
+    if max_per_hour == 0 || max_per_hour > 20 {
+        return Err("the hourly cap must be between 1 and 20".into());
+    }
+    let quiet = match (quiet_start, quiet_end) {
+        (Some(start), Some(end)) => {
+            if start > 23 || end > 23 {
+                return Err("quiet hours must be between 0 and 23".into());
+            }
+            Some(QuietHours {
+                start_hour: start,
+                end_hour: end,
+            })
+        }
+        _ => None,
+    };
+    state.update_settings(|settings| {
+        settings.ambient.max_per_hour = max_per_hour;
+        settings.ambient.quiet_hours = quiet;
+    })?;
+    Ok(())
+}
+
+/// Answer a suggestion: Accept, or Not now.
+///
+/// Accept means "show me": the app switches both windows to the thread the run
+/// landed in, and opens the dashboard on it. "Not now" is recorded with its
+/// timestamp — it is never deleted, and it quiets that source for an hour.
+#[tauri::command]
+async fn respond_suggestion(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+    accepted: bool,
+) -> Result<(), String> {
+    let Some(service) = state.ambient.lock().await.clone() else {
+        return Ok(());
+    };
+    let answered = service.respond(&id, accepted).await;
+    update_character(&app, |inputs| inputs.suggestion_pending = false).await;
+
+    if let Some(suggestion) = answered
+        && accepted
+        && let Some(thread_id) = suggestion.thread_id
+        && let Ok(thread_id) = ThreadId::new(&thread_id)
+    {
+        // Point both windows at the run's own thread, the same way `new_thread`
+        // does — otherwise "show me" would open a conversation that does not
+        // contain the thing being shown.
+        let client = state.client().await?;
+        let mut pump = state.pump.lock().await;
+        if let Some(previous) = pump.take() {
+            previous.abort();
+        }
+        *pump = Some(tokio::spawn(pump_events(
+            app.clone(),
+            client,
+            thread_id.clone(),
+        )));
+        *state.thread.lock().await = Some(thread_id.clone());
+        let _ = app.emit("thread://changed", thread_id.to_string());
+        if let Err(error) = show_dashboard(&app) {
+            tracing::warn!(%error, "could not open the dashboard for an accepted suggestion");
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- voice
@@ -2026,9 +2294,9 @@ async fn voice_settings(state: tauri::State<'_, AppState>) -> Result<VoiceSettin
 /// Every input device on the machine, OS default first.
 #[tauri::command]
 async fn input_devices() -> Result<Vec<String>, String> {
-    Ok(tokio::task::spawn_blocking(ic_voice::input_devices)
+    tokio::task::spawn_blocking(ic_voice::input_devices)
         .await
-        .map_err(|error| format!("could not list the microphones: {error}"))?)
+        .map_err(|error| format!("could not list the microphones: {error}"))
 }
 
 /// Choose the microphone. Takes effect on the next recording / unmute.
@@ -2296,10 +2564,11 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let show = MenuItemBuilder::with_id("show", "Show / hide widget").build(app)?;
     let dashboard = MenuItemBuilder::with_id("dashboard", "Open dashboard").build(app)?;
     let mic = MenuItemBuilder::with_id("voice_mute", "Toggle microphone").build(app)?;
+    let ambient = MenuItemBuilder::with_id("ambient", "Ambient suggestions on / off").build(app)?;
     let reset = MenuItemBuilder::with_id("reset", "Reset widget position").build(app)?;
     let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
     let menu = MenuBuilder::new(app)
-        .items(&[&show, &dashboard, &mic, &reset, &quit])
+        .items(&[&show, &dashboard, &mic, &ambient, &reset, &quit])
         .build()?;
 
     let Some(icon) = app.default_window_icon().cloned() else {
@@ -2320,6 +2589,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                 }
             }
             "voice_mute" => toggle_voice_mute(app),
+            "ambient" => toggle_ambient(app),
             "reset" => reset_widget_position(app),
             // Dropping the app drops the `ProcessJob`, which kills the gateway
             // and anything it spawned.
@@ -2328,6 +2598,32 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         })
         .build(app)?;
     Ok(())
+}
+
+/// Flip ambient mode from the tray. It restarts the gateway (the trigger poller is
+/// a boot-time switch), so it runs in the background rather than freezing the menu.
+fn toggle_ambient(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let enabled = match state.settings_store.load() {
+            Ok(settings) => !settings.ambient_enabled,
+            Err(error) => {
+                tracing::warn!(%error, "could not read the ambient setting");
+                return;
+            }
+        };
+        let settings = match state.update_settings(|settings| settings.ambient_enabled = enabled) {
+            Ok(settings) => settings,
+            Err(error) => {
+                tracing::warn!(%error, "could not save the ambient setting");
+                return;
+            }
+        };
+        tracing::info!(enabled, "ambient mode toggled from the tray");
+        stop_ambient(&app).await;
+        restart_gateway(app.clone(), settings.active_provider).await;
+    });
 }
 
 /// A widget stranded offscreen cannot be dragged back. This is the escape hatch.
@@ -2561,6 +2857,10 @@ fn main() {
             voice_status,
             set_voice_muted,
             set_voice_enabled,
+            ambient_status,
+            set_ambient_enabled,
+            set_ambient_guardrails,
+            respond_suggestion,
             needs_setup,
             profile,
             set_profile,
@@ -2601,6 +2901,9 @@ fn main() {
                 hit_mask: std::sync::Mutex::new(None),
                 voice: Mutex::new(None),
                 settings_write: std::sync::Mutex::new(()),
+                ambient: Mutex::new(None),
+                ambient_task: Mutex::new(None),
+                ambient_thread: Mutex::new(None),
             });
 
             let handle = app.handle().clone();

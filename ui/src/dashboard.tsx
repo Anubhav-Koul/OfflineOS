@@ -8,6 +8,7 @@ import {
   onModelEvent,
   onVoiceState,
   onVoiceTranscript,
+  type AmbientStatus,
   type Automation,
   type GatewayState,
   type InstalledModel,
@@ -1520,6 +1521,126 @@ function VoicePanel() {
   );
 }
 
+/**
+ * Ambient mode: whether the character may speak first (Phase 7a).
+ *
+ * The toggle does two things, and the panel says both out loud. It lets the widget
+ * surface things nobody asked for, and it switches on the gateway's trigger poller
+ * — without which a scheduled automation is listed but never actually fires. That
+ * is also why turning it on restarts the gateway: the runtime reads the poller
+ * switch once, at boot.
+ */
+function AmbientPanel() {
+  const [status, setStatus] = createSignal<AmbientStatus | null>(null);
+  const [busy, setBusy] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+
+  const refresh = async () => {
+    try {
+      setStatus(await api.ambientStatus());
+    } catch (problem) {
+      setError(String(problem));
+    }
+  };
+  onMount(() => void refresh());
+
+  const toggle = async (on: boolean) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.setAmbientEnabled(on);
+      // The gateway restarts, and both windows reload with it — so there may be
+      // nothing left to refresh. Harmless if there is.
+      await refresh();
+    } catch (problem) {
+      setError(String(problem));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveGuardrails = async (max: number, start: number | null, end: number | null) => {
+    setError(null);
+    try {
+      await api.setAmbientGuardrails(max, start, end);
+      await refresh();
+    } catch (problem) {
+      setError(String(problem));
+    }
+  };
+
+  const quietLabel = () => {
+    const current = status();
+    if (!current || current.quiet_start === null || current.quiet_end === null) return "none";
+    return `${String(current.quiet_start).padStart(2, "0")}:00 – ${String(current.quiet_end).padStart(2, "0")}:00`;
+  };
+
+  return (
+    <section>
+      <h2>Ambient</h2>
+      <label class="wizard-voice">
+        <input
+          type="checkbox"
+          disabled={busy()}
+          checked={status()?.enabled ?? false}
+          onChange={(event) => void toggle(event.currentTarget.checked)}
+        />
+        Let it speak first
+        <Show when={busy()}>
+          <span class="muted small"> — restarting the agent…</span>
+        </Show>
+      </label>
+      <p class="muted small">
+        Off by default. When it is off, scheduled automations never run — the agent
+        only ever acts on something you asked for.
+      </p>
+
+      <Show when={status()?.enabled}>
+        <div class="row">
+          <label>
+            At most{" "}
+            <input
+              type="number"
+              min="1"
+              max="20"
+              class="tiny"
+              value={status()?.max_per_hour ?? 2}
+              onChange={(event) =>
+                void saveGuardrails(
+                  Number(event.currentTarget.value),
+                  status()?.quiet_start ?? null,
+                  status()?.quiet_end ?? null,
+                )
+              }
+            />{" "}
+            interruptions an hour
+          </label>
+        </div>
+        <p class="muted small">
+          Quiet hours: <strong>{quietLabel()}</strong>
+          {" · "}
+          <button
+            class="ghost"
+            onClick={() =>
+              void saveGuardrails(
+                status()?.max_per_hour ?? 2,
+                status()?.quiet_start === null ? 22 : null,
+                status()?.quiet_start === null ? 8 : null,
+              )
+            }
+          >
+            {status()?.quiet_start === null ? "Quiet 22:00 – 08:00" : "Never go quiet"}
+          </button>
+        </p>
+      </Show>
+
+      <Show when={error()}>
+        <p class="error">{error()}</p>
+      </Show>
+    </section>
+  );
+}
+
 function Dashboard() {
   const [gateway, setGateway] = createSignal<GatewayState>({ state: "starting" });
   const [log, setLog] = createSignal("");
@@ -1566,6 +1687,7 @@ function Dashboard() {
       <ChatPane />
       <ProfilePanel />
       <VoicePanel />
+      <AmbientPanel />
 
       <section>
         <h2>Gateway</h2>
@@ -1620,7 +1742,9 @@ function Dashboard() {
           </button>
         </div>
         <p class="muted small">
-          Scheduled entries only — <code>serve</code> exposes no run history.
+          Scheduled entries only — <code>serve</code> exposes no run history. They
+          only fire while <strong>Ambient</strong> is on: the gateway's trigger
+          poller is off otherwise.
         </p>
         <PanelBody
           error={automations.error()}

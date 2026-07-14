@@ -30,6 +30,10 @@ pub enum CharacterState {
     Thinking,
     /// Rendering a reply (and speaking it, once TTS lands in Phase 5).
     Speaking,
+    /// Offering something nobody asked for: an ambient suggestion is on screen,
+    /// waiting for Accept or Not now (Phase 7a). Interruptible — answering it, or
+    /// anything more urgent happening, moves the character straight on.
+    Suggesting,
     /// Waiting on the user: a tool-approval or auth gate is open.
     Concerned,
     /// The backend is unhealthy — the gateway failed or rejects our token.
@@ -65,6 +69,8 @@ pub struct CharacterInputs {
     /// Like a gateway gate, this makes the character `concerned` — but it is not a
     /// gateway run, so it needs its own input.
     pub browser_approval_pending: bool,
+    /// An ambient suggestion is on screen, unanswered (Phase 7a).
+    pub suggestion_pending: bool,
 }
 
 impl Default for CharacterInputs {
@@ -79,6 +85,7 @@ impl Default for CharacterInputs {
             voice_thinking: false,
             voice_speaking: false,
             browser_approval_pending: false,
+            suggestion_pending: false,
         }
     }
 }
@@ -88,8 +95,13 @@ impl Default for CharacterInputs {
 /// Priority, highest first: a broken backend (`Error`) overrides everything; a
 /// gateway still coming up rests (`Idle`) since no run can be active yet; then
 /// an open gate (`Concerned`) outranks an in-flight run (`Thinking`), which
-/// outranks rendering a reply (`Speaking`), which outranks taking input
-/// (`Listening`). Everything else is `Idle`.
+/// outranks an unanswered suggestion (`Suggesting`), which outranks rendering a
+/// reply (`Speaking`), which outranks taking input (`Listening`). Everything else
+/// is `Idle`.
+///
+/// A suggestion sits below work and above speech deliberately: what the user asked
+/// for always beats what the character volunteered, but an unanswered question the
+/// character asked outranks it merely finishing a sentence.
 pub fn derive(inputs: &CharacterInputs) -> CharacterState {
     match inputs.gateway {
         // A dead or rejecting gateway is the error face, whatever else is set.
@@ -122,6 +134,13 @@ pub fn derive(inputs: &CharacterInputs) -> CharacterState {
     // its transcribing/awaiting window is thinking all the same.
     if inputs.voice_thinking {
         return CharacterState::Thinking;
+    }
+
+    // Something the character offered, still unanswered. It outranks speech but not
+    // work: interrupting the user's own turn to pitch an idea is exactly the
+    // behaviour that gets an ambient companion switched off.
+    if inputs.suggestion_pending {
+        return CharacterState::Suggesting;
     }
 
     if inputs.speaking || inputs.voice_speaking {
@@ -254,6 +273,35 @@ mod tests {
             ..base
         };
         assert_eq!(derive(&both), CharacterState::Speaking);
+    }
+
+    #[test]
+    fn an_unanswered_suggestion_outranks_speech_but_not_work() {
+        let base = inputs(GatewayState::Ready, None);
+
+        let suggesting = CharacterInputs {
+            suggestion_pending: true,
+            speaking: true,
+            ..base.clone()
+        };
+        assert_eq!(derive(&suggesting), CharacterState::Suggesting);
+
+        // The user's own turn always wins: the character does not pitch an idea
+        // over the answer it is in the middle of producing.
+        let working = CharacterInputs {
+            suggestion_pending: true,
+            run: Some(RunPhase::Running),
+            ..base.clone()
+        };
+        assert_eq!(derive(&working), CharacterState::Thinking);
+
+        // And a gate still outranks it — that one is blocking.
+        let gated = CharacterInputs {
+            suggestion_pending: true,
+            browser_approval_pending: true,
+            ..base
+        };
+        assert_eq!(derive(&gated), CharacterState::Concerned);
     }
 
     #[test]

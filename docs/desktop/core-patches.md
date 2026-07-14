@@ -268,3 +268,41 @@ sidecar gate becomes defence-in-depth. Full write-up: `CLAUDE.md` Phase 4 notes,
     *template* — the six real tools come from the live `tools/list`. A transient
     discovery failure **silently** falls back to that template, so the widget must
     verify the discovered capability count rather than assume success.
+
+---
+
+## Upstream status (checked 2026-07-15)
+
+| Ref | What | Status |
+|---|---|---|
+| [#5998](https://github.com/nearai/ironclaw/issues/5998) | No transport for a local (on-device) MCP server | **Open, no response.** CP-4 + CP-5 stay until it lands. |
+| [#5999](https://github.com/nearai/ironclaw/issues/5999) | `local-dev-yolo` cannot start on Windows (host path used as `MountAlias`) | Open, no response. Not ours; explains 3 red tests in the baseline. |
+| [#6000](https://github.com/nearai/ironclaw/issues/6000) | How to report security issues (no `SECURITY.md`) | Open. A collaborator replied asking a colleague how to handle it — **so there is still no disclosure channel**, and the `PermissionMode::Ask`-is-never-enforced finding remains unreported. |
+| [#6076](https://github.com/nearai/ironclaw/issues/6076) | Automations carry no thread/run correlation | Open, no response. The 7a watcher keeps pairing by timing. |
+| [#6099](https://github.com/nearai/ironclaw/issues/6099) | `POST /llm/test-connection` reports `ok` for a dead endpoint with a junk key | **Filed 2026-07-15.** Pinned by `chat_control.rs`; the widget's own `probe.rs` is the route-around. |
+| **[PR #6098](https://github.com/nearai/ironclaw/pull/6098)** | **CP-1 upstreamed** — skip directory fsync on Windows | **Opened 2026-07-15** against `reborn-integration`. If merged, delete CP-1 from this file and drop the local patch. |
+
+**CP-1 is now a PR.** The evidence that made it worth raising: upstream's *own*
+test suite fails on Windows without it —
+`catalog_contract::composite_routes_filesystem_operations_to_matching_backend`
+dies with `WriteFile … "permission denied"`, because `sync_parent_dir` fsyncs a
+read-only directory handle and Windows answers `ERROR_ACCESS_DENIED`. Every write
+through `LocalFilesystem` fails, so `serve` cannot boot at all. The PR is one
+`#[cfg(windows)]` guard, one file, one commit, with every other platform
+byte-for-byte unchanged.
+
+### A finding that was withdrawn before it was filed
+
+An earlier read of the 8b connector probe concluded that **WASM registry
+connectors hang forever on first tool call**. That was wrong, and it is recorded
+here because the mistake is instructive. The tool call *worked* — it reached
+GitHub, which answered `401` for the deliberately-bogus token, and the run then
+parked in an **auth gate** rather than completing. A probe watching only for
+`"status":"completed"` waits forever and reads that as a hang.
+
+What made it look like a runtime failure rather than a gate: **`serve` reads
+`IRONCLAW_REBORN_LOG`, not `RUST_LOG`** (`ironclaw_reborn_cli/src/runtime/mod.rs:34`).
+With the wrong variable set the log is empty, and an empty log next to a stalled
+run is very easy to misread as a wedged process. It is neither. Set the right
+variable before concluding anything upstream is broken — a false bug report costs
+a maintainer's afternoon.

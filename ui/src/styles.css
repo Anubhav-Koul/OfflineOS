@@ -218,6 +218,24 @@ body.widget-body {
   color: var(--danger, #d1524a);
 }
 
+/* Stop, inside the character's thinking balloon (Phase 8a). Small and quiet —
+   it is a guardrail, not an alarm — but always reachable while a run is live. */
+.say-stop {
+  margin-left: 8px;
+  padding: 1px 8px;
+  border: 1px solid #3a4150;
+  border-radius: 10px;
+  background: #2b2f38;
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.say-stop:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
 /* A heading inside a panel, for a second concern that belongs with the first
    (the local model's cloud fallback lives under Provider). */
 .subhead {
@@ -487,6 +505,27 @@ button.ghost {
   align-self: stretch;
   background: rgba(240, 115, 106, 0.12);
   color: var(--danger);
+}
+/* A history row that is neither a user nor an assistant turn: a summary, a tool
+   result whose body is a reference, or a kind a newer gateway invented. Neutral
+   on purpose — it is context, not conversation. */
+.bubble.event {
+  align-self: stretch;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* The read-only history of a past conversation (Phase 8a). */
+.history {
+  margin-top: 12px;
+  border-top: 1px solid #262a33;
+  padding-top: 8px;
+}
+.history .transcript {
+  max-height: 420px;
+  background: #12141a;
+  border-radius: 8px;
 }
 
 .status {

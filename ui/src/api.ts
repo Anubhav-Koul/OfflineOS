@@ -67,15 +67,34 @@ export interface SendResult {
   run_id: string;
 }
 
+/**
+ * What Stop reports back. Both fields mean "nothing left to stop", and neither
+ * is an error to show: `already_terminal` is the reply landing as the click flies,
+ * `unknown` is a run id the gateway has never heard of (refresh, don't complain).
+ *
+ * Note what Stop does *not* do: it does not abort the model's in-flight
+ * generation. A local llama-server keeps generating to completion.
+ */
 export interface CancelResult {
   already_terminal: boolean;
+  unknown: boolean;
 }
 
-/** A row in the sessions panel. Threads survive gateway restarts. */
+/** A row in the chats panel. Threads survive gateway restarts. */
 export interface Thread {
   thread_id: string;
   /** `null` until the agent titles the thread. */
   title: string | null;
+  /** Hidden by the user — a local archive, not a delete. */
+  hidden: boolean;
+  /** The conversation both windows are currently showing. */
+  current: boolean;
+}
+
+/** One page of the chats list. `next_cursor` null means the end. */
+export interface ThreadPage {
+  threads: Thread[];
+  next_cursor: string | null;
 }
 
 /**
@@ -394,11 +413,18 @@ export const api = {
   cancelRun: (threadId: string, runId: string) =>
     invoke<CancelResult>("cancel_run", { threadId, runId }),
   fetchTimeline: (threadId: string) => invoke<Message[]>("fetch_timeline", { threadId }),
+  /** Hide a conversation from the list, or bring it back. Not a delete — no
+   *  route deletes a thread, and we do not touch IronClaw's database. */
+  setThreadHidden: (threadId: string, hidden: boolean) =>
+    invoke<void>("set_thread_hidden", { threadId, hidden }),
+  /** Point both windows at an existing conversation and follow it. */
+  useThread: (threadId: string) => invoke<void>("use_thread", { threadId }),
   resolveGate: (threadId: string, runId: string, gateRef: string, approved: boolean) =>
     invoke<void>("resolve_gate", { threadId, runId, gateRef, approved }),
   openDashboard: () => invoke<void>("open_dashboard"),
   gatewayLog: () => invoke<string>("gateway_log"),
-  listThreads: () => invoke<Thread[]>("list_threads"),
+  listThreads: (limit?: number, cursor?: string | null) =>
+    invoke<ThreadPage>("list_threads", { limit, cursor }),
   listAutomations: () => invoke<Automation[]>("list_automations"),
   localModelStatus: () => invoke<LocalModel | null>("local_model_status"),
   providerSettings: () => invoke<ProviderSettings>("provider_settings"),

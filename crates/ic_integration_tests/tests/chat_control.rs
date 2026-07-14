@@ -377,6 +377,84 @@ async fn the_threads_list_carries_what_the_chats_panel_renders() {
     }
 }
 
+// ------------------------------------------------------- provider probes (8a.5)
+
+/// 🚨 **`POST /llm/test-connection` cannot test a connection** for any provider
+/// this app can configure. It is not wired to the UI, and this test is why.
+///
+/// `LlmProvider::list_models()` has a **default implementation returning an empty
+/// list** (`ironclaw_llm/src/provider.rs:494`), and `RigAdapter` — which serves
+/// OpenAI, Anthropic, Ollama and `openai_compatible`, i.e. *every* provider in
+/// our picker — does not override it. `test_connection`
+/// (`llm_config_service.rs:536`) asks the adapter for a model list, gets an empty
+/// one, and reports **`ok: true`** without ever opening a socket.
+///
+/// The proof is the `base_url` below: a port with **nothing listening on it**. A
+/// probe that reached the network could not possibly succeed. It reports ok.
+///
+/// So a "Test connection" button over this route would show a green tick for a
+/// bogus key against a dead endpoint — worse than having no button. See the
+/// Phase 8a notes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_provider_probe_reports_ok_for_an_endpoint_that_does_not_exist() {
+    let server = RebornServer::start().await;
+    let client = reqwest::Client::new();
+    let base = format!("{}{API_PREFIX}", server.base_url);
+
+    // A port nothing is listening on: the provider is definitively not there.
+    let dead = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        port
+    };
+    // `adapter` is the *protocol* wire name — the field `providers.json` calls
+    // `protocol`, not the provider id. `open_ai_completions` is the protocol of
+    // openai, groq, and openai_compatible alike.
+    let probe = serde_json::json!({
+        "adapter": "open_ai_completions",
+        "provider_id": "openai_compatible",
+        "base_url": format!("http://127.0.0.1:{dead}/v1"),
+        "api_key": "definitely-not-a-real-key",
+    });
+
+    let response = client
+        .post(format!("{base}/llm/test-connection"))
+        .bearer_auth(&server.token)
+        .json(&probe)
+        .send()
+        .await
+        .expect("test-connection should answer");
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.expect("json");
+    eprintln!("probe: test-connection against a DEAD endpoint → {status}: {body}");
+
+    assert!(status.is_success(), "the route itself works: {body}");
+    assert_eq!(
+        body["ok"], true,
+        "THE FINDING: a dead endpoint with a junk key probes `ok`. If this ever \
+         starts failing, upstream has implemented `list_models` for RigAdapter \
+         and the provider panel can finally have a real Test-connection button."
+    );
+
+    // And the model list is empty for the same reason — so a dropdown populated
+    // from it would always be empty.
+    let response = client
+        .post(format!("{base}/llm/list-models"))
+        .bearer_auth(&server.token)
+        .json(&probe)
+        .send()
+        .await
+        .expect("list-models should answer");
+    let body: serde_json::Value = response.json().await.expect("json");
+    eprintln!("probe: list-models against a DEAD endpoint → {body}");
+    assert_eq!(
+        body["models"].as_array().map(Vec::len),
+        Some(0),
+        "RigAdapter exposes no model list, so this is always empty: {body}"
+    );
+}
+
 /// `GET /threads/{id}/timeline` — the history the Chats panel replays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_timeline_carries_what_the_history_view_renders() {
@@ -397,7 +475,10 @@ async fn the_timeline_carries_what_the_history_view_renders() {
     // than crash on the null.
     let mut kinds = Vec::new();
     for message in messages {
-        assert!(message["kind"].is_string(), "every message has a kind: {message}");
+        assert!(
+            message["kind"].is_string(),
+            "every message has a kind: {message}"
+        );
         assert!(
             message["sequence"].is_number(),
             "every message has a sequence: {message}"

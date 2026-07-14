@@ -238,6 +238,16 @@ pub struct Settings {
     /// thread and every draft it surfaces rides the ambient guardrails.
     #[serde(default)]
     pub reflection_enabled: bool,
+    /// Conversations the user has hidden from the Chats list (Phase 8a).
+    ///
+    /// **A local archive, not a delete.** `ironclaw-reborn serve` exposes no
+    /// route that removes a thread (verified — every spelling 404s), and reaching
+    /// into its libSQL to delete rows would both couple us to internals and break
+    /// the never-delete-LLM-data invariant. So the thread lives on in the gateway
+    /// and this list is the widget's own "don't show me that one" — which is
+    /// exactly what the button says.
+    #[serde(default)]
+    pub hidden_threads: Vec<String>,
     /// Event-driven proactivity (Phase 7d): what the app may watch, and the
     /// user's "when X happens, ask the agent to Y" rules. Every signal kind is
     /// individually opt-in and **off by default**, and none of it runs unless

@@ -180,4 +180,15 @@ impl Error {
     pub fn is_duplicate_action(&self) -> bool {
         matches!(self, Error::Gateway { status: 409, .. })
     }
+
+    /// Whether the gateway says the thing we named does not exist.
+    ///
+    /// The Stop button lives in this race: a run id the UI has been holding can
+    /// be gone by the time the user clicks (a gateway restart replaces the run,
+    /// not the thread). Verified against the running gateway — an unknown run is
+    /// a clean `404`, not an error state. The UI must refresh on it, never show a
+    /// dialog. See `ic_integration_tests/tests/chat_control.rs`.
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Error::Gateway { status: 404, .. })
+    }
 }

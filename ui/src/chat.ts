@@ -63,6 +63,8 @@ export function createChat(options: { speaks?: boolean } = {}) {
   const [bubbles, setBubbles] = createSignal<Bubble[]>([]);
   const [activeRun, setActiveRun] = createSignal<string | null>(null);
   const [phase, setPhase] = createSignal<RunPhase | null>(null);
+  /** A Stop is in flight. The button must not fire twice, and the UI says so. */
+  const [stopping, setStopping] = createSignal(false);
   const [activity, setActivity] = createSignal<string | null>(null);
   const [gate, setGate] = createSignal<Gate | null>(null);
   const [gateway, setGateway] = createSignal<GatewayState>({ state: "starting" });
@@ -283,15 +285,24 @@ export function createChat(options: { speaks?: boolean } = {}) {
   async function stop() {
     const id = threadId();
     const run = activeRun();
-    if (!id || !run) return;
+    if (!id || !run || stopping()) return;
     setSpeaking(null);
+    setStopping(true);
     try {
-      // Stop races the answer; `already_terminal` means the reply landed first,
-      // which is not a failure.
-      const { already_terminal } = await api.cancelRun(id, run);
-      if (already_terminal) await collectReply(null);
+      // Two ways to have nothing left to stop, neither of them a failure:
+      // `already_terminal` — the reply landed while the click was in the air
+      // (the common race); `unknown` — the gateway has never heard of this run
+      // (a stale id we were holding). Both collect the reply and move on.
+      //
+      // Note what this does NOT do: cancelling does not abort the model's
+      // in-flight generation. A local llama-server keeps generating to
+      // completion — Stop means "stop showing me this", not "stop computing it".
+      const { already_terminal, unknown } = await api.cancelRun(id, run);
+      if (already_terminal || unknown) await collectReply(null);
     } catch (error) {
       push({ role: "error", text: `Could not stop: ${error}` });
+    } finally {
+      setStopping(false);
     }
   }
 
@@ -333,6 +344,10 @@ export function createChat(options: { speaks?: boolean } = {}) {
   /** What the character is doing, in words. `null` when idle. */
   const statusLine = () => {
     const current = phase();
+    // Say "stopping…" the moment the click lands, not when the gateway gets
+    // round to admitting it: the cancel is a *request*, and the run can sit in
+    // `running` for another poll or two before it turns over.
+    if (stopping()) return "stopping";
     if (gate()) return "waiting for you";
     if (activity()) return `running ${activity()}`;
     if (!current || TERMINAL_PHASES.has(current)) return null;
@@ -355,6 +370,7 @@ export function createChat(options: { speaks?: boolean } = {}) {
     heard,
     phase,
     busy,
+    stopping,
     ready,
     statusLine,
     start,

@@ -320,10 +320,27 @@ function App() {
           )}
         </Show>
 
+        {/*
+          The thinking balloon, now with the Stop the bubble never had — the
+          always-visible Stop is a runaway-loop guardrail, and until Phase 8a it
+          only existed in the dashboard, which is closed most of the time.
+        */}
         <Show when={!says() && chat.statusLine() && !interrupting() && !suggestion()}>
           {(line) => (
             <div class="say say-thinking solid">
-              <div class="say-cloud">{line()}</div>
+              <div class="say-cloud">
+                {line()}
+                <Show when={chat.busy()}>
+                  <button
+                    type="button"
+                    class="say-stop"
+                    disabled={chat.stopping()}
+                    onClick={() => void chat.stop()}
+                  >
+                    {chat.stopping() ? "Stopping…" : "Stop"}
+                  </button>
+                </Show>
+              </div>
               <div class="say-tail" />
             </div>
           )}

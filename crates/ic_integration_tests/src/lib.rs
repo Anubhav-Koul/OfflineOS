@@ -509,6 +509,12 @@ impl RebornServer {
             .unwrap_or_default()
     }
 
+    /// The mock provider's base URL, when this server runs one. Lets a test
+    /// point the gateway's own provider probes at a provider it controls.
+    pub fn llm_base_url(&self) -> Option<String> {
+        self._mock.as_ref().map(MockLlm::base_url)
+    }
+
     /// Snapshot the serve process stderr captured so far.
     pub fn stderr_snapshot(&self) -> String {
         self.stderr
@@ -614,12 +620,11 @@ impl RebornServer {
 
     /// The raw `GET /threads` body, with optional paging — the shape the Chats
     /// panel reads (`{ threads: [...], next_cursor: "…"|null }`).
-    pub async fn threads_raw(
-        &self,
-        limit: Option<u32>,
-        cursor: Option<&str>,
-    ) -> serde_json::Value {
-        let mut request = self.client.get(self.url("/threads")).bearer_auth(&self.token);
+    pub async fn threads_raw(&self, limit: Option<u32>, cursor: Option<&str>) -> serde_json::Value {
+        let mut request = self
+            .client
+            .get(self.url("/threads"))
+            .bearer_auth(&self.token);
         if let Some(limit) = limit {
             request = request.query(&[("limit", limit.to_string())]);
         }
@@ -629,7 +634,10 @@ impl RebornServer {
         let response = request.send().await.expect("list threads request");
         let status = response.status();
         let body: serde_json::Value = response.json().await.expect("threads json");
-        assert!(status.is_success(), "list threads failed ({status}): {body}");
+        assert!(
+            status.is_success(),
+            "list threads failed ({status}): {body}"
+        );
         body
     }
 
@@ -660,10 +668,7 @@ impl RebornServer {
             .await
             .expect("cancel request");
         let status = response.status();
-        let body = response
-            .json()
-            .await
-            .unwrap_or(serde_json::Value::Null);
+        let body = response.json().await.unwrap_or(serde_json::Value::Null);
         (status, body)
     }
 

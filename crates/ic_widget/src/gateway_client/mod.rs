@@ -101,12 +101,32 @@ impl GatewayClient {
 
     /// List the caller's threads, newest page first.
     pub async fn list_threads(&self, limit: Option<u32>) -> Result<Vec<ThreadSummary>> {
-        let path = match limit {
-            Some(limit) => format!("/threads?limit={limit}"),
-            None => "/threads".to_string(),
-        };
-        let response: ListThreadsResponse = self.get(&path).await?;
-        Ok(response.threads)
+        Ok(self.list_threads_page(limit, None).await?.threads)
+    }
+
+    /// One page of the caller's threads, with the cursor for the next.
+    ///
+    /// `next_cursor` is **absent** — not null — when there is no next page
+    /// (verified against the running gateway; see
+    /// `ic_integration_tests/tests/chat_control.rs`). Both spellings decode to
+    /// `None` here, so a caller only has to handle "no more".
+    pub async fn list_threads_page(
+        &self,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+    ) -> Result<ThreadPage> {
+        let mut query = Vec::new();
+        if let Some(limit) = limit {
+            query.push(("limit", limit.to_string()));
+        }
+        if let Some(cursor) = cursor {
+            query.push(("cursor", cursor.to_string()));
+        }
+        let response: ListThreadsResponse = self.get_with_query("/threads", &query).await?;
+        Ok(ThreadPage {
+            threads: response.threads,
+            next_cursor: response.next_cursor,
+        })
     }
 
     /// List the caller's scheduled automations.
@@ -263,6 +283,30 @@ impl GatewayClient {
         let response = self
             .client
             .get(&url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|source| Error::Http {
+                url: url.clone(),
+                source,
+            })?;
+        self.decode("GET", path, &url, response).await
+    }
+
+    /// A GET with query parameters, encoded by reqwest.
+    ///
+    /// A paging cursor is an **opaque gateway string** — it carries JSON
+    /// structure — so it must never be pasted into a URL by hand.
+    async fn get_with_query<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<T> {
+        let url = self.url(path);
+        let response = self
+            .client
+            .get(&url)
+            .query(query)
             .bearer_auth(&self.token)
             .send()
             .await
@@ -495,6 +539,18 @@ struct CreateThreadResponse {
 #[derive(Debug, Deserialize)]
 struct ListThreadsResponse {
     threads: Vec<ThreadSummary>,
+    /// Omitted by the gateway when there is no next page — not sent as null.
+    #[serde(default)]
+    next_cursor: Option<String>,
+}
+
+/// One page of threads, and how to ask for the next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadPage {
+    /// The rows.
+    pub threads: Vec<ThreadSummary>,
+    /// Pass back as `cursor`. `None` means this is the last page.
+    pub next_cursor: Option<String>,
 }
 
 /// `SessionThreadRecord`, trimmed to what the widget renders.

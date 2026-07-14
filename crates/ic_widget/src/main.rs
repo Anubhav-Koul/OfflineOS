@@ -311,11 +311,27 @@ async fn send_message(
     })
 }
 
+/// What the UI hears back from Stop.
+///
+/// Both fields mean "there is nothing left to stop" — the difference is only
+/// *why*, and neither is an error the user should see.
 #[derive(Serialize)]
 struct CancelResult {
+    /// The run had already finished. The common case: the reply lands while the
+    /// click is in the air.
     already_terminal: bool,
+    /// The gateway has never heard of this run — a stale id the UI was holding.
+    /// Refresh, do not complain.
+    unknown: bool,
 }
 
+/// Stop the run.
+///
+/// **Verified semantics (against the running gateway):** this asks the gateway to
+/// cancel — the response says `CancelRequested`, and the run goes terminal on the
+/// projection stream shortly after. It does **not** abort the in-flight request to
+/// the model: a local `llama-server` keeps generating to completion, so Stop means
+/// "stop showing me this", not "stop computing this". See the Phase 8a notes.
 #[tauri::command]
 async fn cancel_run(
     state: tauri::State<'_, AppState>,
@@ -325,13 +341,23 @@ async fn cancel_run(
     let client = state.client().await?;
     let thread_id = ThreadId::new(thread_id).map_err(user_facing)?;
     let run_id = RunId::new(run_id).map_err(user_facing)?;
-    let outcome = client
-        .cancel_run(&thread_id, &run_id)
-        .await
-        .map_err(user_facing)?;
-    Ok(CancelResult {
-        already_terminal: outcome.already_terminal,
-    })
+    match client.cancel_run(&thread_id, &run_id).await {
+        Ok(outcome) => Ok(CancelResult {
+            already_terminal: outcome.already_terminal,
+            unknown: false,
+        }),
+        // A run that no longer exists cannot be stopped, and saying so in red
+        // would be theatre: the user asked for it to not be running, and it is
+        // not running.
+        Err(error) if error.is_not_found() => {
+            tracing::debug!(%run_id, "stop: the gateway does not know this run; refreshing");
+            Ok(CancelResult {
+                already_terminal: true,
+                unknown: true,
+            })
+        }
+        Err(error) => Err(user_facing(error)),
+    }
 }
 
 #[derive(Serialize)]
@@ -412,28 +438,141 @@ async fn answer_browser_fill(
 
 // ----------------------------------------------------------- dashboard panels
 
-/// A row in the sessions panel.
+/// A row in the chats panel.
 #[derive(Serialize)]
 struct UiThread {
     thread_id: String,
     /// `None` until the agent has titled the thread; the UI shows a placeholder.
     title: Option<String>,
+    /// Whether the user has hidden this conversation. See
+    /// [`ic_widget::settings::Settings::hidden_threads`] — it is a local archive,
+    /// not a delete, because no route deletes a thread.
+    hidden: bool,
+    /// Whether this is the conversation both windows are currently showing.
+    current: bool,
+}
+
+/// One page of the chats list.
+#[derive(Serialize)]
+struct UiThreadPage {
+    threads: Vec<UiThread>,
+    /// Pass back to page. `None` is the end of the list — the gateway omits the
+    /// field entirely rather than sending null, which the client normalizes.
+    next_cursor: Option<String>,
 }
 
 /// The caller's threads, newest first. Threads survive gateway restarts (they
 /// are persisted through the libSQL-backed root filesystem), so this is a stable
 /// list, not a per-session one.
 #[tauri::command]
-async fn list_threads(state: tauri::State<'_, AppState>) -> Result<Vec<UiThread>, String> {
+async fn list_threads(
+    state: tauri::State<'_, AppState>,
+    limit: Option<u32>,
+    cursor: Option<String>,
+) -> Result<UiThreadPage, String> {
     let client = state.client().await?;
-    let threads = client.list_threads(None).await.map_err(user_facing)?;
-    Ok(threads
-        .into_iter()
-        .map(|thread| UiThread {
-            thread_id: thread.thread_id.to_string(),
-            title: thread.title,
-        })
-        .collect())
+    let page = client
+        .list_threads_page(limit, cursor.as_deref())
+        .await
+        .map_err(user_facing)?;
+
+    // silent-ok: an unreadable settings file means nothing is hidden, which
+    // shows *more* than it should rather than losing a conversation.
+    let hidden = state
+        .settings_store
+        .load()
+        .map(|settings| settings.hidden_threads)
+        .unwrap_or_default();
+    let current = state.thread.lock().await.as_ref().map(ThreadId::to_string);
+
+    Ok(UiThreadPage {
+        threads: page
+            .threads
+            .into_iter()
+            .map(|thread| {
+                let id = thread.thread_id.to_string();
+                UiThread {
+                    hidden: hidden.contains(&id),
+                    current: current.as_deref() == Some(id.as_str()),
+                    thread_id: id,
+                    title: thread.title,
+                }
+            })
+            .collect(),
+        next_cursor: page.next_cursor,
+    })
+}
+
+/// Hide a conversation from the list, or bring it back.
+///
+/// **This is not a delete, and the button does not say it is.** No serve route
+/// removes a thread, and we do not touch IronClaw's database — so the
+/// conversation is still there, in the gateway, exactly as the agent left it.
+/// The widget simply stops listing it.
+#[tauri::command]
+async fn set_thread_hidden(
+    state: tauri::State<'_, AppState>,
+    thread_id: String,
+    hidden: bool,
+) -> Result<(), String> {
+    // Validate before persisting: an id that is not a thread id would sit in the
+    // settings file forever, hiding nothing.
+    let thread_id = ThreadId::new(thread_id).map_err(user_facing)?.to_string();
+    state.update_settings(|settings| {
+        settings.hidden_threads.retain(|id| id != &thread_id);
+        if hidden {
+            settings.hidden_threads.push(thread_id.clone());
+        }
+    })?;
+    Ok(())
+}
+
+/// Point both windows at an existing conversation, and follow it.
+///
+/// The thread is owned by Rust (see [`current_thread`]), so switching means
+/// replacing the app's thread and its event pump — the same move
+/// [`respond_suggestion`] makes when the user accepts "show me".
+#[tauri::command]
+async fn use_thread(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    thread_id: String,
+) -> Result<(), String> {
+    let thread_id = ThreadId::new(thread_id).map_err(user_facing)?;
+    // Prove the thread exists before repointing the app at it: a stale id from a
+    // list the user has been staring at for ten minutes must not strand both
+    // windows on a conversation the gateway has never heard of.
+    let client = state.client().await?;
+    client
+        .timeline(&thread_id, Some(1))
+        .await
+        .map_err(user_facing)?;
+    follow_thread(&app, &state, thread_id).await?;
+    Ok(())
+}
+
+/// Repoint the app's thread and event pump at `thread_id`, and tell both windows.
+async fn follow_thread(
+    app: &AppHandle,
+    state: &AppState,
+    thread_id: ThreadId,
+) -> Result<(), String> {
+    let client = state.client().await?;
+    let mut pump = state.pump.lock().await;
+    if let Some(previous) = pump.take() {
+        previous.abort();
+    }
+    *pump = Some(tokio::spawn(pump_events(
+        app.clone(),
+        client,
+        thread_id.clone(),
+    )));
+    drop(pump);
+
+    *state.thread.lock().await = Some(thread_id.clone());
+    update_character(app, |inputs| inputs.run = None).await;
+    let _ = app.emit("thread://changed", thread_id.to_string());
+    Ok(())
 }
 
 /// A row in the automations panel.
@@ -2605,21 +2744,9 @@ async fn respond_suggestion(
         && let Some(thread_id) = suggestion.thread_id
         && let Ok(thread_id) = ThreadId::new(&thread_id)
     {
-        // Point both windows at the run's own thread, the same way `new_thread`
-        // does — otherwise "show me" would open a conversation that does not
-        // contain the thing being shown.
-        let client = state.client().await?;
-        let mut pump = state.pump.lock().await;
-        if let Some(previous) = pump.take() {
-            previous.abort();
-        }
-        *pump = Some(tokio::spawn(pump_events(
-            app.clone(),
-            client,
-            thread_id.clone(),
-        )));
-        *state.thread.lock().await = Some(thread_id.clone());
-        let _ = app.emit("thread://changed", thread_id.to_string());
+        // Point both windows at the run's own thread — otherwise "show me" would
+        // open a conversation that does not contain the thing being shown.
+        follow_thread(&app, &state, thread_id).await?;
         if let Err(error) = show_dashboard(&app) {
             tracing::warn!(%error, "could not open the dashboard for an accepted suggestion");
         }
@@ -3550,6 +3677,8 @@ fn main() {
             watchers_status,
             set_watcher_kinds,
             set_watch_rules,
+            set_thread_hidden,
+            use_thread,
             respond_suggestion,
             needs_setup,
             profile,

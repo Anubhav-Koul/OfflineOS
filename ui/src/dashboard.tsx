@@ -22,6 +22,7 @@ import {
   type ProviderSettings,
   type RecommendedModel,
   type ReplyMode,
+  type Message,
   type Thread,
   type VoiceState,
 } from "./api";
@@ -941,6 +942,236 @@ function SetupWizard(props: { onDone: () => void }) {
   );
 }
 
+/** The chat state, owned by the Dashboard so the Chats panel can read it too. */
+type Chat = ReturnType<typeof createChat>;
+
+/**
+ * Past conversations: list them, read them, continue one, hide one (Phase 8a).
+ *
+ * Three verified facts shape this panel, all from driving the real gateway
+ * (`ic_integration_tests/tests/chat_control.rs`):
+ *
+ * - **Nothing deletes a thread.** Every removal route 404s. So "Hide" is a local
+ *   archive in the widget's own settings, and the button says exactly that —
+ *   the conversation is still in the gateway, untouched.
+ * - **`next_cursor` is omitted, not null**, at the end of the list. Absent and
+ *   null are both "no more".
+ * - Historical threads can hold message kinds this build has never met (a
+ *   `summary`, a tool result with null content). They render as neutral rows;
+ *   an unknown kind must never be able to crash the panel.
+ */
+function ChatsPanel(props: { chat: Chat }) {
+  const [threads, setThreads] = createSignal<Thread[]>([]);
+  const [cursor, setCursor] = createSignal<string | null>(null);
+  const [loading, setLoading] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+  const [showHidden, setShowHidden] = createSignal(false);
+  const [notice, setNotice] = createSignal<string | null>(null);
+
+  /** The conversation being previewed, and its history. */
+  const [opened, setOpened] = createSignal<Thread | null>(null);
+  const [history, setHistory] = createSignal<Message[]>([]);
+  const [historyError, setHistoryError] = createSignal<string | null>(null);
+
+  const PAGE = 25;
+
+  const load = async (append: boolean) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const page = await api.listThreads(PAGE, append ? cursor() : null);
+      setThreads((current) => (append ? [...current, ...page.threads] : page.threads));
+      setCursor(page.next_cursor);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setLoading(false);
+    }
+  };
+  onMount(() => void load(false));
+
+  const visible = () => threads().filter((thread) => showHidden() || !thread.hidden);
+
+  const open = async (thread: Thread) => {
+    setOpened(thread);
+    setHistory([]);
+    setHistoryError(null);
+    try {
+      setHistory(await api.fetchTimeline(thread.thread_id));
+    } catch (reason) {
+      // A thread that vanished under us (a wiped store) is a refresh, not a
+      // dialog — the same posture as a stale run id.
+      setHistoryError(String(reason));
+      void load(false);
+    }
+  };
+
+  const continueHere = async (thread: Thread) => {
+    setNotice(null);
+    // Switching thread while the agent is mid-answer would abandon a run the
+    // user is still waiting on — and the reply would land in a conversation
+    // nobody is watching. Make them finish or stop it first.
+    if (props.chat.busy()) {
+      setNotice("The agent is still working. Finish or stop that answer first.");
+      return;
+    }
+    try {
+      await api.useThread(thread.thread_id);
+      setOpened(null);
+      await load(false);
+    } catch (reason) {
+      setNotice(String(reason));
+      void load(false);
+    }
+  };
+
+  const setHidden = async (thread: Thread, hidden: boolean) => {
+    setNotice(null);
+    try {
+      await api.setThreadHidden(thread.thread_id, hidden);
+      await load(false);
+    } catch (reason) {
+      setNotice(String(reason));
+    }
+  };
+
+  return (
+    <section>
+      <div class="panel-head">
+        <h2>Conversations</h2>
+        <button class="ghost" disabled={loading()} onClick={() => void load(false)}>
+          Refresh
+        </button>
+      </div>
+      <p class="muted small">
+        Every conversation the agent has had. Threads survive restarts.{" "}
+        <strong>Hide</strong> removes one from this list only — nothing deletes a
+        conversation, because the agent's API has no route that does.
+      </p>
+
+      <Show when={notice()}>
+        <p class="reason-inline">{notice()}</p>
+      </Show>
+      <Show when={error()}>
+        <p class="reason-inline">{error()}</p>
+      </Show>
+
+      <Show
+        when={visible().length > 0 || loading()}
+        fallback={<p class="muted">No conversations yet.</p>}
+      >
+        <ul class="rows">
+          <For each={visible()}>
+            {(thread) => (
+              <li class="row">
+                <div class="model-card-main">
+                  <span class="row-title">
+                    {thread.title ?? "Untitled conversation"}
+                    <Show when={thread.current}>
+                      {" "}
+                      <span class="badge ready">current</span>
+                    </Show>
+                    <Show when={thread.hidden}>
+                      {" "}
+                      <span class="badge starting">hidden</span>
+                    </Show>
+                  </span>
+                  <span class="row-meta">{thread.thread_id}</span>
+                </div>
+                <button class="ghost" onClick={() => void open(thread)}>
+                  Read
+                </button>
+                <Show when={!thread.current}>
+                  <button onClick={() => void continueHere(thread)}>Continue</button>
+                </Show>
+                <button
+                  class="ghost"
+                  onClick={() => void setHidden(thread, !thread.hidden)}
+                >
+                  {thread.hidden ? "Unhide" : "Hide"}
+                </button>
+              </li>
+            )}
+          </For>
+        </ul>
+      </Show>
+
+      <div class="row">
+        <Show when={cursor()}>
+          <button class="ghost" disabled={loading()} onClick={() => void load(true)}>
+            {loading() ? "Loading…" : "Load more"}
+          </button>
+        </Show>
+        <label class="wizard-voice">
+          <input
+            type="checkbox"
+            checked={showHidden()}
+            onChange={(event) => setShowHidden(event.currentTarget.checked)}
+          />
+          Show hidden
+        </label>
+      </div>
+
+      {/* The history of one conversation, read-only. */}
+      <Show when={opened()}>
+        {(thread) => (
+          <div class="history">
+            <div class="panel-head">
+              <h3>{thread().title ?? "Untitled conversation"}</h3>
+              <button class="ghost" onClick={() => setOpened(null)}>
+                Close
+              </button>
+            </div>
+            <Show when={historyError()}>
+              <p class="reason-inline">{historyError()}</p>
+            </Show>
+            <Show
+              when={history().length > 0}
+              fallback={<p class="muted">{historyError() ? "" : "Loading…"}</p>}
+            >
+              <div class="transcript">
+                <For each={history()}>
+                  {(message) => (
+                    <div class={`bubble ${historyRole(message)}`}>
+                      {/* An unknown kind, or a message whose body is a reference
+                          (a tool result), renders as a neutral row rather than
+                          crashing on the null. */}
+                      <Show
+                        when={message.content}
+                        fallback={<em class="muted">({message.kind})</em>}
+                      >
+                        {message.content}
+                      </Show>
+                    </div>
+                  )}
+                </For>
+              </div>
+            </Show>
+          </div>
+        )}
+      </Show>
+    </section>
+  );
+}
+
+/**
+ * Map a timeline message kind onto a bubble style.
+ *
+ * Anything that is not a plain user or assistant turn — a summary, a tool
+ * result, a kind added by a newer gateway — renders as a neutral "event" row.
+ * The panel must never crash on a kind it has not met.
+ */
+function historyRole(message: Message): string {
+  switch (message.kind) {
+    case "user":
+      return "user";
+    case "assistant":
+      return "assistant";
+    default:
+      return "event";
+  }
+}
+
 /**
  * The conversation. This is where typing lives now — the widget is the character,
  * and the character does not carry a text box.
@@ -948,9 +1179,14 @@ function SetupWizard(props: { onDone: () => void }) {
  * It shows the *same* thread the widget speaks from: the thread is owned by Rust
  * (`api.currentThread()`), so both windows join one conversation rather than each
  * creating their own.
+ *
+ * The chat is created by the Dashboard and handed down (Phase 8a): the Chats
+ * panel has to know whether a run is in flight before it lets the user switch
+ * conversations, and a second `createChat()` would be a second event pump
+ * fighting the first for one of the gateway's three stream slots.
  */
-function ChatPane() {
-  const chat = createChat();
+function ChatPane(props: { chat: Chat }) {
+  const chat = props.chat;
   const [draft, setDraft] = createSignal("");
   const [copied, setCopied] = createSignal<number | null>(null);
   let transcript: HTMLDivElement | undefined;
@@ -964,13 +1200,8 @@ function ChatPane() {
     scrollToEnd();
   });
 
-  onMount(() => {
-    const cleanups: (() => void)[] = [];
-    onCleanup(() => cleanups.forEach((fn) => fn()));
-    void (async () => {
-      cleanups.push(await chat.start());
-    })();
-  });
+  // The chat is started once, by the Dashboard. Starting it here too would open
+  // a second event pump for the same thread every time the user opened this tab.
 
   const submit = () => {
     const text = draft();
@@ -2109,17 +2340,26 @@ function Dashboard() {
   const [showWizard, setShowWizard] = createSignal(false);
   const [section, setSection] = createSignal<SectionId>("chats");
 
-  const sessions = createPanelData<Thread>(api.listThreads);
   const automations = createPanelData<Automation>(api.listAutomations);
   const model = createValueData<LocalModel | null>(api.localModelStatus);
 
+  // One chat for the whole window: the Chats panel needs to see whether a run is
+  // in flight before it lets the user switch conversations, and a second
+  // `createChat()` would open a second event pump against the same thread.
+  const chat = createChat();
+
   const loadAll = () => {
-    void sessions.refresh();
     void automations.refresh();
     void model.refresh();
   };
 
   onMount(async () => {
+    const cleanups: (() => void)[] = [];
+    onCleanup(() => cleanups.forEach((fn) => fn()));
+    void (async () => {
+      cleanups.push(await chat.start());
+    })();
+
     const unlisten = await onGatewayState((state) => {
       const wasReady = gateway().state === "ready";
       setGateway(state);
@@ -2181,7 +2421,7 @@ function Dashboard() {
 
       <main class="dashboard">
         <Show when={section() === "chats"}>
-          <ChatPane />
+          <ChatPane chat={chat} />
         </Show>
 
         <Show when={section() === "settings"}>
@@ -2218,32 +2458,7 @@ function Dashboard() {
       </Show>
 
       <Show when={section() === "chats"}>
-      <section>
-        <div class="panel-head">
-          <h2>Sessions</h2>
-          <button class="ghost" disabled={sessions.loading()} onClick={() => void sessions.refresh()}>
-            Refresh
-          </button>
-        </div>
-        <PanelBody
-          error={sessions.error()}
-          loading={sessions.loading()}
-          loaded={sessions.loaded()}
-          empty={sessions.rows().length === 0}
-          emptyText="No conversations yet."
-        >
-          <ul class="rows">
-            <For each={sessions.rows()}>
-              {(thread) => (
-                <li class="row">
-                  <span class="row-title">{thread.title ?? "Untitled conversation"}</span>
-                  <span class="row-meta">{thread.thread_id}</span>
-                </li>
-              )}
-            </For>
-          </ul>
-        </PanelBody>
-      </section>
+        <ChatsPanel chat={chat} />
       </Show>
 
       <Show when={section() === "automations"}>

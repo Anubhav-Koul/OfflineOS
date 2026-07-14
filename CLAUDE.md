@@ -1585,3 +1585,102 @@ templates). No code is blocked on any of it.
 Next: **Phase 8 — surfacing the runtime.** An audit against the serve route table
 found whole tiers of runtime capability the product never surfaces; Phase 8 wires
 the highest-value ones in, starting with 8a (dashboard shell + chat management).
+
+## Phase 8a notes — dashboard shell + chat management (recorded 2026-07-14)
+
+`crates/ic_widget` (`main.rs`, `gateway_client/mod.rs`, `error.rs`, `settings.rs`) +
+`ui/` (`dashboard.tsx`, `chat.ts`, `widget.tsx`, `api.ts`, `styles.css`) + a new gate
+(`ic_integration_tests/tests/chat_control.rs`). **No core patch.** Every contract
+below was verified against the pinned upstream commit **`a492857`**
+(`reborn-integration`) by driving a real `serve` — on the next upstream merge those
+assertions are the alarm.
+
+### The three ⚠️ VERIFY items, answered before any feature code
+
+**1. Nothing deletes a thread.** All five plausible spellings 404
+(`DELETE /threads/{id}`, `POST .../delete`, `.../archive`, `.../hide`;
+`DELETE .../messages` is a 405), and the thread survives every attempt. So the
+button says **Hide**, and means it: the conversation stays in the gateway exactly
+as the agent left it, and the widget keeps a local `settings.hidden_threads` list
+of what not to show. No libSQL was touched — that would couple us to internals and
+break the never-delete-LLM-data invariant.
+
+**2. Stop does not stop the model.** This is the finding that reshapes the feature.
+`cancel_run` answers `status: "CancelRequested"` — a *request*, not a completion —
+and a slow-provider mock proves the gateway **leaves its in-flight HTTP request to
+the LLM open**: three seconds after the cancel, the provider request was neither
+aborted nor answered. The run does go terminal on the projection stream, so the UI
+recovers correctly; but with a local model, `llama-server` keeps generating to
+completion and the GPU burns tokens nobody will read. **Stop means "stop showing me
+this", not "stop computing this."** Pinned by
+`cancelling_an_in_flight_run_reports_terminal_and_what_it_does_to_the_provider`,
+whose verdict line prints which way it went — if upstream ever wires cancellation
+through to the provider request, that test says so.
+
+**3. 🚨 `POST /llm/test-connection` cannot test a connection — 8a.5 is NOT built.**
+The spec asked for a Test-connection button "instead of restarting the gateway to
+find out a key works". The route exists and is inert: `LlmProvider::list_models()`
+has a **default impl returning an empty list** (`ironclaw_llm/src/provider.rs:494`),
+and **`RigAdapter` — which serves OpenAI, Anthropic, Ollama and `openai_compatible`,
+i.e. every provider our picker can configure — never overrides it**.
+`test_connection` (`llm_config_service.rs:536`) asks the adapter for a model list,
+gets an empty one, and reports **`ok: true`** without opening a socket. Proven by
+probing a **port with nothing listening on it, using a junk key**: it reports
+"connection ok". A button over this would show a green tick for a bogus key against
+a dead endpoint — worse than no button — and a model dropdown fed by
+`/llm/list-models` would always be empty. **Reported rather than adapted, per the
+rules of engagement; awaiting a decision.** Pinned by
+`the_provider_probe_reports_ok_for_an_endpoint_that_does_not_exist`, which starts
+failing the day upstream implements `list_models` for `RigAdapter` — that is the
+signal the button can finally exist.
+
+### What shipped
+
+- **The sidebar landed as its own logic-free commit** (`19d9d66`), as required.
+  Each existing panel is *wrapped* in a nav `Show` rather than extracted into a
+  routed component, so there is no seam through which a panel's behaviour could
+  have shifted — the diff is a section registry, a signal, and moved JSX.
+  **Connectors is deliberately absent** from the sidebar: it arrives with 8b, and a
+  nav entry that opens an empty panel is worse than no entry.
+- **Chats panel**: `GET /threads` with cursor paging (the widget's client gained
+  `list_threads_page`), read any conversation's history through the timeline,
+  **Continue** to point both windows at it, **Hide/Unhide**. Switching conversations
+  while a run is in flight is **blocked** with "finish or stop that answer first" —
+  otherwise the reply lands in a thread nobody is watching. A message kind this
+  build has never met (a summary, a tool result with `content: null`) renders as a
+  neutral event row; an unknown kind must never be able to crash the panel.
+- **Stop is now in the bubble**, which is where the user actually is — it only ever
+  existed in the dashboard, which is closed most of the time. It says "Stopping…"
+  from the moment it is clicked rather than waiting for the gateway to admit the
+  cancel (which takes a poll or two).
+- **The two Stop races no longer show a dialog.** An already-finished run
+  (`already_terminal`, the common case — the reply lands as the click flies) and an
+  unknown run id (a clean `404`) both now mean "collect the reply and move on".
+  Before this, a stale run id produced a red "Could not stop" the user could do
+  nothing about.
+- **One chat per window.** The Dashboard now owns the `createChat()` and hands it to
+  both the chat pane and the Chats panel: the panel has to know whether a run is in
+  flight, and a second `createChat()` would open a second event pump against the
+  same thread — the gateway caps a caller at three concurrent streams.
+
+### Two contract quirks worth remembering
+
+- The cancel response's `status` is **PascalCase** (`CancelRequested`, `Completed`),
+  unlike the projection stream's snake_case `run_status`. Two spellings of the same
+  vocabulary on one API.
+- **`next_cursor` is omitted, not null**, when there is no next page. A client that
+  reads it as a required field breaks on the common case; both spellings normalize
+  to "no more" in `gateway_client`.
+
+### The regression checklist (8a.1)
+
+The layout commit changes no panel logic *by construction* (the diff is wrapping),
+the frontend type-checks and builds, and the app boots with the dashboard webview
+mounting every panel **with no console error**. What could not be automated: a
+human clicking each interactive flow (model download + cancel, model switch,
+provider apply-and-restart, ambient toggles, skill review card). Those call Tauri
+commands this phase did not touch, but a visual pass is still worth one minute of
+someone's time.
+
+Next: **8b — connectors**, whose first job is its own ⚠️ VERIFY: drive a registry
+connector to a *real tool call* before building any UI.

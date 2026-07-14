@@ -25,25 +25,37 @@
 //! blocked and the registry path is upstream-broken, exactly as it was for
 //! CP-4/CP-5.
 //!
-//! # The answer (2026-07-15)
+//! # The answer (2026-07-15): **it all works.**
 //!
-//! Stages 1–4 **work**, and work well — this is *not* the Phase 4 trap. The
-//! registry is composed (10 entries), install succeeds, the credential lands
-//! through the product-auth lane, and activation genuinely hands the model all 34
-//! GitHub tools.
+//! All five stages pass. The registry is composed (10 entries); install succeeds;
+//! the credential lands; activation hands the model all 34 GitHub tools; and the
+//! tool call **reaches GitHub's API**, which answers `401` because the token here
+//! is deliberately bogus:
 //!
-//! **Stage 5 hangs.** The capability reports `started` and then never completes,
-//! never fails, and never times out — observed at 90 s, 120 s and 300 s. The
-//! module is *not* the problem: `system/extensions/github/wasm/github_tool.wasm`
-//! is downloaded and sitting on disk. The artifact arrives, the capability is
-//! published, the model calls it, and the **execution wedges**. A user who
-//! installs a WASM registry connector gets an agent that freezes on first use,
-//! with no error to show for it and no timeout to recover from.
+//! ```text
+//! WASM guest returned raw capability error  capability_id=github.search_repositories
+//!   wasm_error={"code":"github_api_error_status_401","kind":"auth_required"}
+//! ```
 //!
-//! So 8b takes the fallback the spec allows: in-process first-party connectors,
-//! the proven `ic_browser_mcp` / `ic_canvas_mcp` pattern. The assertions at the
-//! bottom are a **tripwire asserting the broken behaviour** — the day upstream
-//! fixes WASM tool execution, this test goes red and says so.
+//! That 401 is the proof the whole chain works — registration, WASM execution,
+//! host egress, and credential injection. With a real token it would have
+//! returned repositories. **8b can be built on the registry path.**
+//!
+//! ## The trap that nearly produced a false bug report
+//!
+//! A 401 from the tool does not end the run — it **parks it in an auth gate**
+//! (`blocked_auth`), because the runtime's answer to "this credential is bad" is
+//! to ask the user for a better one. A probe that waits only for
+//! `"status":"completed"` therefore waits forever, and *looks* exactly like a hang.
+//!
+//! Compounding it: `serve` reads **`IRONCLAW_REBORN_LOG`**, not `RUST_LOG`
+//! (`ironclaw_reborn_cli/src/runtime/mod.rs:34`). With the wrong variable set the
+//! log is empty, and an empty log plus a stalled run reads as a wedged runtime.
+//! It is neither. **Set the right variable before concluding anything is broken.**
+//!
+//! This also explains why `/manual-token/submit` demands a `run_id` and `gate_ref`
+//! while `/manual-token/secret-submit` does not: the former exists precisely to
+//! answer *this* gate, mid-run.
 //!
 //! Contract verified against upstream `a492857` (`reborn-integration`).
 #![cfg(feature = "webui-v2-beta")]
@@ -86,7 +98,7 @@ fn responder() -> ic_integration_tests::MockResponder {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_wasm_registry_connector_reaches_the_model_but_its_tool_call_hangs() {
+async fn a_wasm_registry_connector_installs_activates_and_calls_a_real_tool() {
     // A home we can inspect afterwards: whether the WASM artifact ever landed on
     // disk is what separates "the download never happened" from "the module ran
     // and wedged".
@@ -94,9 +106,15 @@ async fn a_wasm_registry_connector_reaches_the_model_but_its_tool_call_hangs() {
     let server = RebornServer::start_scripted_in_home(
         responder(),
         "unused".to_string(),
+        // `serve` reads **`IRONCLAW_REBORN_LOG`**, not `RUST_LOG`
+        // (`ironclaw_reborn_cli/src/runtime/mod.rs:34`). Setting the wrong one is
+        // why an earlier version of this probe saw an empty log and wrongly
+        // concluded the binary was silent.
         vec![(
-            "RUST_LOG".into(),
-            "info,ironclaw_wasm=debug,ironclaw_extensions=debug".into(),
+            "IRONCLAW_REBORN_LOG".into(),
+            "info,ironclaw_wasm=trace,ironclaw_extensions=debug,ironclaw_host_runtime=debug,\
+             ironclaw_reborn_composition=debug"
+                .into(),
         )],
         home.path(),
     )
@@ -387,52 +405,42 @@ async fn a_wasm_registry_connector_reaches_the_model_but_its_tool_call_hangs() {
         tail(&logs, 60)
     );
 
-    // ---- The verdict --------------------------------------------------------
-    //
-    // Stages 1–4 all pass, and they pass *well*: the model is genuinely handed
-    // all 34 GitHub tools. This is NOT the Phase 4 trap (a green install with no
-    // tools behind it) — everything up to the invocation works.
-    //
-    // Stage 5 does not merely fail. It **hangs**: the capability reports
-    // `started` and then never completes, never fails, and never times out —
-    // observed at 90 s, 120 s and 300 s. No `.wasm` artifact is ever written to
-    // the home directory, so the module the call needs is never fetched.
-    //
-    // So a WASM registry connector cannot be shipped: a user who installs one
-    // gets an agent that freezes on first use, with no error to show them.
-    //
-    // These assertions are a TRIPWIRE, and they are deliberately the wrong way
-    // round: they assert the *broken* behaviour, so that the day upstream fixes
-    // WASM tool execution this test goes red and tells us the registry path is
-    // open. Until then, 8b takes the fallback the spec allows — in-process
-    // first-party connectors, the proven ic_browser_mcp / ic_canvas_mcp pattern.
+    // ---- The verdict: the registry connector path works ---------------------
 
     assert!(
         github_tools.len() >= 30,
-        "the model should be offered GitHub's tools — registration, credentials \
-         and activation all work. If this breaks, something *earlier* regressed. \
-         Offered: {github_tools:?}"
+        "the model must be offered GitHub's tools — registration, credentials and \
+         activation all work today. Offered: {github_tools:?}"
     );
 
-    assert!(
-        !done && tool_results.is_empty(),
-        "🎉 THE TOOL CALL RETURNED. Upstream has fixed WASM tool execution — the \
-         registry connector path is open, and 8b can be rebuilt on it instead of \
-         on in-process wrappers. Tool results: {tool_results:?}"
-    );
-
-    // And the module IS on disk — `system/extensions/github/wasm/github_tool.wasm`.
-    // So the fetch is not the problem: the artifact downloads, the capability is
-    // published, the model calls it, and the *execution* wedges. That narrows the
-    // upstream bug to the WASM host, which is worth stating precisely when we
-    // report it.
+    // The module really is fetched and executed.
     assert!(
         wasm.iter().any(|path| path.ends_with(".wasm")),
-        "the module is no longer being fetched — a different failure from the one \
-         this test was written for. Re-diagnose rather than trusting the tripwire."
+        "the WASM module should be downloaded to the home directory: {wasm:?}"
     );
 
-    let _ = (capabilities, stream, provided);
+    // THE BAR: the tool call reached the vendor. The 401 is the *proof* — it can
+    // only come from GitHub, and only after the module ran, the host egress
+    // allowed the request, and the injected credential was sent. A real token
+    // would have returned repositories instead.
+    assert!(
+        logs.contains("github_api_error_status_401") || logs.contains("auth_required"),
+        "the tool call never reached GitHub. If the runtime now answers something \
+         else, re-read the log before assuming success:\n{}",
+        tail(&logs, 40)
+    );
+
+    // And the run parks in an auth gate rather than finishing — which is the
+    // correct answer to a bad credential, and the reason a probe that waits only
+    // for `completed` waits forever and misreads it as a hang.
+    assert!(
+        !done,
+        "the run completed with a deliberately invalid token — expected it to park \
+         in an auth gate instead. Statuses seen: {:?}",
+        run_statuses(&stream)
+    );
+
+    let _ = (capabilities, tool_results, provided);
 }
 
 /// The registry's shape, verified live:

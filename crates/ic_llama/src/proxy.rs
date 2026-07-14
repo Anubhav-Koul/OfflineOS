@@ -102,6 +102,34 @@ pub const MAX_GRAMMAR_REPETITIONS: u64 = 1999;
 /// JSON Schema keywords that llama.cpp turns into a GBNF repetition bound.
 const REPETITION_KEYWORDS: [&str; 4] = ["maxLength", "minLength", "maxItems", "minItems"];
 
+/// A JSON Schema `pattern` is transcribed into the grammar **as written**, and
+/// GBNF's character classes are not regex: they have no `\s`, `\d`, `\w`, and no
+/// lookaround. llama.cpp's converter passes those escapes straight through, and
+/// its own parser then rejects the result — with `failed to parse grammar`, a
+/// `400`, and **no clue which tool did it**.
+///
+/// The blast radius is what makes this worth a route-around rather than a
+/// per-schema fix: all of a request's tools compile into *one* grammar, so a
+/// single unsupported pattern in a single property of a single tool takes down
+/// every tool call the model could have made. Installing the GitHub connector did
+/// exactly that — its `owner`/`repo` properties carry `pattern: "[^\\s/?#]+"`, and
+/// with it active a local model answered nothing at all: every turn 400'd, the
+/// agent loop retried, and the run never terminated. Measured, not theorised —
+/// `ic_integration_tests/tests/tool_flood.rs`.
+///
+/// So a pattern is kept only when it is *obviously* expressible in GBNF, and
+/// dropped otherwise. This is the same fail-closed shape as the browser consent
+/// gate: the uncertain case takes the safe branch, because a model that is merely
+/// unconstrained on one string field still works, and a model that cannot compile
+/// its grammar does not work at all.
+fn pattern_is_grammar_safe(pattern: &str) -> bool {
+    // A backslash is the door to every escape GBNF lacks (`\s`, `\d`, `\w`, `\b`),
+    // and `(?` opens lookaround and non-capturing groups it cannot express. Neither
+    // is worth parsing precisely: to know which subset llama.cpp accepts we would
+    // have to re-implement its converter and then track it upstream forever.
+    !pattern.contains('\\') && !pattern.contains("(?")
+}
+
 /// Requests larger than this are refused rather than buffered. IronClaw's
 /// payloads are tens of kilobytes; a full context of messages is well under this.
 const MAX_REQUEST_BYTES: usize = 64 << 20;
@@ -549,11 +577,12 @@ fn bad_gateway(message: &str) -> Response<BoxBody<Bytes, std::io::Error>> {
     response
 }
 
-/// Strip repetition bounds llama.cpp cannot compile.
+/// Strip what llama.cpp cannot compile into a grammar: oversized repetition
+/// bounds, and `pattern`s using regex GBNF does not have.
 ///
 /// Returns the body unchanged when it is not JSON, when it carries no tools, or
-/// when every bound is already within range — a body we do not understand is a
-/// body we forward verbatim rather than corrupt.
+/// when there was nothing to repair — a body we do not understand is a body we
+/// forward verbatim rather than corrupt.
 fn sanitize_body(body: &Bytes) -> Bytes {
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return body.clone();
@@ -586,8 +615,9 @@ fn sanitize_body(body: &Bytes) -> Bytes {
     }
 }
 
-/// Recursively remove `maxLength`/`minLength`/`maxItems`/`minItems` whose value
-/// exceeds [`MAX_GRAMMAR_REPETITIONS`]. Returns how many were removed.
+/// Recursively remove what llama.cpp's grammar compiler cannot take: repetition
+/// bounds above [`MAX_GRAMMAR_REPETITIONS`], and `pattern`s that are not
+/// [`pattern_is_grammar_safe`]. Returns how many keywords were removed.
 fn strip_oversized_bounds(node: &mut serde_json::Value) -> usize {
     let mut stripped = 0;
     match node {
@@ -601,6 +631,14 @@ fn strip_oversized_bounds(node: &mut serde_json::Value) -> usize {
                     map.remove(keyword);
                     stripped += 1;
                 }
+            }
+            let unsafe_pattern = map
+                .get("pattern")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|pattern| !pattern_is_grammar_safe(pattern));
+            if unsafe_pattern {
+                map.remove("pattern");
+                stripped += 1;
             }
             for child in map.values_mut() {
                 stripped += strip_oversized_bounds(child);
@@ -772,6 +810,54 @@ mod tests {
         // 1999 compiles; 2000 is the first value that does not.
         assert_eq!(properties["small"]["maxLength"], 1999);
         assert!(properties["big"].get("maxLength").is_none());
+    }
+
+    /// The exact schema the GitHub connector ships. Before this rule, installing
+    /// it made a local model answer *nothing at all*: the pattern rode into the
+    /// grammar as `[^\s/?#]+`, GBNF has no `\s`, and llama.cpp answered `400
+    /// failed to parse grammar` to every request — for every tool, because they all
+    /// compile into one grammar.
+    #[test]
+    fn a_pattern_gbnf_cannot_express_is_stripped() {
+        let sanitized = sanitize(json!({
+            "tools": [{"function": {"parameters": {"properties": {
+                "owner": {"type": "string", "pattern": "[^\\s/?#]+"},
+                "repo": {"type": "string", "pattern": "[^\\s/?#]+"}
+            }}}}]
+        }));
+        let properties = &sanitized["tools"][0]["function"]["parameters"]["properties"];
+        assert!(properties["owner"].get("pattern").is_none());
+        assert!(properties["repo"].get("pattern").is_none());
+        // The property itself survives — only the constraint goes.
+        assert_eq!(properties["owner"]["type"], "string");
+    }
+
+    #[test]
+    fn a_pattern_gbnf_can_express_is_left_alone() {
+        let sanitized = sanitize(json!({
+            "tools": [{"function": {"parameters": {"properties": {
+                "ref": {"type": "string", "pattern": "^[a-zA-Z0-9_-]+$"}
+            }}}}]
+        }));
+        let properties = &sanitized["tools"][0]["function"]["parameters"]["properties"];
+        assert_eq!(properties["ref"]["pattern"], "^[a-zA-Z0-9_-]+$");
+    }
+
+    #[test]
+    fn lookaround_is_not_grammar_safe() {
+        assert!(!pattern_is_grammar_safe("(?=.*[a-z]).+"));
+        assert!(!pattern_is_grammar_safe("\\d{3}"));
+        assert!(pattern_is_grammar_safe("[a-z]+"));
+    }
+
+    /// A user's own message may contain anything, including the word "pattern" and
+    /// a regex. Repairing it would corrupt the conversation.
+    #[test]
+    fn a_pattern_in_a_message_is_not_touched() {
+        let sanitized = sanitize(json!({
+            "messages": [{"role": "user", "content": {"pattern": "[^\\s]+"}}],
+        }));
+        assert_eq!(sanitized["messages"][0]["content"]["pattern"], "[^\\s]+");
     }
 
     #[test]

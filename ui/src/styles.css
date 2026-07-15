@@ -942,6 +942,28 @@ ul.warnings li::before {
 button.ghost.danger {
   color: var(--danger);
 }
+/* An inline text button that reads as a link (Phase 8b.1, "remove the client"). */
+button.linklike {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent, #6ea8fe);
+  text-decoration: underline;
+  cursor: pointer;
+  font: inherit;
+}
+/* The numbered Google OAuth setup steps. */
+ol.oauth-steps {
+  margin: 8px 0 8px 26px;
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+ol.oauth-steps .key-row {
+  margin-left: 0;
+  margin-top: 4px;
+}
 .apply-row {
   margin-top: 14px;
   display: flex;

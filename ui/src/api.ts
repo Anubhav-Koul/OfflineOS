@@ -381,6 +381,19 @@ export interface Connector {
   setup_url: string | null;
 }
 
+/**
+ * The Google OAuth client's state and the exact redirect URI to register
+ * (Phase 8b.1). The client id/secret themselves never come back to the UI.
+ */
+export interface GoogleOAuthStatus {
+  /** Whether a client is stored — i.e. OAuth connectors can be authorized. */
+  configured: boolean;
+  /** The redirect URI to register with Google, byte-for-byte. */
+  redirect_uri: string;
+  /** The fixed loopback port it lands on. */
+  port: number;
+}
+
 /** What installing a connector reports back — the vendor's onboarding copy. */
 export interface InstallOutcome {
   awaiting_token: boolean;
@@ -520,6 +533,21 @@ export const api = {
   /** Publish a connector's tools to the agent, or take them away. */
   setConnectorEnabled: (id: string, enabled: boolean) =>
     invoke<void>("set_connector_enabled", { id, enabled }),
+  /** The Google OAuth client's state and the redirect URI to register (8b.1). */
+  googleOAuthStatus: () => invoke<GoogleOAuthStatus>("google_oauth_status"),
+  /** Store the Google OAuth client the user created; restarts the gateway. */
+  setGoogleOAuth: (clientId: string, clientSecret: string) =>
+    invoke<void>("set_google_oauth", { clientId, clientSecret }),
+  /** Forget the Google OAuth client; restarts the gateway. */
+  clearGoogleOAuth: () => invoke<void>("clear_google_oauth"),
+  /** Change the fixed loopback OAuth callback port; restarts the gateway. The
+   *  user must re-register the new redirect URI with Google. */
+  setOAuthCallbackPort: (port: number) =>
+    invoke<void>("set_oauth_callback_port", { port }),
+  /** Authorize an OAuth connector end to end: opens Google's consent page,
+   *  catches the redirect, completes the exchange, and activates the tools. */
+  authorizeGoogleConnector: (id: string) =>
+    invoke<void>("authorize_google_connector", { id }),
   /** Store a connector's new credential and clear the run parked on the old one.
    *  The caller re-asks the question afterwards — see `chat.ts::answerAuthGate`. */
   recoverAuthGate: (provider: string, token: string, threadId: string, runId: string) =>

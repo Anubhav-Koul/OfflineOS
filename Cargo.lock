@@ -4701,6 +4701,7 @@ dependencies = [
 name = "ic_widget"
 version = "0.1.0"
 dependencies = [
+ "axum 0.8.9",
  "bytes",
  "chrono",
  "dirs",
@@ -4716,6 +4717,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sha2 0.10.9",
  "tauri",
  "tauri-build",
@@ -4724,6 +4726,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
  "uuid",

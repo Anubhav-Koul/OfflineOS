@@ -121,6 +121,13 @@ pub enum Error {
         provider: String,
     },
 
+    /// The user tried to save a blank Google OAuth client field (Phase 8b.1).
+    #[error("the Google OAuth {field} is empty")]
+    BlankGoogleOAuth {
+        /// Which field: `client id` or `client secret`. Never the value.
+        field: &'static str,
+    },
+
     /// A JSON value could not be produced or consumed.
     #[error("{context}")]
     Json {

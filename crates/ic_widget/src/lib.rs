@@ -11,6 +11,7 @@
 //! | [`browser`] | Supervising the browser MCP sidecar; registering its tools |
 //! | [`canvas`] | The in-process canvas MCP server; rendering agent HTML/SVG |
 //! | [`gateway_client`] | The only place we talk to `ironclaw-reborn serve` |
+//! | [`oauth_callback`] | The fixed-port loopback listener for connector OAuth |
 //! | [`hit_test`] | The click-through mask for the transparent window |
 //! | [`job_object`] | Making child processes die with us |
 //! | [`secrets`] | The bearer token, in the OS credential store |
@@ -29,6 +30,7 @@ pub mod gateway_client;
 pub mod hit_test;
 pub mod job_object;
 pub mod model_catalog;
+pub mod oauth_callback;
 pub mod persona;
 pub mod probe;
 pub mod providers;

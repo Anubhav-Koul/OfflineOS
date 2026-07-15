@@ -1874,8 +1874,111 @@ drives today.
 Two findings from this phase are worth filing once #6000 is answered: the
 `/manual-token/submit` `400`, and the auth-gate payload that names no connector.
 
-Next: **8c — the runtime's own surfaces** (memory, skills, audit, run history), whose
-first job is its own ⚠️ VERIFY: all four have no HTTP route today
-(`docs/desktop/dashboard-gaps.md`), so establish what `serve` will and will not answer
-*before* designing a panel for any of them. Gmail's OAuth callback (a stable loopback
-port) belongs there too.
+Next: **8b.1 — finish the Gmail OAuth lane** (the stable loopback callback the 8b
+notes left as future work), then **8c — the runtime's own surfaces** (memory, skills,
+audit, run history), whose first job is its own ⚠️ VERIFY: all four have no HTTP route
+today (`docs/desktop/dashboard-gaps.md`), so establish what `serve` will and will not
+answer *before* designing a panel for any of them.
+
+## Phase 8b.1 notes — the Gmail OAuth lane, wired (recorded 2026-07-15)
+
+`crates/ic_widget` (new `oauth_callback.rs`; `secrets.rs`, `settings.rs`,
+`error.rs`, `gateway_client/mod.rs`, `main.rs`) + `ui/` (`dashboard.tsx`, `api.ts`,
+`styles.css`) + a new gate (`ic_integration_tests/tests/connector_oauth_wired.rs`).
+**No core patch.** The 8b notes stopped Gmail at a documented 503; 8b.1 closes the
+gap the additive way the whole fork is built.
+
+### The ⚠️ VERIFY answered from source, then driven against a running `serve`
+
+`serve` reads its Google OAuth **client** from the environment once at boot
+(`resolve_google_oauth_config`, `ironclaw_reborn_cli/src/runtime/mod.rs:436`):
+`IRONCLAW_REBORN_GOOGLE_CLIENT_ID`, `..._CLIENT_SECRET` (optional → public-client
+PKCE), `..._OAUTH_REDIRECT_URI`. Two facts decided the design:
+
+- **The redirect URI is *ours* to choose.** `serve` embeds `config.redirect_uri()`
+  verbatim into the Google authorization URL and, later, into the token exchange —
+  it never checks the request's own host/port against it. So the redirect can point
+  anywhere, including a widget-owned listener.
+- **But `serve` owns the token exchange.** Its Google callback handler
+  (`product_auth_serve/oauth.rs::google_oauth_callback_handler`) holds the PKCE
+  verifier it minted during `oauth/start`, in a process-local cache, and does the
+  code→token swap itself. Only `serve` can complete the flow.
+
+So the widget **cannot** simply own the callback; it owns the *stable address* and
+**proxies** the redirect into `serve`. Pinned by `connector_oauth_wired.rs`, which
+boots `serve` with a well-formed fake client whose redirect URI is our fixed-port
+loopback, and asserts the same start route that answered **503** in
+`connector_oauth.rs` now answers **200** with a consent URL carrying our client id,
+**our redirect URI percent-encoded verbatim**, and a CSRF `state`. That is the whole
+widget-side contract; the two tests are each other's foil (no-client → 503,
+client → 200).
+
+### The fixed-port decision, and why
+
+Google matches a registered redirect URI byte-for-byte, and the widget takes a
+*fresh OS-assigned* port for `serve` every launch (two instances must coexist). A
+redirect URI built from `serve`'s port would force the user to re-register with
+Google on every launch — unusable. So OAuth gets the one **stable** address in the
+system: a widget-owned loopback listener on a **fixed, configurable** port
+(`settings.google_oauth.callback_port`, default **51789** — uncommon, rarely
+clashes). The user registers `http://127.0.0.1:51789/api/reborn/product-auth/oauth/google/callback`
+with Google once; it survives relaunches. The port is configurable because 51789
+may be taken, and changing it restarts the gateway (the redirect URI is boot-time
+env) and requires re-registering with Google — the panel shows the current URI with
+a copy button so there is no guessing.
+
+### `oauth_callback.rs` — what the listener owns (and what it doesn't)
+
+- **Loopback bind only** (`127.0.0.1`), never a routable interface.
+- **Proxy, not handler.** It forwards the browser's callback — path and query
+  verbatim, `Accept: text/html` — into `{serve_base}/api/reborn/product-auth/oauth/google/callback`,
+  and streams `serve`'s own "you can close this window" page back. The markup and
+  the token exchange are `serve`'s; the listener is a stable doorway.
+- **A CSRF binding the widget can actually enforce.** `serve` generates and
+  cryptographically validates the opaque `state`; the widget cannot re-derive it,
+  but it *can* extract the `state` from the authorization URL `serve` returned and
+  require the callback to carry that exact value before forwarding. A mismatched or
+  missing `state` is a `400` and is **never** forwarded, and deliberately does *not*
+  consume the one-shot latch — a forged hit cannot burn the genuine callback.
+- **One-shot** (a replay is `409`) and **closed when idle**: the port is bound only
+  for the duration of one flow (`arm()` binds, `ArmedListener::wait()` tears down),
+  and binding happens **before** the browser opens so a port clash is an error the
+  user sees, not a browser onto a dead redirect.
+
+### The one env difference from every other secret
+
+The Google client id **and secret** enter `serve`'s environment on purpose
+(`google_oauth_env` in `main.rs`). This is the exact opposite of the cloud-failover
+key, which the `ic_llama` proxy deliberately keeps *out* of `serve` because the
+proxy owns that retry. Here `serve` owns the OAuth token exchange, so it genuinely
+needs the secret. The client lives in the OS credential store
+(`SecretStore::{set,has,clear}_google_oauth`), never `settings.json`, and the client
+id/secret never round-trip back to the webview — the panel asks only
+`has_google_oauth`.
+
+### The panel
+
+For any installed OAuth connector the dashboard now renders a shared **Google
+sign-in** block (one client covers Gmail/Drive/Calendar): it links the exact console
+page, shows the redirect URI to register with a copy button, and takes the client id
++ secret. Once configured, each OAuth connector row shows an **Authorize** button
+that runs `authorize_google_connector` end to end — read the OAuth secret's
+invocation/scopes, `oauth/start`, arm the listener, open the **system** browser
+(Google blocks embedded webviews), await the proxied callback, confirm the
+credential landed by polling the setup projection (the honest check — a 2xx callback
+means `serve` accepted it, not that the account was stored), then activate. The
+character goes `concerned` while the user is away consenting.
+
+### Where the gate stops, and the manual smoke item
+
+`connector_oauth_wired.rs` drives every automatable link — env wiring, install,
+setup, and the start route producing a consent URL with our redirect. It stops
+exactly where GitHub's real-token read stopped in `connector_verify.rs`: the
+callback is a real token exchange against Google's servers, needing a real OAuth
+client, a real user consenting, and a real Gmail account. **Manual smoke gate:**
+register a real client, `Authorize` Gmail through the panel, then ask "summarize my
+latest email" and confirm the agent reads it — the one hop that needs a human and a
+mailbox, not a fixture.
+
+Next: **8c — the runtime's own surfaces** (memory, skills, audit, run history), and
+Gmail's OAuth callback is no longer among its open items.

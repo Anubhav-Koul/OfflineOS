@@ -20,6 +20,17 @@ const SERVICE: &str = "IronClaw Desktop";
 /// The gateway bearer token's entry name.
 const GATEWAY_TOKEN: &str = "gateway-token";
 
+/// The Google OAuth **client** id and secret entry names (Phase 8b.1).
+///
+/// This is the client the user creates in the Google Cloud console — not a user
+/// credential. `serve` needs both at boot to run the OAuth flow (it does the
+/// token exchange), so unlike a cloud provider key, this one *is* handed to the
+/// gateway's environment. The client id is not truly secret (it rides in every
+/// authorization URL) but is filed here alongside the secret for one place to
+/// look and one place to wipe.
+const GOOGLE_OAUTH_CLIENT_ID: &str = "google-oauth-client-id";
+const GOOGLE_OAUTH_CLIENT_SECRET: &str = "google-oauth-client-secret";
+
 /// 32 bytes of hex. `serve` requires ≥ 32 bytes when SSO is enabled and uses the
 /// token as an HMAC key (`serve.rs:272`); we are not using SSO, but a token that
 /// would be too short for it is a token that would break the day we did.
@@ -102,6 +113,59 @@ impl SecretStore {
         Ok(())
     }
 
+    /// The Google OAuth client the user registered, if both id and secret are
+    /// stored (Phase 8b.1). `None` unless *both* are present — a half-configured
+    /// client would make `serve` fail its token exchange at the worst moment.
+    ///
+    /// Read at gateway spawn to set the `IRONCLAW_REBORN_GOOGLE_*` environment.
+    /// Not exposed to the webview; the dashboard asks [`SecretStore::has_google_oauth`].
+    pub fn google_oauth(&self) -> Result<Option<GoogleOAuthClient>> {
+        let (Some(client_id), Some(client_secret)) = (
+            self.read(GOOGLE_OAUTH_CLIENT_ID)?,
+            self.read(GOOGLE_OAUTH_CLIENT_SECRET)?,
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(GoogleOAuthClient {
+            client_id,
+            client_secret,
+        }))
+    }
+
+    /// Whether a Google OAuth client is configured. Safe to expose to the UI.
+    pub fn has_google_oauth(&self) -> Result<bool> {
+        Ok(self.read(GOOGLE_OAUTH_CLIENT_ID)?.is_some()
+            && self.read(GOOGLE_OAUTH_CLIENT_SECRET)?.is_some())
+    }
+
+    /// Store the Google OAuth client id and secret, replacing any previous pair.
+    ///
+    /// Both are required and neither may be blank: a blank field looks configured
+    /// in the dashboard and then fails `serve` at boot with an opaque error. The
+    /// values never appear in a log line.
+    pub fn set_google_oauth(&self, client_id: &str, client_secret: &str) -> Result<()> {
+        if client_id.trim().is_empty() {
+            return Err(Error::BlankGoogleOAuth { field: "client id" });
+        }
+        if client_secret.trim().is_empty() {
+            return Err(Error::BlankGoogleOAuth {
+                field: "client secret",
+            });
+        }
+        self.write(GOOGLE_OAUTH_CLIENT_ID, client_id.trim())?;
+        self.write(GOOGLE_OAUTH_CLIENT_SECRET, client_secret.trim())?;
+        tracing::info!("stored a Google OAuth client in the OS credential store");
+        Ok(())
+    }
+
+    /// Forget the Google OAuth client. Idempotent.
+    pub fn clear_google_oauth(&self) -> Result<()> {
+        self.delete(GOOGLE_OAUTH_CLIENT_ID)?;
+        self.delete(GOOGLE_OAUTH_CLIENT_SECRET)?;
+        tracing::info!("cleared the Google OAuth client from the OS credential store");
+        Ok(())
+    }
+
     /// Remove every credential this app owns: the gateway token and each provider's
     /// key. For uninstall cleanup — Windows never removes Credential Manager entries
     /// on its own. Idempotent (a missing entry is not an error), and best-effort per
@@ -115,6 +179,9 @@ impl SecretStore {
             if let Err(error) = self.clear_provider_key(&provider) {
                 tracing::warn!(provider = %provider.id, %error, "could not clear a provider key");
             }
+        }
+        if let Err(error) = self.clear_google_oauth() {
+            tracing::warn!(%error, "could not clear the Google OAuth client");
         }
         Ok(())
     }
@@ -159,6 +226,19 @@ impl SecretStore {
             }),
         }
     }
+}
+
+/// The Google OAuth client the user registered in the Cloud console (Phase 8b.1).
+///
+/// Both fields are handed to `serve`'s environment so it can run the token
+/// exchange. Never serialized into `settings.json`, a log line, or a webview
+/// response.
+#[derive(Debug, Clone)]
+pub struct GoogleOAuthClient {
+    /// The `*.apps.googleusercontent.com` client id.
+    pub client_id: String,
+    /// The client secret Google issued alongside it.
+    pub client_secret: String,
 }
 
 /// 128 bits of randomness rendered as 64 hex characters, from two v4 UUIDs.
@@ -209,6 +289,36 @@ mod tests {
             // The message names the provider, never the value.
             assert!(error.to_string().contains("anthropic"));
         }
+    }
+
+    #[test]
+    fn a_blank_google_oauth_field_is_refused_before_it_reaches_the_credential_store() {
+        let store = SecretStore::new();
+        for blank in ["", "   ", "\t\n"] {
+            let error = store
+                .set_google_oauth(blank, "a-secret")
+                .expect_err("a blank client id must be refused");
+            assert!(matches!(
+                error,
+                Error::BlankGoogleOAuth { field: "client id" }
+            ));
+            let error = store
+                .set_google_oauth("a-client.apps.googleusercontent.com", blank)
+                .expect_err("a blank client secret must be refused");
+            assert!(matches!(
+                error,
+                Error::BlankGoogleOAuth {
+                    field: "client secret"
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn google_oauth_entries_never_collide_with_the_gateway_token_or_each_other() {
+        assert_ne!(GOOGLE_OAUTH_CLIENT_ID, GATEWAY_TOKEN);
+        assert_ne!(GOOGLE_OAUTH_CLIENT_SECRET, GATEWAY_TOKEN);
+        assert_ne!(GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET);
     }
 
     #[test]

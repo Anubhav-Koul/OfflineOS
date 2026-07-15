@@ -11,6 +11,7 @@ import {
   type AmbientStatus,
   type Automation,
   type Connector,
+  type GoogleOAuthStatus,
   type ImportPreview,
   type WatchRule,
   type WatchTrigger,
@@ -2453,6 +2454,15 @@ function ConnectorsPanel() {
   const [busy, setBusy] = createSignal<string | null>(null);
   const [notice, setNotice] = createSignal<Record<string, string>>({});
 
+  // Google OAuth (Phase 8b.1): the shared client the user registers, and the
+  // redirect URI they must paste into it. Distinct from a connector credential —
+  // one client covers every Google connector.
+  const [oauth, setOauth] = createSignal<GoogleOAuthStatus | null>(null);
+  const [clientId, setClientId] = createSignal("");
+  const [clientSecret, setClientSecret] = createSignal("");
+  const [oauthBusy, setOauthBusy] = createSignal(false);
+  const [copied, setCopied] = createSignal(false);
+
   const refresh = async () => {
     setLoading(true);
     setError(null);
@@ -2464,7 +2474,17 @@ function ConnectorsPanel() {
       setLoading(false);
     }
   };
-  onMount(() => void refresh());
+  const refreshOAuth = async () => {
+    try {
+      setOauth(await api.googleOAuthStatus());
+    } catch (reason) {
+      setError(String(reason));
+    }
+  };
+  onMount(() => {
+    void refresh();
+    void refreshOAuth();
+  });
 
   const token = (id: string) => tokens()[id] ?? "";
   const setToken = (id: string, value: string) =>
@@ -2529,6 +2549,66 @@ function ConnectorsPanel() {
     }
   };
 
+  /** Whether any installed connector needs the shared Google OAuth client. */
+  const needsGoogleClient = () =>
+    connectors().some((connector) => connector.auth_kind === "oauth");
+
+  const saveGoogleClient = async () => {
+    if (!clientId().trim() || !clientSecret().trim()) return;
+    setOauthBusy(true);
+    setError(null);
+    try {
+      // This restarts the gateway (serve reads the OAuth client at boot), so the
+      // panels reload behind it — this refresh is best-effort.
+      await api.setGoogleOAuth(clientId().trim(), clientSecret().trim());
+      setClientId("");
+      setClientSecret("");
+      await refreshOAuth();
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setOauthBusy(false);
+    }
+  };
+
+  const clearGoogleClient = async () => {
+    setOauthBusy(true);
+    try {
+      await api.clearGoogleOAuth();
+      await refreshOAuth();
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setOauthBusy(false);
+    }
+  };
+
+  const copyRedirect = async () => {
+    const uri = oauth()?.redirect_uri;
+    if (!uri) return;
+    try {
+      await navigator.clipboard.writeText(uri);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard can be denied; the URI is visible to select by hand.
+    }
+  };
+
+  const authorize = async (connector: Connector) => {
+    setBusy(connector.id);
+    say(connector.id, "Opening your browser to sign in…");
+    try {
+      await api.authorizeGoogleConnector(connector.id);
+      say(connector.id, "Signed in — its tools are now on the agent.");
+      await refresh();
+    } catch (reason) {
+      say(connector.id, String(reason));
+    } finally {
+      setBusy(null);
+    }
+  };
+
   /** How many tools the agent is currently carrying, across all connectors. */
   const activeTools = () =>
     connectors()
@@ -2574,6 +2654,106 @@ function ConnectorsPanel() {
         <p class="reason-inline">{error()}</p>
       </Show>
 
+      {/*
+        Google sign-in setup (Phase 8b.1). One OAuth client covers every Google
+        connector, so it lives here, once, rather than per row. The two human
+        steps are real and cannot be automated: Google issues an OAuth client
+        only to a person in the Cloud console, and it matches the redirect URI
+        byte-for-byte. So the panel walks those steps honestly — link the console,
+        show the exact redirect URI to register, take the client id and secret —
+        and then the per-connector "Authorize" button can do the rest.
+      */}
+      <Show when={needsGoogleClient()}>
+        <div class="row connector">
+          <div class="model-card-main">
+            <span class="row-title">
+              Google sign-in
+              <Show when={oauth()?.configured}>
+                {" "}
+                <span class="badge ready">configured</span>
+              </Show>
+            </span>
+            <span class="row-meta">
+              Gmail, Drive, and Calendar sign in with Google — not a token you can
+              paste. Set this up once and every Google connector can use it.
+            </span>
+
+            <Show
+              when={oauth() && !oauth()!.configured}
+              fallback={
+                <p class="muted small">
+                  A Google OAuth client is configured. Authorize a connector below,
+                  or{" "}
+                  <button
+                    class="linklike"
+                    disabled={oauthBusy()}
+                    onClick={() => void clearGoogleClient()}
+                  >
+                    remove the client
+                  </button>
+                  .
+                </p>
+              }
+            >
+              <ol class="muted small oauth-steps">
+                <li>
+                  Create an OAuth client (type “Desktop app” or “Web application”)
+                  at{" "}
+                  <a
+                    href="https://console.cloud.google.com/apis/credentials"
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Google Cloud → Credentials
+                  </a>
+                  , and enable the Gmail API for the project.
+                </li>
+                <li>
+                  Add this exact redirect URI to the client (it must match
+                  byte-for-byte):
+                  <div class="key-row">
+                    <input type="text" readonly value={oauth()?.redirect_uri ?? ""} />
+                    <button disabled={!oauth()} onClick={() => void copyRedirect()}>
+                      {copied() ? "Copied" : "Copy"}
+                    </button>
+                  </div>
+                </li>
+                <li>Paste the client’s ID and secret here:</li>
+              </ol>
+              <div class="key-row">
+                <input
+                  type="text"
+                  placeholder="Client ID (…apps.googleusercontent.com)"
+                  value={clientId()}
+                  onInput={(event) => setClientId(event.currentTarget.value)}
+                />
+              </div>
+              <div class="key-row">
+                <input
+                  type="password"
+                  placeholder="Client secret"
+                  value={clientSecret()}
+                  onInput={(event) => setClientSecret(event.currentTarget.value)}
+                />
+                <button
+                  disabled={
+                    !clientId().trim() || !clientSecret().trim() || oauthBusy()
+                  }
+                  onClick={() => void saveGoogleClient()}
+                >
+                  {oauthBusy() ? "Saving…" : "Save client"}
+                </button>
+              </div>
+              <p class="muted small">
+                Saving restarts the agent so it picks up the client — the panels
+                may blink. Your client stays on this machine, in the OS credential
+                store, never in a settings file.
+              </p>
+            </Show>
+          </div>
+        </div>
+      </Show>
+
       <ul class="rows">
         <For each={connectors()}>
           {(connector) => (
@@ -2601,24 +2781,34 @@ function ConnectorsPanel() {
                   {(message) => <p class="reason-inline">{message()}</p>}
                 </Show>
 
-                {/* An OAuth connector (Gmail, Drive, Notion) cannot be finished
-                    here, and pretending otherwise would be the cruellest kind of
-                    UI: a token box that accepts a paste and then never works. The
-                    gateway will not even begin the flow without an OAuth client
-                    registered with the vendor — it answers 503 (pinned by
-                    `connector_oauth.rs`) — and that client can only be created by a
-                    human, against a redirect URI Google matches exactly. So the row
-                    says what it needs and stops. */}
+                {/* An OAuth connector (Gmail, Drive) signs in with a browser
+                    round-trip, not a paste. The gateway will not begin that flow
+                    without a Google OAuth client registered against a fixed
+                    redirect URI — so the shared setup above supplies the client,
+                    and this button drives the consent + exchange (Phase 8b.1).
+                    Until the client is configured, the row points up at it. */}
                 <Show when={connector.installed && !connector.ready && connector.auth_kind === "oauth"}>
-                  <p class="reason-inline">
-                    {connector.name} signs in with {connector.provider ?? "OAuth"},
-                    not with a token you can paste. That needs an OAuth client
-                    registered with {connector.provider ?? "the vendor"} and a fixed
-                    callback address — neither of which this build ships yet, so the
-                    agent cannot use {connector.name} today.
-                  </p>
-                  <Show when={connector.instructions}>
-                    {(text) => <p class="muted small">{text()}</p>}
+                  <Show
+                    when={oauth()?.configured}
+                    fallback={
+                      <p class="reason-inline">
+                        {connector.name} signs in with {connector.provider ?? "Google"}.
+                        Finish the Google sign-in setup above, then come back to
+                        authorize it.
+                      </p>
+                    }
+                  >
+                    <p class="muted small">
+                      {connector.name} signs in with {connector.provider ?? "Google"}.
+                      Authorizing opens your browser; approve there and it returns
+                      here.
+                    </p>
+                    <button
+                      disabled={busy() === connector.id}
+                      onClick={() => void authorize(connector)}
+                    >
+                      {busy() === connector.id ? "Waiting for sign-in…" : "Authorize"}
+                    </button>
                   </Show>
                 </Show>
 

@@ -975,6 +975,265 @@ async fn set_connector_enabled(
     Ok(())
 }
 
+// ------------------------------------------------- connector OAuth (Phase 8b.1)
+
+/// The Google OAuth client's state, and the redirect URI the user must register.
+#[derive(Serialize)]
+struct GoogleOAuthStatus {
+    /// Whether a client id + secret are stored — i.e. OAuth connectors can start.
+    configured: bool,
+    /// The redirect URI to register with Google, byte-for-byte. Shown with a copy
+    /// button so the user pastes exactly this into their OAuth client.
+    redirect_uri: String,
+    /// The fixed loopback port it lands on.
+    port: u16,
+}
+
+/// The Google OAuth client's state and the exact redirect URI to register.
+///
+/// The redirect URI is derived from the fixed callback port; the user registers
+/// it with Google once and it survives relaunches (the gateway's own port does
+/// not). Never returns the stored client id/secret to the webview.
+#[tauri::command]
+async fn google_oauth_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<GoogleOAuthStatus, String> {
+    let port = state
+        .settings_store
+        .load()
+        .map(|settings| settings.google_oauth.callback_port)
+        // silent-ok: unreadable settings mean the default port, same as fresh.
+        .unwrap_or(51789);
+    let configured = SecretStore::new().has_google_oauth().map_err(user_facing)?;
+    Ok(GoogleOAuthStatus {
+        configured,
+        redirect_uri: ic_widget::oauth_callback::redirect_uri(port),
+        port,
+    })
+}
+
+/// Store the Google OAuth client the user created, then restart the gateway so
+/// `serve` boots with it (it reads the OAuth environment once, at startup).
+#[tauri::command]
+async fn set_google_oauth(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    client_id: String,
+    client_secret: String,
+) -> Result<(), String> {
+    SecretStore::new()
+        .set_google_oauth(client_id.trim(), client_secret.trim())
+        .map_err(user_facing)?;
+    // silent-ok: unreadable settings mean the default (local) provider, which is
+    // the right thing to restart onto for a fresh install.
+    let selection = state
+        .settings_store
+        .load()
+        .map(|settings| settings.active_provider)
+        .unwrap_or_default();
+    restart_gateway(app, selection).await;
+    Ok(())
+}
+
+/// Forget the Google OAuth client and restart the gateway without it.
+#[tauri::command]
+async fn clear_google_oauth(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    SecretStore::new()
+        .clear_google_oauth()
+        .map_err(user_facing)?;
+    // silent-ok: unreadable settings mean the default (local) provider, which is
+    // the right thing to restart onto.
+    let selection = state
+        .settings_store
+        .load()
+        .map(|settings| settings.active_provider)
+        .unwrap_or_default();
+    restart_gateway(app, selection).await;
+    Ok(())
+}
+
+/// Change the fixed loopback port the OAuth redirect lands on, and restart the
+/// gateway so `serve`'s registered redirect URI matches.
+///
+/// The user must re-register the new redirect URI with Google — the panel shows
+/// it. Restarting is required because the redirect URI is boot-time env for
+/// `serve`, exactly like the client id.
+#[tauri::command]
+async fn set_oauth_callback_port(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    port: u16,
+) -> Result<(), String> {
+    if port < 1024 {
+        return Err("Pick a port above 1023 — low ports need admin rights.".to_string());
+    }
+    let settings = state.update_settings(|settings| settings.google_oauth.callback_port = port)?;
+    restart_gateway(app, settings.active_provider).await;
+    Ok(())
+}
+
+/// Authorize an OAuth connector (Gmail, Drive, …) end to end (Phase 8b.1).
+///
+/// The one flow the panel could not offer before: read the connector's OAuth
+/// requirement, ask `serve` to begin the flow, open Google's consent page in the
+/// user's real browser (Google refuses embedded webviews), catch the redirect on
+/// the fixed-port listener, let `serve` complete the token exchange, then confirm
+/// the credential landed and publish the connector's tools.
+///
+/// The listener is armed **before** the browser opens, so a port clash is an
+/// error the user sees rather than a browser onto a dead redirect.
+#[tauri::command]
+async fn authorize_google_connector(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    if !SecretStore::new().has_google_oauth().map_err(user_facing)? {
+        return Err(
+            "Set up your Google OAuth client first — paste its client id and secret above."
+                .to_string(),
+        );
+    }
+    let client = state.client().await?;
+    let port = state
+        .settings_store
+        .load()
+        .map(|settings| settings.google_oauth.callback_port)
+        .unwrap_or(51789);
+
+    // 1. What the connector's OAuth secret needs: the invocation to authorize
+    //    against, the scopes, the account label, and the provider.
+    let setup = client.extension_setup(&id).await.map_err(user_facing)?;
+    let oauth = setup
+        .secrets
+        .iter()
+        .find(|secret| {
+            secret
+                .setup
+                .as_ref()
+                .and_then(|setup| setup.kind.as_deref())
+                == Some("oauth")
+        })
+        .ok_or("This connector does not use OAuth.")?;
+    let details = oauth
+        .setup
+        .as_ref()
+        .ok_or("The connector's OAuth setup is missing.")?;
+    let invocation_id = details.invocation_id.clone().ok_or(
+        "The gateway did not offer an OAuth invocation. Make sure the connector is installed \
+         and the Google client is configured, then try again.",
+    )?;
+    let provider = oauth
+        .provider
+        .clone()
+        .unwrap_or_else(|| "google".to_string());
+    let account_label = details
+        .account_label
+        .clone()
+        .unwrap_or_else(|| format!("{id} {provider}"));
+    let scopes = details.scopes.clone();
+
+    // 2. Ask serve to begin the flow. This is what answered 503 before a client
+    //    was configured; now it returns the Google consent URL.
+    let start = client
+        .start_extension_oauth(&id, &provider, &account_label, &scopes, &invocation_id)
+        .await
+        .map_err(user_facing)?;
+    let expected_state =
+        ic_widget::oauth_callback::state_from_authorization_url(&start.authorization_url)
+            .ok_or("The gateway returned an authorization URL without a state parameter.")?;
+
+    // 3. Arm the listener before opening the browser, so a port clash surfaces now.
+    let armed = ic_widget::oauth_callback::arm(port, expected_state, client.base_url().to_string())
+        .await
+        .map_err(|error| error.to_string())?;
+
+    update_character(&app, |inputs| inputs.auth_gate_pending = true).await;
+
+    // 4. Send the user to Google. Their real browser, not a webview — Google
+    //    blocks embedded user agents for OAuth.
+    if let Err(error) = open_in_browser(&start.authorization_url) {
+        update_character(&app, |inputs| inputs.auth_gate_pending = false).await;
+        return Err(format!(
+            "Could not open your browser to sign in: {error}. You can paste this URL yourself:\n{}",
+            start.authorization_url
+        ));
+    }
+
+    // 5. Wait for the redirect. serve completes the exchange when the listener
+    //    proxies the callback into it.
+    let outcome = armed
+        .wait(std::time::Duration::from_secs(300))
+        .await
+        .map_err(|error| error.to_string());
+    update_character(&app, |inputs| inputs.auth_gate_pending = false).await;
+
+    match outcome? {
+        ic_widget::oauth_callback::FlowOutcome::Completed => {}
+        ic_widget::oauth_callback::FlowOutcome::ProviderError { reason } => {
+            return Err(format!(
+                "Google did not authorize the connection ({reason}). You can try again."
+            ));
+        }
+        ic_widget::oauth_callback::FlowOutcome::ServeRejected { status } => {
+            return Err(format!(
+                "The sign-in did not complete (the agent returned {status}). \
+                 Check that the redirect URI you registered with Google matches exactly, \
+                 then try again."
+            ));
+        }
+    }
+
+    // 6. Confirm the credential actually landed, then publish the tools. The
+    //    setup projection is the honest check — the callback returning 2xx says
+    //    serve accepted it, not that the account was stored.
+    let mut provided = false;
+    for _ in 0..20 {
+        let setup = client.extension_setup(&id).await.map_err(user_facing)?;
+        if setup
+            .secrets
+            .iter()
+            .all(|secret| secret.provided || secret.optional)
+        {
+            provided = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    }
+    if !provided {
+        return Err(
+            "Signed in, but the credential did not appear. Refresh and try enabling the connector."
+                .to_string(),
+        );
+    }
+    client.activate_extension(&id).await.map_err(user_facing)?;
+    Ok(())
+}
+
+/// Open a URL in the user's default browser (Windows).
+///
+/// Spawns `rundll32 url.dll,FileProtocolHandler <url>` directly — no shell — so
+/// the `&` characters in an OAuth query are never mis-parsed by `cmd`.
+fn open_in_browser(url: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("rundll32.exe")
+            .arg("url.dll,FileProtocolHandler")
+            .arg(url)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = url;
+        Err("opening a browser is only wired for Windows".to_string())
+    }
+}
+
 /// Does this key work, and what can it run? (Phase 8a.5)
 ///
 /// Asked of the **provider itself**, from this process. The gateway cannot
@@ -2341,7 +2600,13 @@ async fn bring_up_gateway(app: AppHandle, selection: ProviderSelection) {
         let mut config = GatewayConfig::new(reborn_binary(), reborn_home()?, token)
             .map_err(|error| error.to_string())?;
         config.llm_env = llm_env;
-        config.extra_env = ambient_env(ambient_enabled);
+        // Ambient's trigger poller plus, when a Google OAuth client is configured,
+        // the environment `serve` needs to run the connector OAuth flow. The
+        // redirect URI is built from our fixed callback port so it matches what
+        // the user registered with Google.
+        let mut extra_env = ambient_env(ambient_enabled);
+        extra_env.extend(google_oauth_env(settings.google_oauth.callback_port));
+        config.extra_env = extra_env;
         GatewaySupervisor::start(config, job)
             .await
             .map_err(|error| error.to_string())
@@ -2437,6 +2702,40 @@ fn ambient_env(enabled: bool) -> Vec<(String, String)> {
     match enabled {
         true => vec![("IRONCLAW_TRIGGER_POLLER_ENABLED".into(), "true".into())],
         false => Vec::new(),
+    }
+}
+
+/// The environment that lets `serve` run the Google OAuth flow (Phase 8b.1), or
+/// empty when no client is configured.
+///
+/// **This one reaches the gateway on purpose**, unlike a cloud provider key. The
+/// `ic_llama` proxy deliberately keeps cloud keys out of `serve`'s environment
+/// because it owns the retry; but the Google OAuth token exchange is `serve`'s
+/// own — it holds the PKCE verifier — so `serve` genuinely needs the client
+/// secret. `serve` reads these once at boot (`resolve_google_oauth_config`,
+/// `ironclaw_reborn_cli`), so configuring a client restarts the gateway. The
+/// redirect URI is built from our fixed callback `port` and must match what the
+/// user registered with Google.
+fn google_oauth_env(port: u16) -> Vec<(String, String)> {
+    match SecretStore::new().google_oauth() {
+        Ok(Some(client)) => vec![
+            ("IRONCLAW_REBORN_GOOGLE_CLIENT_ID".into(), client.client_id),
+            (
+                "IRONCLAW_REBORN_GOOGLE_CLIENT_SECRET".into(),
+                client.client_secret,
+            ),
+            (
+                "IRONCLAW_REBORN_GOOGLE_OAUTH_REDIRECT_URI".into(),
+                ic_widget::oauth_callback::redirect_uri(port),
+            ),
+        ],
+        Ok(None) => Vec::new(),
+        Err(error) => {
+            // silent-ok: an unreadable client just means connector OAuth is
+            // unavailable this launch, the same as never configuring one.
+            tracing::warn!(%error, "could not read the Google OAuth client; connector OAuth unavailable");
+            Vec::new()
+        }
     }
 }
 
@@ -4012,6 +4311,11 @@ fn main() {
             install_connector,
             set_connector_token,
             set_connector_enabled,
+            google_oauth_status,
+            set_google_oauth,
+            clear_google_oauth,
+            set_oauth_callback_port,
+            authorize_google_connector,
             recover_auth_gate,
             respond_suggestion,
             needs_setup,

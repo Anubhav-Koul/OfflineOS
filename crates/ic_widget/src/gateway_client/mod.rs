@@ -303,6 +303,42 @@ impl GatewayClient {
         Ok(())
     }
 
+    /// Begin an OAuth connector's authorization (Phase 8b.1).
+    ///
+    /// Unlike a manual-token connector, this cannot be finished by a paste: it
+    /// needs a browser round-trip against a Google OAuth **client** the user
+    /// registered, which the gateway will only run if it was booted with that
+    /// client's environment. On success the gateway returns an `authorization_url`
+    /// to send the user to; the redirect lands back on the widget's fixed-port
+    /// callback listener, which proxies it into the gateway to complete the
+    /// exchange.
+    ///
+    /// `account_label`, `scopes`, and `invocation_id` all come from the OAuth
+    /// secret in [`GatewayClient::extension_setup`] — the gateway mints the
+    /// invocation and requires it back here. The route lives under the WebChat
+    /// prefix at `/extensions/{id}/setup/oauth/start`.
+    pub async fn start_extension_oauth(
+        &self,
+        id: &str,
+        provider: &str,
+        account_label: &str,
+        scopes: &[String],
+        invocation_id: &str,
+    ) -> Result<OAuthStart> {
+        // The gateway rejects an expiry beyond its own flow TTL; ten minutes is
+        // comfortably inside it and long enough for a human to consent.
+        let expires_at = (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
+        let body = serde_json::json!({
+            "provider": provider,
+            "account_label": account_label,
+            "scopes": scopes,
+            "expires_at": expires_at,
+            "invocation_id": invocation_id,
+        });
+        self.post(&format!("/extensions/{id}/setup/oauth/start"), &body)
+            .await
+    }
+
     /// The product-auth routes sit at `/api/reborn/product-auth/…`, *outside* the
     /// WebChat v2 prefix every other call uses.
     async fn post_product_auth<T: serde::de::DeserializeOwned>(
@@ -834,6 +870,37 @@ pub struct SecretSetup {
     /// `manual_token` or `oauth`.
     #[serde(default)]
     pub kind: Option<String>,
+    /// The label the credential account is filed under, e.g. `gmail google`.
+    /// Present only for `oauth`; carried verbatim into the OAuth start request.
+    #[serde(default)]
+    pub account_label: Option<String>,
+    /// The provider scopes this connector needs, e.g.
+    /// `https://www.googleapis.com/auth/gmail.readonly`. Present only for `oauth`.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// The invocation the OAuth flow must be started against. The gateway mints
+    /// it into the setup projection and *requires* it back on start — an OAuth
+    /// start without it is refused. Present only for `oauth`.
+    #[serde(default)]
+    pub invocation_id: Option<String>,
+}
+
+/// What `POST /extensions/{id}/setup/oauth/start` answers with (Phase 8b.1).
+///
+/// Only the two fields the widget acts on are decoded. `authorization_url` is the
+/// Google consent page to open; `flow_id` identifies the flow the callback
+/// completes. The gateway also returns `status`/`continuation`/`callback_scope`,
+/// which the widget does not need — the credential landing is observed by polling
+/// [`GatewayClient::extension_setup`], and there is no run to resume (this is a
+/// setup-only flow).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct OAuthStart {
+    /// The Google authorization URL to open in the user's browser. It carries the
+    /// CSRF `state` the callback listener binds against.
+    pub authorization_url: String,
+    /// The flow this authorization belongs to.
+    #[serde(default)]
+    pub flow_id: Option<String>,
 }
 
 /// `/manual-token/setup` — the interaction a token is submitted against.

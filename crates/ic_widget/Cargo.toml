@@ -82,6 +82,13 @@ chrono = { version = "0.4", default-features = false, features = [
 ] }
 keyring = { version = "3", features = ["windows-native"] }
 dirs = "6"
+# The connector OAuth callback listener (Phase 8b.1): a widget-owned loopback
+# server on a fixed port that proxies the redirect into `serve`. Same axum the
+# canvas MCP already pulls in, so no new transitive weight.
+axum = "0.8"
+# Decode the OAuth `state`/`error` query params the same way the browser encoded
+# them, for the CSRF check. Already compiled (axum uses it).
+serde_urlencoded = "0.7"
 
 tauri = { version = "2", features = ["tray-icon"], optional = true }
 tauri-plugin-global-shortcut = { version = "2", optional = true }
@@ -110,6 +117,9 @@ windows = { version = "0.62", features = [
 [dev-dependencies]
 ic_integration_tests = { path = "../ic_integration_tests" }
 tempfile = "3"
+# Drive the OAuth callback router without a socket (Phase 8b.1), the same way
+# the canvas/browser MCP tests drive theirs.
+tower = { version = "0.5", features = ["util"] }
 
 [lints]
 workspace = true

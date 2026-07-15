@@ -44,7 +44,14 @@
 //! Neither is hard; both are decisions with consequences, and neither belongs in a
 //! commit that claims Gmail "works". The panel therefore shows Gmail with the
 //! vendor's own instructions and says plainly that it needs a Google OAuth client,
-//! which is the truth. Wiring it is tracked as 8c work.
+//! which is the truth.
+//!
+//! **Phase 8b.1 wired the rest** (see `connector_oauth_wired.rs`): the widget owns
+//! a fixed-port loopback callback, sets the `IRONCLAW_REBORN_GOOGLE_*` environment
+//! from a user-registered client, and `serve` then answers this same start route
+//! with a real consent URL instead of the 503 pinned below. This test stays as the
+//! *no-client* baseline — it must keep answering 503 when the environment is
+//! absent, which is exactly what makes the wired test's 200 meaningful.
 #![cfg(feature = "webui-v2-beta")]
 
 use ic_integration_tests::{API_PREFIX, RebornServer};

@@ -259,6 +259,39 @@ pub struct Settings {
     /// [`Settings::ambient_enabled`] is also on.
     #[serde(default)]
     pub watchers: WatcherSettings,
+    /// Connector OAuth (Phase 8b.1). Holds the one thing about the OAuth callback
+    /// that is not secret and not derivable: the fixed loopback port the redirect
+    /// lands on. The Google OAuth *client* itself lives in the credential store.
+    #[serde(default)]
+    pub google_oauth: GoogleOAuthSettings,
+}
+
+/// Connector OAuth configuration (Phase 8b.1).
+///
+/// Google matches a registered redirect URI byte-for-byte, but the widget takes
+/// a fresh OS-assigned port for `serve` at every launch — so OAuth needs a
+/// *stable* callback the user registers with Google once. The widget owns a
+/// small loopback listener on this fixed port and proxies the redirect into
+/// `serve`'s dynamic callback route. Configurable because 51789 may be taken.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoogleOAuthSettings {
+    /// The fixed loopback port the OAuth redirect lands on. Default 51789 — an
+    /// uncommon port, chosen to rarely collide.
+    #[serde(default = "default_oauth_callback_port")]
+    pub callback_port: u16,
+}
+
+impl Default for GoogleOAuthSettings {
+    fn default() -> Self {
+        Self {
+            callback_port: default_oauth_callback_port(),
+        }
+    }
+}
+
+/// The default fixed loopback port for connector OAuth redirects.
+fn default_oauth_callback_port() -> u16 {
+    51789
 }
 
 /// The ambient watchers' configuration (Phase 7d).

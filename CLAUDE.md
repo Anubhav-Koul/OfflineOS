@@ -2155,3 +2155,67 @@ speaks, and that switching mid-utterance cuts the old voice cleanly.
 
 Next: the remaining Phase 8 topics — **universal approval gates**, **skills from
 git repos**, **channels**, **memory seeding + subagent visibility**.
+
+## Phase 8d notes — universal approval gates (recorded 2026-07-22)
+
+`ic_integration_tests/tests/approval_gate_dormant.rs` (new canary) +
+`docs/desktop/approval-gates.md` (new, the full write-up). **No core patch, no
+new UI, by design.** This is the spec's "expected case": the ⚠️ VERIFY confirmed
+the runtime's tool-approval gate never fires under our profile, and the
+instruction is explicit — *do not build UI over a mechanism that doesn't trigger*.
+
+### The VERIFY, answered from source and then driven live
+
+- **The `gate` SSE event IS the tool-approval channel** (distinct from
+  `auth_required`, the credential gate Phase 8b handles) — but it has **no
+  producer under `local-dev`.** A `gate` needs `TurnStatus::BlockedApproval` needs
+  `Decision::RequireApproval`; the only wired authorizer, `GrantAuthorizer`,
+  returns solely `Allow`/`Deny` (`RequireApproval` is never constructed), no hook
+  dispatcher is installed in composition, and budget-approval *fails* a run rather
+  than gating it. This confirms and extends the Phase 4 finding.
+- **`apply_patch` is active and runs unprompted** (`builtin.apply_patch`,
+  workspace-mounted, handler-registered). The one consent-sensitive cap not
+  otherwise driven by a gate test — so 8d drives it **live** (Phase 4 lesson: a
+  source trace is not a running gateway).
+- **`skill_install` runs unprompted** — re-confirmed (already pinned by 7b).
+
+### The capability-policy "backstop" cannot approve — only remove
+
+`local_dev_capability_policy.toml` is a compile-time **allow-list of grants**
+(capability → allowed effects + mount + network). It has **no deny/approval
+tier**: the only moves are narrow-the-effects or omit-the-entry (deny-by-absence
+→ `Decision::Deny{MissingGrant}`). So it can *remove* a capability but never make
+one "ask" — and it's a **core file** (a `core-patch:`). The consent-sensitive caps
+we actually use (`skill_install`, `skill_remove`, `shell`, `extension_install`,
+`apply_patch`) can't be removed without breaking Phase 4/7/8, and there's no cap
+we clearly want gone. **So: no core patch — the backstop buys nothing worth its
+cost.**
+
+### Decision (unchanged posture, now documented and pinned)
+
+The standing consent mechanism stays the **widget-side** patterns — the 7b
+two-step (review → red bubble card → a *deterministic* action, no LLM between the
+yes and the effect) and the Phase 4 browser-sidecar gate — which guard the two
+flows that genuinely need consent (installing model-authored code; typing secrets
+into a page) *in surfaces we own*, the only place a gate can be enforced when the
+runtime emits none. No double-prompt to reconcile: the runtime never emits a
+tool-approval gate, so the widget gates are the sole owner of every decision.
+
+### The tripwire
+
+`approval_gate_dormant.rs` drives `apply_patch` through a real gateway and asserts
+the run **completes** with **no `gate` event and no `blocked_approval`** on the
+projection stream. The day upstream wires `RequireApproval` (or a hook gate), the
+run parks at `blocked_approval` and a `gate` frame appears — both assertions flip,
+and *that* is the signal to build the universal consent card. Until then,
+`docs/desktop/approval-gates.md` is why it doesn't exist. Same shape as the
+`the_event_stream_never_carries_the_assistant_text` canary.
+
+### Gate
+
+fmt ✅, clippy `-D warnings` ✅ (`ic_integration_tests`), the canary passes against
+a real `serve` (`apply_patch` dispatched, run completed, no gate). No unit/UI
+changes — this sub-phase is a verified negative result, not a feature.
+
+Next: the remaining Phase 8 topics — **skills from git repos**, **channels**,
+**memory seeding + subagent visibility**.

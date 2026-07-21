@@ -1982,3 +1982,108 @@ mailbox, not a fixture.
 
 Next: **8c — the runtime's own surfaces** (memory, skills, audit, run history), and
 Gmail's OAuth callback is no longer among its open items.
+
+## Phase 8c notes — the runtime's own surfaces (recorded 2026-07-21)
+
+`crates/ic_widget` (new `skills.rs`; `main.rs`, `lib.rs`) + `ui/`
+(`dashboard.tsx`, `api.ts`, `styles.css`) + a new gate
+(`ic_integration_tests/tests/skills_panel_gate.rs`) + `docs/desktop/dashboard-gaps.md`.
+**No core patch.** The ⚠️ VERIFY drove the running gateway and the on-disk state
+for all four surfaces before any panel was designed, and it split them cleanly in
+two — with a fork-policy decision (**hold golden rule #1**) settling the rest.
+
+### The VERIFY: on-disk files the widget owns vs. the gateway's private libSQL
+
+The four surfaces are **not** one gap; they are two, and the difference is *who
+owns the bytes*:
+
+- **Skills — a stale "unavailable" claim, actually buildable.** User skills are
+  plain files at `<reborn-home>/local-dev/skills/<name>/SKILL.md` — the exact
+  directory the widget already *writes* (7b reflection installs, 7c folder
+  imports), proven read-back by `skill_install.rs`. Reading a directory the
+  widget co-owns is not DB coupling; it needs no route and no LLM turn. The old
+  "skills are an in-agent tool, not an HTTP route" reason was wrong: there is no
+  route, and there does not need to be.
+- **Memory and audit — the gateway's *private* libSQL store.** Both live in
+  `reborn-local-dev.db`: memory in `root_filesystem_entries WHERE path LIKE
+  '/memory/%'` (plaintext markdown), audit in `root_filesystem_events WHERE path
+  LIKE '/events/audit/%'` (bare, **unversioned** `ironclaw_host_api::AuditEnvelope`
+  JSON). Each has a Rust read path but **no HTTP route and no composition handle**.
+  Surfacing either means reading the gateway's private DB directly — the coupling
+  `dashboard-gaps.md` and golden rule #1 refuse. (Confirmed unstable: the
+  `ironclaw_memory` CLAUDE.md documents `reborn_memory_*` tables the local-dev
+  wiring does **not** use — the internal layout already diverges from its own docs.)
+- **Run history** has no cross-thread enumeration anywhere; a conversation's own
+  history is already the 8a Chats timeline.
+
+**Decision (the user's call, taken deliberately): hold the line.** Ship only the
+Skills panel; leave memory/audit/run-history unavailable, with the reasons
+sharpened from vague "no route" to the precise "in the private libSQL store —
+reading it would couple us to internals; the honest fix is an upstream route"
+(the backlog). Golden rule #1 stays intact. The alternative (a read-only DB
+browser for memory/audit) was offered and declined.
+
+### What shipped: the Skills panel (list + remove)
+
+- **`ic_widget::skills`** — pure, `Path`-in, testable like `skill_import`:
+  `list(root)` reads each subdir with a `SKILL.md`, reusing `reflection::parse_skill_md`
+  for the description (a malformed `SKILL.md` is **still listed**, flagged
+  `valid: false` — it is on disk and the user may want to prune it, and a blank
+  description that looked like a bug is worse). `remove(root, name)` deletes one
+  directory, gated by `plain_component` — a single `Component::Normal`, re-checked
+  after the join so a separator that slipped the component check still cannot
+  delete outside the root (pinned by `remove_refuses_a_traversal`, which asserts a
+  sibling dir survives `..`, `../outside`, `/etc`, `a/b`).
+- **Only user skills appear.** The runtime's *bundled* skills are written to a
+  separate `local-dev/system/skills` tree (a runtime-managed dir with an install
+  lock and stale-removal) — this reconciles the CP-1 "serve writes bundled skills"
+  note with 7b's "embedded, not on disk": they *are* on disk, just in the
+  gateway's own managed dir, which the widget leaves alone. The panel header says
+  built-ins are managed separately, so the list is honest about its scope.
+- **Symmetric ownership.** Install (7b/7c) writes a directory here; remove deletes
+  one. A skill is user-authored procedure, not LLM data, so a user-initiated
+  removal (inline two-click confirm in the panel, not a modal) does not touch the
+  never-delete invariant — the same reasoning as the permitted dashboard wipe.
+- **Dashboard**: an `InstalledSkillsPanel` above the existing 7c import panel in
+  the Skills section; `list_installed_skills` / `remove_installed_skill` commands;
+  the `UNAVAILABLE_PANELS` list drops "Skills list" and sharpens the other three.
+
+### The gate
+
+`skills_panel_gate.rs` has the agent install a skill through
+`builtin__skill_install` against a **real** `serve` (the `skill_install.rs`
+pattern), then calls the **shipping** `ic_widget::skills::list`/`::remove` over the
+directory the gateway actually wrote — asserting the panel sees it with the
+on-disk description and that remove deletes exactly it. 8c consumes **no new serve
+route** (it reads the filesystem), so the contract it pins is the on-disk skills
+*layout*; the gate is what catches upstream ever moving user skills or reshaping
+`SKILL.md`. Verified against the pinned upstream commit **`a492857`**. Unit tests
+(8, in `skills.rs`) cover the absent-root-is-empty, sorted listing, non-skill
+dirs, the malformed-but-listed case, footprint counting, and every `remove`
+refusal.
+
+### Two corrections the VERIFY surfaced for a later sub-phase (not 8c)
+
+- **`memory_import` and `memory_seed` are NOT agent tools.** They exist only as
+  `PromptWriteOperation` audit-labeling enum variants — there is no capability
+  manifest or dispatch arm for either. This **invalidates the premise of the
+  memory-seeding sub-phase** ("onboarding via `memory_import`/`memory_seed`"): the
+  four real memory tools are `builtin.memory_{search,read,tree,write}`, and a real
+  seed goes through `memory_write`. Re-scope that sub-phase against those before
+  building UI.
+- **A memory browser is not blocked by "no route" but by policy.** Memory is
+  plaintext in `root_filesystem_entries WHERE path LIKE '/memory/%'`; if the
+  golden-rule-#1 line is ever relaxed for a read-only surface, a browser is a
+  direct SQLite read away. Recorded so the option is not re-derived from scratch.
+
+### Gate status
+
+fmt ✅, clippy `-D warnings` ✅ (`ic_widget --features app` + `ic_integration_tests
+--features webui-v2-beta`), `cargo test -p ic_widget` 211 pass, the new integration
+gate green against a real gateway. Manual click-through smoke (open the Skills
+panel, list, remove-with-confirm) is the human step, as in 8a — the automated gate
+already drives the shipping list/remove against the real runtime.
+
+Next: the remaining Phase 8 topics — the **voice picker**, **universal approval
+gates**, **skills from git repos**, **channels**, and **memory seeding + subagent
+visibility** (re-scoped per the `memory_import`/`memory_seed` correction above).

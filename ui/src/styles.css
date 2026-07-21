@@ -278,6 +278,36 @@ body.widget-body {
   overflow: auto;
 }
 
+/* The installed-skills list (Phase 8c). */
+.skill-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+.skill-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 4px;
+  border-top: 1px solid #2b2f38;
+}
+.skill-row:first-child {
+  border-top: none;
+}
+.skill-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+button.danger {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
 .widget-header {
   display: flex;
   align-items: center;

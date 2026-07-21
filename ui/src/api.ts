@@ -429,6 +429,21 @@ export interface ImportPreview {
   files: ImportFile[];
 }
 
+/**
+ * One installed skill, as listed in the Skills panel (Phase 8c).
+ *
+ * Read from the widget-owned skills directory on disk — the same one 7b/7c
+ * install into — not from any gateway route. Only user-installed skills appear;
+ * the runtime's own bundled skills live in a separate managed directory.
+ */
+export interface InstalledSkill {
+  name: string;
+  description: string;
+  valid: boolean;
+  files: number;
+  bytes: number;
+}
+
 /** What one watcher rule fires on (Phase 7d). */
 export type WatchTrigger =
   | { type: "foreground_app"; title_contains: string }
@@ -613,6 +628,13 @@ export const api = {
    *  happens there, and only a yes installs. */
   requestSkillImport: (path: string) =>
     invoke<void>("request_skill_import", { path }),
+  /** List the user's installed skills (Phase 8c). Reads the widget-owned skills
+   *  directory on disk — no gateway route, no LLM turn. */
+  listInstalledSkills: () =>
+    invoke<InstalledSkill[]>("list_installed_skills"),
+  /** Remove one installed skill by name. The UI confirms first. */
+  removeInstalledSkill: (name: string) =>
+    invoke<void>("remove_installed_skill", { name }),
   /** The watcher toggles and rules. */
   watchersStatus: () => invoke<WatcherSettings>("watchers_status"),
   /** Switch the three signal kinds. Takes effect on the next sample. */

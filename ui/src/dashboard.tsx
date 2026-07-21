@@ -13,6 +13,7 @@ import {
   type Connector,
   type GoogleOAuthStatus,
   type ImportPreview,
+  type InstalledSkill,
   type WatchRule,
   type WatchTrigger,
   type WatcherSettings,
@@ -35,29 +36,30 @@ import "./styles.css";
 /**
  * The dashboard.
  *
- * Panels are split by what the `serve` API can actually back. Sessions
- * (`GET /threads`) and automations (`GET /automations`) have live routes.
- * The memory browser, skills list, audit log, and run history have **no HTTP
- * route** in `ironclaw-reborn serve` — see `docs/desktop/dashboard-gaps.md`.
- * They are listed as explicitly unavailable rather than faked.
+ * Panels are split by what the `serve` API (or the local machine) can actually
+ * back. Sessions (`GET /threads`) and automations (`GET /automations`) have live
+ * routes; the Skills list reads the widget-owned skills directory on disk (8c).
+ * The memory browser, audit log, and run history remain unavailable because they
+ * live in the gateway's private libSQL store with no HTTP route — reading it
+ * directly would couple us to internals (`docs/desktop/dashboard-gaps.md`). They
+ * are listed as explicitly unavailable rather than faked.
  */
 
 const UNAVAILABLE_PANELS = [
   {
     name: "Memory browser",
-    reason: "no memory route exists in the serve API",
-  },
-  {
-    name: "Skills list",
-    reason: "skills are an in-agent tool, not an HTTP route",
+    reason:
+      "memory lives in the gateway's private libSQL store — reading it means coupling to internals; the honest fix is an upstream route",
   },
   {
     name: "Audit log",
-    reason: "audit records go to internal sinks, not an HTTP route",
+    reason:
+      "audit records live in the private libSQL store as an unversioned internal schema — no HTTP route, and reading the DB directly would couple us to it",
   },
   {
     name: "Run history",
-    reason: "automations expose schedules only, not past runs",
+    reason:
+      "no cross-thread run enumeration exists; a conversation's own history is in its Chats timeline",
   },
 ] as const;
 
@@ -2960,6 +2962,114 @@ function SkillImportPanel() {
   );
 }
 
+/** Human-readable byte size for a skill's footprint. */
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * The installed-skills list (Phase 8c).
+ *
+ * The "skills list" panel was long marked unavailable — "an in-agent tool, not
+ * an HTTP route". The 8c VERIFY corrected that: user skills are plain files in a
+ * directory this widget already owns (7b installs reflection drafts there, 7c
+ * imports folders there), so listing them is a filesystem read with no gateway
+ * route and no LLM turn. Memory/audit stay unavailable because they live in the
+ * gateway's *private* libSQL store, which is a different thing entirely.
+ *
+ * Only user-installed skills appear; the runtime's own bundled skills live in a
+ * separate managed directory and are its to own, so the header says so.
+ */
+function InstalledSkillsPanel() {
+  const skills = createPanelData<InstalledSkill>(api.listInstalledSkills);
+  const [confirming, setConfirming] = createSignal<string | null>(null);
+  const [actionError, setActionError] = createSignal<string | null>(null);
+
+  onMount(() => void skills.refresh());
+
+  const remove = async (name: string) => {
+    setActionError(null);
+    try {
+      await api.removeInstalledSkill(name);
+      setConfirming(null);
+      await skills.refresh();
+    } catch (problem) {
+      setActionError(String(problem));
+    }
+  };
+
+  return (
+    <section>
+      <div class="panel-head">
+        <h2>Installed skills</h2>
+        <button class="ghost" onClick={() => void skills.refresh()} disabled={skills.loading()}>
+          {skills.loading() ? "Loading…" : "Refresh"}
+        </button>
+      </div>
+      <p class="muted small">
+        Skills you (or the character, with your consent) have added. The runtime's
+        own built-in skills are managed separately and aren't listed here.
+      </p>
+      <Show when={skills.error()}>
+        <p class="error">{skills.error()}</p>
+      </Show>
+      <Show when={actionError()}>
+        <p class="error">{actionError()}</p>
+      </Show>
+      <Show
+        when={skills.rows().length > 0}
+        fallback={
+          <Show when={skills.loaded() && !skills.error()}>
+            <p class="muted">No skills installed yet.</p>
+          </Show>
+        }
+      >
+        <ul class="skill-list">
+          <For each={skills.rows()}>
+            {(skill) => (
+              <li class="skill-row">
+                <div class="skill-meta">
+                  <strong>{skill.name}</strong>
+                  <Show
+                    when={skill.valid}
+                    fallback={
+                      <span class="muted small">
+                        SKILL.md could not be read — malformed frontmatter
+                      </span>
+                    }
+                  >
+                    <span class="muted small">{skill.description}</span>
+                  </Show>
+                  <span class="muted small">
+                    {skill.files} file(s) · {formatBytes(skill.bytes)}
+                  </span>
+                </div>
+                <Show
+                  when={confirming() === skill.name}
+                  fallback={
+                    <button class="danger" onClick={() => setConfirming(skill.name)}>
+                      Remove
+                    </button>
+                  }
+                >
+                  <div class="row">
+                    <button class="danger" onClick={() => void remove(skill.name)}>
+                      Confirm remove
+                    </button>
+                    <button onClick={() => setConfirming(null)}>Cancel</button>
+                  </div>
+                </Show>
+              </li>
+            )}
+          </For>
+        </ul>
+      </Show>
+    </section>
+  );
+}
+
 /**
  * The sidebar's sections (Phase 8a).
  *
@@ -3103,6 +3213,7 @@ function Dashboard() {
         </Show>
 
         <Show when={section() === "skills"}>
+          <InstalledSkillsPanel />
           <SkillImportPanel />
         </Show>
 

@@ -3208,6 +3208,28 @@ fn record_import_event(event: ic_widget::ambient::log::LogEvent) {
     }
 }
 
+/// List the user's installed skills for the dashboard (Phase 8c).
+///
+/// Reads the widget-owned skills root — the same directory 7b/7c install into,
+/// not the gateway's private libSQL store — so it needs no route and no LLM
+/// turn. Bundled runtime skills live elsewhere and are deliberately not listed.
+#[tauri::command]
+async fn list_installed_skills() -> Result<Vec<ic_widget::skills::InstalledSkill>, String> {
+    let root = skills_root()?;
+    ic_widget::skills::list(&root)
+}
+
+/// Remove one installed skill by name (Phase 8c).
+///
+/// Symmetric with the 7b/7c install: it deletes a directory under the same
+/// widget-owned root. A skill is user-authored procedure, not LLM data, so this
+/// is a permitted user-initiated removal — the UI confirms first.
+#[tauri::command]
+async fn remove_installed_skill(name: String) -> Result<(), String> {
+    let root = skills_root()?;
+    ic_widget::skills::remove(&root, &name)
+}
+
 /// Read a skill folder and return everything the review needs. Pure — nothing
 /// is stored and nothing can install from here.
 #[tauri::command]
@@ -4301,6 +4323,8 @@ fn main() {
             set_cloud_fallback,
             preview_skill_import,
             request_skill_import,
+            list_installed_skills,
+            remove_installed_skill,
             watchers_status,
             set_watcher_kinds,
             set_watch_rules,

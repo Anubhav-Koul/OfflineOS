@@ -8,6 +8,7 @@
 //! |---|---|
 //! | [`ambient`] | The character speaking first: suggestions, guardrails, the log |
 //! | [`skill_import`] | Reviewing and installing a third-party skill folder |
+//! | [`skills`] | Listing and removing the user's installed skills |
 //! | [`browser`] | Supervising the browser MCP sidecar; registering its tools |
 //! | [`canvas`] | The in-process canvas MCP server; rendering agent HTML/SVG |
 //! | [`gateway_client`] | The only place we talk to `ironclaw-reborn serve` |
@@ -37,6 +38,7 @@ pub mod providers;
 pub mod secrets;
 pub mod settings;
 pub mod skill_import;
+pub mod skills;
 pub mod supervisor;
 pub mod voice;
 pub mod window_state;

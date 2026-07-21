@@ -209,3 +209,75 @@ tap, live mic capture through the fallback, and the WASAPI watcher registration.
   need no toolchain; add the mic device picker + a first-run "enable voice" prompt.
 - A dashboard voice panel (enable/disable, mute, device, model status) — the
   `voice_status` / `set_voice_enabled` / `set_voice_muted` commands exist for it.
+
+## Phase 8c — the voice picker (recorded 2026-07-22)
+
+The TTS voice was hardcoded to `en_US-amy-medium`. It is now a **curated,
+switchable catalog** (`ic_voice::VOICES`), selected from the dashboard Voice
+panel, downloaded on selection, and applied by restarting the pipeline.
+
+### The three ⚠️ traps, answered before building
+
+- **(a) espeak-ng phoneme data.** Sidestepped, not risked: the catalog is
+  **English only**. Every voice shares the English espeak-ng data the bundled
+  Piper already proves it ships (amy works). A non-English voice needs its
+  language's phoneme data, which our bundle may not carry, so listing one is
+  gated on verifying that first. Documented, not attempted.
+- **(b) sample rate + lip-sync scaling.** *Already dynamic end to end* — no code
+  change was needed. `PiperTts::new` reads each voice's rate from its
+  `.onnx.json`; `Speech` carries it; `playback::resample_to` builds the resampler
+  from `speech.sample_rate`; the lip-sync tap runs on the resampled render at the
+  device rate. Only prose comments said "22.05 kHz". The lip-sync **gain** is a
+  fixed `EnvelopeFollower::GAIN` with an RMS clamp, so louder/quieter voices
+  degrade gracefully (Piper voices share similar normalization) — a per-voice
+  gain would be over-engineering a mouth flap. All catalog voices are `medium`
+  at 22050 Hz anyway, which keeps the picker predictable.
+- **(c) live-switch teardown.** Handled by the *existing* `restart_voice`
+  (widget) — whose doc comment already named "TTS voice" as a boot-resolved
+  thing. It calls `VoiceService::shutdown` → `VoiceHandle::shutdown` →
+  `Command::Shutdown`; the driver's exit path (`pipeline.rs`, "Leaving: stop any
+  playback and drop the mic") calls `playback.stop()`, which sets the atomic the
+  audio callback and lip-sync tap watch, silencing and releasing the device
+  *before* the fresh pipeline is built. Switching mid-sentence does not deadlock
+  the device.
+
+### Pinning voices without downloading 315 MB
+
+The catalog's `.onnx` digests come from **HuggingFace's git-LFS metadata**
+(`GET /api/models/rhasspy/piper-voices/tree/main/<path>` → `lfs.oid`, which
+git-LFS defines as the file's content SHA-256). This was cross-checked against
+amy's long-standing pin (they match), so a voice can be pinned authoritatively
+without fetching its 63 MB model. The tiny `.onnx.json` configs are *not* LFS
+(their `oid` is a git blob SHA-1), so those digests were computed from the
+fetched files. All 10 pins (5 `.onnx` + 5 config) were re-verified against the
+live HF data at commit time.
+
+### Wiring
+
+- `ic_voice::assets`: `PiperVoice { id, display_name, accent, onnx, config }`,
+  `VOICES`, `DEFAULT_VOICE_ID` (amy — so an existing install's sound is
+  unchanged), `find_voice`/`voice_or_default` (an unknown/dropped id falls back
+  to the default, never disables voice). `VoiceAssets` is now voice-parameterized
+  (`locate`/`ensure`/`voice_installed` take a `&PiperVoice`); whisper + `piper.exe`
+  are shared and skipped on a switch, so only the new ~63 MB model transfers.
+- `settings.voice_id: Option<String>`; `voice::start` resolves it at pipeline
+  start (like the mic device).
+- Widget commands: `voice_catalog` (installed/selected flags) and `set_voice`
+  (persist always; if running, download with progress on `voice://voice-download`
+  then `restart_voice`; if off, save and apply on next enable). Voice panel:
+  `VoicePickerPanel`.
+
+### The manual smoke (the human step)
+
+Actually *hearing* each voice — enable voice, pick each one, confirm it downloads
+and speaks a reply cleanly, and that switching mid-utterance cuts the old voice
+and starts the new one — is the manual gate, matching the `#[ignore]`d
+real-asset tests. The automated gate covers pins, catalog well-formedness,
+unknown-id fallback, and the (already-tested) dynamic sample-rate path.
+
+### Voice cloning
+
+Out of scope by design; the engine candidates, VRAM/latency/licence constraints,
+and the clean `Synthesizer`-subprocess seam a future engine would use are written
+up in `docs/desktop/voice-cloning.md`, along with the offline "train a real Piper
+voice" alternative.

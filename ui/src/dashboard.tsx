@@ -6,6 +6,7 @@ import {
   api,
   onGatewayState,
   onModelEvent,
+  onVoiceDownload,
   onVoiceState,
   onVoiceTranscript,
   type AmbientStatus,
@@ -28,6 +29,7 @@ import {
   type Message,
   type Probe,
   type Thread,
+  type VoiceOption,
   type VoiceState,
 } from "./api";
 import { createChat } from "./chat";
@@ -1913,6 +1915,119 @@ function MicSetup(props: {
  * this panel existed the only way to see the wake-word step again was to wipe
  * `setup_complete` by hand.
  */
+/**
+ * The TTS voice picker (Phase 8c).
+ *
+ * The voice used to be hardcoded to Amy. This lists the curated English voices
+ * (all sharing the bundled espeak-ng data, all downloaded on selection through
+ * the same digest-verified machinery as the other assets). Selecting one that
+ * isn't downloaded transfers its ~63 MB model with a progress bar; if voice is
+ * running it then restarts the pipeline onto the new voice, otherwise the choice
+ * simply applies next time voice is enabled.
+ */
+function VoicePickerPanel(props: { running: boolean }) {
+  const [voices, setVoices] = createSignal<VoiceOption[]>([]);
+  const [busy, setBusy] = createSignal<string | null>(null);
+  const [progress, setProgress] = createSignal<number | null>(null);
+  const [error, setError] = createSignal<string | null>(null);
+
+  const refresh = async () => {
+    try {
+      setVoices(await api.voiceCatalog());
+    } catch (problem) {
+      setError(String(problem));
+    }
+  };
+
+  onMount(() => {
+    void refresh();
+    const cleanups: (() => void)[] = [];
+    onCleanup(() => cleanups.forEach((fn) => fn()));
+    void (async () => {
+      cleanups.push(
+        await onVoiceDownload((event) => {
+          if (event.kind === "progress") {
+            setProgress(event.fraction);
+          } else {
+            setBusy(null);
+            setProgress(null);
+            if (!event.ok) setError(event.error ?? "the voice download failed");
+            void refresh();
+          }
+        }),
+      );
+    })();
+  });
+
+  const choose = async (voice: VoiceOption) => {
+    if (busy() || voice.selected) return;
+    setError(null);
+    setBusy(voice.id);
+    // With voice off there is no download and no download-finished event, so the
+    // busy state must clear here; with voice on the event clears it (and reloads).
+    setProgress(props.running && !voice.installed ? 0 : null);
+    try {
+      await api.setVoice(voice.id);
+      if (!props.running) setBusy(null);
+      await refresh();
+    } catch (problem) {
+      setError(String(problem));
+      setBusy(null);
+      setProgress(null);
+    }
+  };
+
+  return (
+    <div class="voice-picker">
+      <h3>Voice</h3>
+      <p class="muted small">
+        Who the assistant sounds like. A voice you haven't used downloads (~63 MB)
+        the first time you pick it.
+      </p>
+      <ul class="voice-list">
+        <For each={voices()}>
+          {(voice) => (
+            <li class="voice-row" classList={{ selected: voice.selected }}>
+              <label class="voice-choice">
+                <input
+                  type="radio"
+                  name="tts-voice"
+                  checked={voice.selected}
+                  disabled={busy() !== null}
+                  onChange={() => void choose(voice)}
+                />
+                <span class="voice-name">
+                  {voice.display_name}
+                  <span class="muted small"> · {voice.accent}</span>
+                </span>
+              </label>
+              <span class="voice-tag muted small">
+                <Show
+                  when={busy() === voice.id}
+                  fallback={voice.installed ? "installed" : "not downloaded"}
+                >
+                  <Show
+                    when={progress() !== null}
+                    fallback={props.running ? "applying…" : "saving…"}
+                  >
+                    {Math.round((progress() ?? 0) * 100)}%
+                  </Show>
+                </Show>
+              </span>
+            </li>
+          )}
+        </For>
+      </ul>
+      <Show when={!props.running}>
+        <p class="muted small">Voice is off — your choice applies when you enable it.</p>
+      </Show>
+      <Show when={error()}>
+        <p class="error">{error()}</p>
+      </Show>
+    </div>
+  );
+}
+
 function VoicePanel() {
   const [enabled, setEnabled] = createSignal(false);
   const [muted, setMuted] = createSignal(false);
@@ -2027,6 +2142,8 @@ function VoicePanel() {
           </Show>
         </p>
       </Show>
+
+      <VoicePickerPanel running={running()} />
 
       <MicSetup assistantName={assistantName()} onTrained={() => setWakeWord(true)} />
 

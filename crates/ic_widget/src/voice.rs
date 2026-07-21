@@ -151,13 +151,24 @@ pub async fn start(
     on_state: StateFn,
     amplitude: AmplitudeSink,
     start_muted: bool,
+    voice_id: Option<String>,
 ) -> Option<VoiceService> {
-    // Provision assets: use them in place if already present, else download.
-    let assets = match VoiceAssets::locate(&models_root) {
+    // The selected TTS voice, falling back to the default for an unset or
+    // no-longer-in-catalog id (the pipeline is resolved fresh on every restart, so
+    // a voice switch is a `restart_voice` away — the same shape as the mic device).
+    let voice = ic_voice::voice_or_default(voice_id.as_deref());
+
+    // Provision assets: use them in place if already present, else download. On a
+    // voice switch the shared whisper/piper.exe are already present, so only the
+    // new voice downloads.
+    let assets = match VoiceAssets::locate(&models_root, voice) {
         Some(assets) => assets,
         None => {
-            tracing::info!("provisioning voice models (first run may download ~210 MB)");
-            match VoiceAssets::ensure(&models_root, &downloader, None).await {
+            tracing::info!(
+                voice = voice.id,
+                "provisioning voice models (first run may download ~210 MB)"
+            );
+            match VoiceAssets::ensure(&models_root, &downloader, voice, None).await {
                 Ok(assets) => assets,
                 Err(error) => {
                     tracing::warn!(%error, "could not provision voice models; voice disabled");

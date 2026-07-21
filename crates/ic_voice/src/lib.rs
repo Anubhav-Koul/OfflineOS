@@ -62,7 +62,10 @@ pub mod wake;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testsupport;
 
-pub use assets::{PinnedAsset, VoiceAssets, bundled_wake_models};
+pub use assets::{
+    AssetProgress, DEFAULT_VOICE_ID, PinnedAsset, PiperVoice, VOICES, VoiceAssets,
+    bundled_wake_models, find_voice, voice_or_default,
+};
 pub use capture::{Capture, CpalCapture, input_devices};
 pub use device::{DeviceChangeFn, DeviceWatcher};
 pub use endpoint::{EndpointConfig, EndpointEvent, Endpointer};

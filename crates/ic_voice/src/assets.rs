@@ -70,23 +70,154 @@ pub const WHISPER_MODEL: PinnedAsset = PinnedAsset {
     file_name: "ggml-small.en.bin",
 };
 
-/// The Piper voice model (`en_US-amy-medium`, 63 MB).
-pub const PIPER_VOICE: PinnedAsset = PinnedAsset {
-    label: "Piper voice (amy)",
-    url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx",
-    sha256: "b3a6e47b57b8c7fbe6a0ce2518161a50f59a9cdd8a50835c02cb02bdd6206c18",
-    size_bytes: 63_201_294,
-    file_name: "en_US-amy-medium.onnx",
-};
+/// One selectable Piper TTS voice (Phase 8c voice picker).
+///
+/// The model and its config are each a [`PinnedAsset`] — pinned by URL, SHA-256,
+/// and size like every other asset. The `.onnx` digests were taken from
+/// HuggingFace's authoritative git-LFS metadata (`lfs.oid`, which git-LFS defines
+/// as the content SHA-256 — cross-checked against amy's long-standing pin); the
+/// tiny `.onnx.json` configs are not LFS, so their digests were computed from the
+/// fetched files. See `docs/desktop/voice-notes.md`.
+#[derive(Debug, Clone, Copy)]
+pub struct PiperVoice {
+    /// Stable catalog id — also the Piper voice's canonical name (`en_US-amy-medium`).
+    pub id: &'static str,
+    /// A short name for the picker (e.g. "Amy").
+    pub display_name: &'static str,
+    /// Accent + timbre, for the picker's secondary line (e.g. "US · female").
+    pub accent: &'static str,
+    /// The voice model (`.onnx`).
+    pub onnx: PinnedAsset,
+    /// The voice config (`.onnx.json`, sits beside the model; Piper reads it).
+    pub config: PinnedAsset,
+}
 
-/// The Piper voice config (sits beside the model; Piper reads it automatically).
-pub const PIPER_VOICE_CONFIG: PinnedAsset = PinnedAsset {
-    label: "Piper voice config",
-    url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx.json",
-    sha256: "95a23eb4d42909d38df73bb9ac7f45f597dbfcde2d1bf9526fdeaf5466977d77",
-    size_bytes: 4_882,
-    file_name: "en_US-amy-medium.onnx.json",
-};
+/// The voice selected when the user has not chosen one — the voice that shipped
+/// before the picker, so an existing install's sound does not change under it.
+pub const DEFAULT_VOICE_ID: &str = "en_US-amy-medium";
+
+/// The curated voice catalog.
+///
+/// **English only, deliberately.** A non-English Piper voice needs its language's
+/// espeak-ng phoneme data, and our bundled Piper ships only what the English
+/// voices use; listing a voice whose phonemes the bundle cannot resolve would
+/// synthesize silence or gibberish. Every voice here shares the English espeak-ng
+/// data amy already proves is present, and every one is `medium` quality at
+/// 22.05 kHz — the sample rate flows from each config through the resampler
+/// dynamically (`ic_voice::tts`/`playback`), so mixing rates would be safe too;
+/// keeping them uniform just makes the picker predictable. Expanding to other
+/// languages is gated on verifying the espeak-ng data ships for them.
+pub const VOICES: &[PiperVoice] = &[
+    PiperVoice {
+        id: "en_US-amy-medium",
+        display_name: "Amy",
+        accent: "US · female",
+        onnx: PinnedAsset {
+            label: "Piper voice (Amy)",
+            url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx",
+            sha256: "b3a6e47b57b8c7fbe6a0ce2518161a50f59a9cdd8a50835c02cb02bdd6206c18",
+            size_bytes: 63_201_294,
+            file_name: "en_US-amy-medium.onnx",
+        },
+        config: PinnedAsset {
+            label: "Piper config (Amy)",
+            url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx.json",
+            sha256: "95a23eb4d42909d38df73bb9ac7f45f597dbfcde2d1bf9526fdeaf5466977d77",
+            size_bytes: 4_882,
+            file_name: "en_US-amy-medium.onnx.json",
+        },
+    },
+    PiperVoice {
+        id: "en_US-lessac-medium",
+        display_name: "Lessac",
+        accent: "US · neutral",
+        onnx: PinnedAsset {
+            label: "Piper voice (Lessac)",
+            url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx",
+            sha256: "5efe09e69902187827af646e1a6e9d269dee769f9877d17b16b1b46eeaaf019f",
+            size_bytes: 63_201_294,
+            file_name: "en_US-lessac-medium.onnx",
+        },
+        config: PinnedAsset {
+            label: "Piper config (Lessac)",
+            url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json",
+            sha256: "efe19c417bed055f2d69908248c6ba650fa135bc868b0e6abb3da181dab690a0",
+            size_bytes: 4_885,
+            file_name: "en_US-lessac-medium.onnx.json",
+        },
+    },
+    PiperVoice {
+        id: "en_US-ryan-medium",
+        display_name: "Ryan",
+        accent: "US · male",
+        onnx: PinnedAsset {
+            label: "Piper voice (Ryan)",
+            url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/medium/en_US-ryan-medium.onnx",
+            sha256: "abf4c274862564ed647ba0d2c47f8ee7c9b717d27bdad9219100eb310db4047a",
+            size_bytes: 63_201_294,
+            file_name: "en_US-ryan-medium.onnx",
+        },
+        config: PinnedAsset {
+            label: "Piper config (Ryan)",
+            url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/medium/en_US-ryan-medium.onnx.json",
+            sha256: "44034c056cb15681b2ad494307c7f3f2e4499d1253c700c711fa0a4607ffe78d",
+            size_bytes: 4_883,
+            file_name: "en_US-ryan-medium.onnx.json",
+        },
+    },
+    PiperVoice {
+        id: "en_GB-alan-medium",
+        display_name: "Alan",
+        accent: "UK · male",
+        onnx: PinnedAsset {
+            label: "Piper voice (Alan)",
+            url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/alan/medium/en_GB-alan-medium.onnx",
+            sha256: "0a309668932205e762801f1efc2736cd4b0120329622adf62be09e56339d3330",
+            size_bytes: 63_201_294,
+            file_name: "en_GB-alan-medium.onnx",
+        },
+        config: PinnedAsset {
+            label: "Piper config (Alan)",
+            url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/alan/medium/en_GB-alan-medium.onnx.json",
+            sha256: "c0f0d124e5895c00e7c03b35dcc8287f319a6998a365b182deb5c8e752ee8c1e",
+            size_bytes: 4_888,
+            file_name: "en_GB-alan-medium.onnx.json",
+        },
+    },
+    PiperVoice {
+        id: "en_GB-jenny_dioco-medium",
+        display_name: "Jenny",
+        accent: "UK · female",
+        onnx: PinnedAsset {
+            label: "Piper voice (Jenny)",
+            url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/jenny_dioco/medium/en_GB-jenny_dioco-medium.onnx",
+            sha256: "469c630d209e139dd392a66bf4abde4ab86390a0269c1e47b4e5d7ce81526b01",
+            size_bytes: 63_201_294,
+            file_name: "en_GB-jenny_dioco-medium.onnx",
+        },
+        config: PinnedAsset {
+            label: "Piper config (Jenny)",
+            url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/jenny_dioco/medium/en_GB-jenny_dioco-medium.onnx.json",
+            sha256: "a9a7a93a317c9a3cb6563e37eb057df9ef09c06188a8a4341b0fcb58cba54dd4",
+            size_bytes: 4_895,
+            file_name: "en_GB-jenny_dioco-medium.onnx.json",
+        },
+    },
+];
+
+/// Find a voice by its catalog id.
+pub fn find_voice(id: &str) -> Option<&'static PiperVoice> {
+    VOICES.iter().find(|voice| voice.id == id)
+}
+
+/// Resolve an optional, possibly-stale voice id to a catalog voice, falling back
+/// to the default when it is `None` or names a voice that no longer exists (a
+/// dropped catalog entry from an older settings file must not disable voice).
+pub fn voice_or_default(id: Option<&str>) -> &'static PiperVoice {
+    id.and_then(find_voice)
+        .or_else(|| find_voice(DEFAULT_VOICE_ID))
+        .expect("the default voice is always in the catalog")
+}
 
 /// The Piper Windows binary bundle (piper.exe + espeak/onnx DLLs, 22 MB zip).
 pub const PIPER_ARCHIVE: PinnedAsset = PinnedAsset {
@@ -117,43 +248,56 @@ impl VoiceAssets {
         root.join("voice")
     }
 
-    /// The paths the assets *would* occupy, without checking they exist.
-    fn paths(root: &Path) -> Self {
+    /// The paths the assets *would* occupy for `voice`, without checking they
+    /// exist. Whisper and `piper.exe` are voice-independent (one copy, shared);
+    /// only `piper_voice` depends on which voice is selected.
+    fn paths(root: &Path, voice: &PiperVoice) -> Self {
         let dir = Self::dir(root);
         Self {
             whisper_model: dir.join(WHISPER_MODEL.file_name),
             // The archive extracts to `piper/piper.exe` under the voice dir.
             piper_exe: dir.join("piper").join("piper.exe"),
-            piper_voice: dir.join(PIPER_VOICE.file_name),
+            piper_voice: dir.join(voice.onnx.file_name),
         }
     }
 
-    /// Return the assets if all three are already present on disk — the offline /
-    /// bundled-by-the-installer path, where nothing needs downloading.
-    pub fn locate(root: &Path) -> Option<Self> {
-        let paths = Self::paths(root);
+    /// Whether `voice`'s model is already downloaded (its `.onnx` is present). The
+    /// picker uses this to show which voices need a download before they can be
+    /// selected; it does not check the shared whisper/piper.exe, which the pipeline
+    /// provisions regardless of the voice.
+    pub fn voice_installed(root: &Path, voice: &PiperVoice) -> bool {
+        Self::dir(root).join(voice.onnx.file_name).is_file()
+    }
+
+    /// Return the assets for `voice` if the shared models and this voice's model
+    /// are already present on disk — the offline / bundled-by-the-installer path,
+    /// where nothing needs downloading.
+    pub fn locate(root: &Path, voice: &PiperVoice) -> Option<Self> {
+        let paths = Self::paths(root, voice);
         (paths.whisper_model.is_file() && paths.piper_exe.is_file() && paths.piper_voice.is_file())
             .then_some(paths)
     }
 
-    /// Ensure every asset is present and verified, downloading whatever is missing.
-    /// Idempotent: an already-correct file is re-hashed and skipped, so this is
-    /// cheap to call on every launch.
+    /// Ensure every asset for `voice` is present and verified, downloading whatever
+    /// is missing. Idempotent: an already-correct file is re-hashed and skipped, so
+    /// this is cheap to call on every launch — and cheap on a voice *switch*, where
+    /// the shared whisper/piper.exe are skipped and only the new voice downloads.
     pub async fn ensure(
         root: &Path,
         downloader: &Downloader,
+        voice: &PiperVoice,
         progress: Option<AssetProgress>,
     ) -> Result<Self> {
         let dir = Self::dir(root);
         std::fs::create_dir_all(&dir)
             .map_err(|error| Error::io(format!("creating {}", dir.display()), error))?;
 
-        // The three single files.
-        for asset in [WHISPER_MODEL, PIPER_VOICE, PIPER_VOICE_CONFIG] {
+        // Whisper (shared) plus the selected voice's model and config.
+        for asset in [WHISPER_MODEL, voice.onnx, voice.config] {
             fetch(downloader, &asset, &dir.join(asset.file_name), &progress).await?;
         }
 
-        // The Piper binary bundle: fetch the verified zip, then extract it once.
+        // The Piper binary bundle (shared): fetch the verified zip, extract once.
         let piper_dir = dir.join("piper");
         let piper_exe = piper_dir.join("piper.exe");
         if !piper_exe.is_file() {
@@ -167,7 +311,7 @@ impl VoiceAssets {
             }
         }
 
-        Ok(Self::paths(root))
+        Ok(Self::paths(root, voice))
     }
 }
 
@@ -256,16 +400,21 @@ pub fn bundled_wake_models(assets_dir: &Path) -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
+    /// Every pinned asset, shared and per-voice, for the blanket checks below.
+    fn all_pins() -> Vec<PinnedAsset> {
+        let mut pins = vec![WHISPER_MODEL, PIPER_ARCHIVE];
+        for voice in VOICES {
+            pins.push(voice.onnx);
+            pins.push(voice.config);
+        }
+        pins
+    }
+
     #[test]
     fn every_pinned_digest_parses() {
         // A malformed pin fails here rather than at download time on a user's
         // machine.
-        for asset in [
-            WHISPER_MODEL,
-            PIPER_VOICE,
-            PIPER_VOICE_CONFIG,
-            PIPER_ARCHIVE,
-        ] {
+        for asset in all_pins() {
             asset
                 .digest()
                 .unwrap_or_else(|e| panic!("{}: {e}", asset.label));
@@ -274,12 +423,7 @@ mod tests {
 
     #[test]
     fn every_pinned_url_is_https_and_named() {
-        for asset in [
-            WHISPER_MODEL,
-            PIPER_VOICE,
-            PIPER_VOICE_CONFIG,
-            PIPER_ARCHIVE,
-        ] {
+        for asset in all_pins() {
             assert!(asset.url.starts_with("https://"), "{}", asset.label);
             assert!(!asset.file_name.is_empty(), "{}", asset.label);
             assert!(asset.size_bytes > 0, "{}", asset.label);
@@ -287,9 +431,46 @@ mod tests {
     }
 
     #[test]
+    fn the_catalog_is_well_formed() {
+        assert!(!VOICES.is_empty());
+        // The default must be in the catalog, or `voice_or_default` cannot fall back.
+        assert!(find_voice(DEFAULT_VOICE_ID).is_some());
+        // Ids are unique, and each voice's onnx/config file names match its id — the
+        // picker keys on the id, and two voices sharing a file name would collide on
+        // disk (a switch would "download" a file that is already the other voice's).
+        for voice in VOICES {
+            assert_eq!(
+                VOICES.iter().filter(|v| v.id == voice.id).count(),
+                1,
+                "{}",
+                voice.id
+            );
+            assert!(voice.onnx.file_name.starts_with(voice.id), "{}", voice.id);
+            assert!(voice.config.file_name.starts_with(voice.id), "{}", voice.id);
+            assert!(
+                voice.config.file_name.ends_with(".onnx.json"),
+                "{}",
+                voice.id
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_or_missing_voice_id_resolves_to_the_default() {
+        assert_eq!(voice_or_default(None).id, DEFAULT_VOICE_ID);
+        assert_eq!(voice_or_default(Some("no-such-voice")).id, DEFAULT_VOICE_ID);
+        assert_eq!(
+            voice_or_default(Some("en_GB-alan-medium")).id,
+            "en_GB-alan-medium"
+        );
+    }
+
+    #[test]
     fn locate_is_none_when_nothing_is_downloaded() {
         let tmp = std::env::temp_dir().join(format!("ic_voice_assets_{}", std::process::id()));
-        assert!(VoiceAssets::locate(&tmp).is_none());
+        let voice = voice_or_default(None);
+        assert!(VoiceAssets::locate(&tmp, voice).is_none());
+        assert!(!VoiceAssets::voice_installed(&tmp, voice));
     }
 
     #[test]

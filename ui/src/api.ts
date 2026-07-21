@@ -317,6 +317,30 @@ export interface VoiceSettings {
   input_device: string | null;
 }
 
+/** One selectable TTS voice in the picker (Phase 8c). */
+export interface VoiceOption {
+  id: string;
+  display_name: string;
+  accent: string;
+  /** Whether the voice's model is already on disk (no download needed). */
+  installed: boolean;
+  /** Whether this is the current selection. */
+  selected: boolean;
+  /** The model download size in bytes (the config is a few KB, not counted). */
+  size_bytes: number;
+}
+
+/** Progress of a voice download, on `voice://voice-download` (Phase 8c). */
+export type VoiceDownloadEvent =
+  | {
+      kind: "progress";
+      id: string;
+      downloaded: number;
+      total: number | null;
+      fraction: number | null;
+    }
+  | { kind: "finished"; id: string; ok: boolean; error: string | null };
+
 /**
  * Ambient mode: whether the character may speak first, and the guardrails on it.
  *
@@ -603,6 +627,11 @@ export const api = {
   setVoiceMuted: (muted: boolean) => invoke<void>("set_voice_muted", { muted }),
   /** Turn voice on or off (enabling downloads the speech models on first run). */
   setVoiceEnabled: (enabled: boolean) => invoke<void>("set_voice_enabled", { enabled }),
+  /** The curated TTS voices, each marked installed/selected (Phase 8c). */
+  voiceCatalog: () => invoke<VoiceOption[]>("voice_catalog"),
+  /** Select a TTS voice. Persists always; if voice is running, downloads the
+   *  voice (progress on `voice://voice-download`) and restarts onto it. */
+  setVoice: (id: string) => invoke<void>("set_voice", { id }),
   /** Whether the first-run setup wizard should be shown. */
   needsSetup: () => invoke<boolean>("needs_setup"),
   /** Mark first-run setup complete. */
@@ -795,4 +824,11 @@ export function onVoiceAmplitude(handler: (level: number) => void): Promise<Unli
 /** Subscribe to voice-loop state changes, for the mic-live indicator. */
 export function onVoiceState(handler: (state: VoiceState) => void): Promise<UnlistenFn> {
   return listen<VoiceState>("voice://state", (event) => handler(event.payload));
+}
+
+/** Subscribe to voice-download progress while switching TTS voices (Phase 8c). */
+export function onVoiceDownload(
+  handler: (event: VoiceDownloadEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<VoiceDownloadEvent>("voice://voice-download", (event) => handler(event.payload));
 }

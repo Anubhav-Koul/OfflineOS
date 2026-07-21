@@ -3512,14 +3512,14 @@ async fn start_voice(app: AppHandle) {
         })
     };
 
-    // Read the mute state NOW (post-provisioning it may be stale, so it is read
-    // again below — but the pipeline needs a value to start with).
-    let start_muted = app
+    // Read the mute state and the selected voice NOW (post-provisioning they may be
+    // stale, so mute is re-read below — but the pipeline needs values to start with).
+    let (start_muted, voice_id) = app
         .state::<AppState>()
         .settings_store
         .load()
-        .map(|s| s.voice_muted)
-        .unwrap_or(false);
+        .map(|s| (s.voice_muted, s.voice_id))
+        .unwrap_or((false, None));
 
     // Voice speaks on the app's conversation, not one of its own — so a spoken
     // question lands in the same transcript the dashboard shows and the same bubble
@@ -3584,6 +3584,7 @@ async fn start_voice(app: AppHandle) {
         on_state,
         amplitude,
         start_muted,
+        voice_id,
     )
     .await;
 
@@ -3986,6 +3987,126 @@ async fn set_voice_muted(state: tauri::State<'_, AppState>, muted: bool) -> Resu
     Ok(())
 }
 
+/// One voice in the picker (Phase 8c): catalog metadata plus whether it is already
+/// downloaded and whether it is the current selection.
+#[derive(Serialize)]
+struct VoiceOption {
+    id: String,
+    display_name: String,
+    accent: String,
+    /// Whether this voice's model is already on disk (no download needed).
+    installed: bool,
+    /// Whether this is the currently-selected voice.
+    selected: bool,
+    /// The model download size (the config is a few KB and is not counted).
+    size_bytes: u64,
+}
+
+/// The curated TTS voices, each marked installed/selected for the Voice panel.
+#[tauri::command]
+async fn voice_catalog(state: tauri::State<'_, AppState>) -> Result<Vec<VoiceOption>, String> {
+    let settings = state.settings_store.load().map_err(|e| e.to_string())?;
+    let selected = ic_voice::voice_or_default(settings.voice_id.as_deref()).id;
+    let root = voice_root().map_err(|e| e.to_string())?;
+    Ok(ic_voice::VOICES
+        .iter()
+        .map(|voice| VoiceOption {
+            id: voice.id.to_string(),
+            display_name: voice.display_name.to_string(),
+            accent: voice.accent.to_string(),
+            installed: ic_voice::VoiceAssets::voice_installed(&root, voice),
+            selected: voice.id == selected,
+            size_bytes: voice.onnx.size_bytes,
+        })
+        .collect())
+}
+
+/// Progress of a voice download, streamed to the panel on `voice://voice-download`.
+#[derive(Serialize, Clone)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum VoiceDownloadEvent {
+    Progress {
+        id: String,
+        downloaded: u64,
+        total: Option<u64>,
+        fraction: Option<f64>,
+    },
+    Finished {
+        id: String,
+        ok: bool,
+        error: Option<String>,
+    },
+}
+
+/// Select the TTS voice (Phase 8c).
+///
+/// Persists the choice always. If voice is **running**, it also downloads the
+/// voice (idempotent — the shared whisper/piper.exe are already present, so only
+/// this voice's ~63 MB model transfers) with progress on `voice://voice-download`,
+/// then restarts the pipeline onto it. The restart stops any in-flight playback
+/// before rebuilding (`VoiceService::shutdown` → the driver's exit path calls
+/// `playback.stop()`), so switching mid-sentence releases the audio device cleanly
+/// rather than deadlocking it. If voice is **off**, the choice is saved and applies
+/// when voice is next enabled — no download is forced on a user who only browsed.
+#[tauri::command]
+async fn set_voice(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    let voice = ic_voice::find_voice(&id).ok_or_else(|| format!("unknown voice: {id}"))?;
+    state.update_settings(|settings| settings.voice_id = Some(id.clone()))?;
+
+    // Voice off ⇒ persist only; it downloads and applies on the next enable.
+    if state.voice.lock().await.is_none() {
+        tracing::info!(voice = %id, "voice selection saved; applies when voice is enabled");
+        return Ok(());
+    }
+
+    let root = voice_root().map_err(|e| e.to_string())?;
+    let downloader = Downloader::new().map_err(|e| e.to_string())?;
+    let progress: ic_voice::AssetProgress = {
+        let app = app.clone();
+        let id = id.clone();
+        Arc::new(move |_label: &str, snapshot: Progress| {
+            let _ = app.emit(
+                "voice://voice-download",
+                VoiceDownloadEvent::Progress {
+                    id: id.clone(),
+                    downloaded: snapshot.downloaded,
+                    total: snapshot.total,
+                    fraction: snapshot.fraction(),
+                },
+            );
+        })
+    };
+
+    let outcome = ic_voice::VoiceAssets::ensure(&root, &downloader, voice, Some(progress)).await;
+    if let Err(error) = outcome {
+        let _ = app.emit(
+            "voice://voice-download",
+            VoiceDownloadEvent::Finished {
+                id: id.clone(),
+                ok: false,
+                error: Some(error.to_string()),
+            },
+        );
+        return Err(format!("could not download the voice: {error}"));
+    }
+
+    // Files are present; rebuild the pipeline onto the new voice.
+    restart_voice(&app).await;
+    let _ = app.emit(
+        "voice://voice-download",
+        VoiceDownloadEvent::Finished {
+            id,
+            ok: true,
+            error: None,
+        },
+    );
+    Ok(())
+}
+
 /// Turn voice on or off, persisting the choice. Enabling provisions and starts it
 /// in the background (a first-run download does not block this call). Disabling
 /// winds the pipeline down in the background too: `VoiceService::shutdown` waits
@@ -4354,6 +4475,8 @@ fn main() {
             set_input_device,
             test_microphone,
             voice_settings,
+            voice_catalog,
+            set_voice,
             has_wake_word,
             speak_reply,
             start_listening,

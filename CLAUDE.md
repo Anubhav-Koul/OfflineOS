@@ -2087,3 +2087,71 @@ already drives the shipping list/remove against the real runtime.
 Next: the remaining Phase 8 topics — the **voice picker**, **universal approval
 gates**, **skills from git repos**, **channels**, and **memory seeding + subagent
 visibility** (re-scoped per the `memory_import`/`memory_seed` correction above).
+
+## Phase 8c (voice picker) notes — the switchable TTS voice (recorded 2026-07-22)
+
+`crates/ic_voice` (`assets.rs`, `lib.rs`) + `crates/ic_widget`
+(`voice.rs`, `settings.rs`, `main.rs`) + `ui/` (`dashboard.tsx`, `api.ts`,
+`styles.css`) + `docs/desktop/voice-cloning.md` (new) + `voice-notes.md`.
+**No core patch.** This is the *plan's* 8c ("voice picker"), done after the
+dated-notes 8c ("runtime surfaces"); the letters collided when the notes
+re-sequenced, so both are recorded under 8c by topic.
+
+### The three ⚠️ traps were answered by the VERIFY, and two needed no code
+
+- **(b) sample rate — already fully dynamic.** `PiperTts::new` reads each voice's
+  rate from its `.onnx.json`; `Speech` carries it; `playback::resample_to` builds
+  the resampler from `speech.sample_rate`; the lip-sync tap runs at the device
+  rate. Only prose comments hardcoded "22.05 kHz". Lip-sync **gain** is a fixed
+  `EnvelopeFollower::GAIN` with an RMS clamp — robust across voices (Piper voices
+  share normalization), so no per-voice calibration.
+- **(c) live-switch teardown — already handled** by the existing `restart_voice`,
+  whose doc comment *already named* "TTS voice" as a boot-resolved input. Its
+  `shutdown()` drives the driver's exit path → `playback.stop()` (sets the atomic
+  the audio callback watches), releasing the device before the rebuild. No
+  deadlock switching mid-sentence.
+- **(a) espeak-ng phoneme data — sidestepped.** The catalog is **English only**;
+  every voice shares the English espeak-ng data the bundled Piper proves it ships
+  (amy works). Non-English is gated on verifying its phoneme data ships — a
+  documented follow-up, not a listed-then-broken voice.
+
+So the picker was mostly *catalog + wiring*, not new audio code — the architecture
+was already voice-agnostic below the synthesizer.
+
+### Pinning without downloading 315 MB
+
+The 5 curated voices' `.onnx` digests come from **HuggingFace's git-LFS metadata**
+(`tree` API → `lfs.oid` = content SHA-256, cross-checked against amy's existing
+pin), so a voice is pinned authoritatively without fetching its 63 MB model; the
+tiny non-LFS `.onnx.json` configs were hashed from the fetched files. **All 10
+pins were re-verified against live HF data at commit time** (a scripted check, not
+a committed networked test — adding `reqwest`+`sha2` dev-deps for one ignored test
+was disproportionate).
+
+### What shipped
+
+- `ic_voice::assets`: `PiperVoice`/`VOICES`/`DEFAULT_VOICE_ID` (amy, so existing
+  installs sound unchanged) + `find_voice`/`voice_or_default` (unknown/dropped id
+  → default, never disables voice). `VoiceAssets` is voice-parameterized; shared
+  whisper/`piper.exe` are skipped on a switch, so only the new model transfers.
+- `settings.voice_id`; `voice::start` resolves it at pipeline start.
+- Widget: `voice_catalog` + `set_voice` (persist always; if running, download with
+  progress on `voice://voice-download` then `restart_voice`; if off, save and
+  apply on next enable — no download forced on a browsing user). UI: a
+  `VoicePickerPanel` in the Voice panel.
+- `docs/desktop/voice-cloning.md`: cloning is out of scope; the note records the
+  engine candidates (XTTS non-commercial, F5-TTS, GPT-SoVITS), VRAM/latency/consent
+  constraints, the clean `Synthesizer`-subprocess seam a future engine would use,
+  and the offline "train a real Piper voice" alternative.
+
+### Gate
+
+fmt ✅, clippy `-D warnings` ✅ (`ic_voice`; `ic_widget --features app`),
+`ic_voice` 88 + `ic_widget` 211 unit tests ✅ (catalog well-formedness,
+unknown-id fallback, the dynamic sample-rate path), frontend builds, all 10 pins
+verified against HF. **Manual smoke (the human step, matching the `#[ignore]`d
+real-asset tests):** enable voice, pick each voice, confirm it downloads and
+speaks, and that switching mid-utterance cuts the old voice cleanly.
+
+Next: the remaining Phase 8 topics — **universal approval gates**, **skills from
+git repos**, **channels**, **memory seeding + subagent visibility**.

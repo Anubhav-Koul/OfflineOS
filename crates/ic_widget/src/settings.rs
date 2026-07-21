@@ -224,6 +224,13 @@ pub struct Settings {
     /// the user can make, and it has to survive restarts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_device: Option<String>,
+    /// Which Piper TTS voice speaks replies, by catalog id (`ic_voice::VOICES`).
+    /// `None` uses the default (Amy) — the voice that shipped before the picker, so
+    /// an existing install's sound does not change under it. Downloaded on
+    /// selection; switching restarts the voice pipeline (the voice is resolved at
+    /// pipeline start, like the mic device).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_id: Option<String>,
     /// Whether the first-run setup wizard has been completed. `false` on a fresh
     /// install shows the wizard (pick a model / provider, optionally enable voice).
     #[serde(default)]

@@ -1132,6 +1132,65 @@ mod tests {
         assert!(error.contains("no SKILL.md"), "{error}");
     }
 
+    /// The importer's canonical fixture, and the repo that earned both review
+    /// -card behaviours. Ignored (needs the internet); run with
+    /// `cargo test -p ic_widget -- --ignored clones_the_canonical_fixture`.
+    ///
+    /// It is a good fixture because it is four awkward things at once: the skill
+    /// lives in a **subfolder**, its description is a **multi-line quoted
+    /// scalar**, its frontmatter carries a **valueless metadata key**, and it
+    /// ships a **`hooks/` bundle written for a host that dispatches hooks** —
+    /// which this app is not. It is also the repo *named after its own skill*,
+    /// which is what `namespaced_name` collapses.
+    ///
+    /// Loose assertions on purpose: the repo is upstream's to change. What is
+    /// pinned is the shape — the name does not stutter, and the hook bundle is
+    /// reported as inert rather than installed in silence.
+    #[tokio::test]
+    #[ignore = "networked; run with --ignored"]
+    async fn clones_the_canonical_fixture_and_reports_its_inert_half() {
+        let into = std::env::temp_dir().join(format!("ic_git_fixture_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&into);
+        let result = clone_and_scan(
+            "https://github.com/pskoett/self-improving-agent.git".to_string(),
+            into.clone(),
+            MAX_REPO_BYTES,
+            CLONE_TIMEOUT,
+        )
+        .await;
+        let import = match result {
+            Ok(import) => import,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&into);
+                panic!("clone + scan failed: {error}");
+            }
+        };
+        assert_eq!(import.slug, "pskoett-self-improving-agent");
+        let skill = import
+            .skills
+            .first()
+            .expect("the repo ships at least one skill")
+            .clone();
+        // The collapse: the owner is kept, the skill name is not said twice.
+        assert_eq!(skill.install_name, "pskoett-self-improving-agent");
+        assert!(
+            !skill.description.is_empty(),
+            "a multi-line quoted description must read as a description"
+        );
+        // The inert half, stated rather than discovered.
+        let inert = skill_import::inert_lanes(&skill.files);
+        assert!(
+            inert.iter().any(|lane| lane.lane == "hooks"),
+            "the hooks bundle must be reported as inert; files: {:?}",
+            skill.files
+        );
+        // And the cost the user is agreeing to pay on every activation.
+        let cost = skill_import::context_cost(&skill.skill_md);
+        println!("{} — {}", skill.install_name, cost.summary);
+        assert!(cost.approx_tokens > 0);
+        let _ = std::fs::remove_dir_all(&into);
+    }
+
     /// The real thing: a public repo that actually ships skills, cloned and
     /// scanned by the shipping code. Ignored (needs the internet); run with
     /// `cargo test -p ic_widget -- --ignored clones_a_real_skills_repo`.

@@ -12,8 +12,10 @@ import {
   type AmbientStatus,
   type Automation,
   type Connector,
+  type ContextCost,
   type GoogleOAuthStatus,
   type ImportPreview,
+  type InertLane,
   type InstalledSkill,
   type RepoPreview,
   type RepoSkillReview,
@@ -3006,6 +3008,40 @@ function ConnectorsPanel() {
  * content for nothing, and an installed skill runs at the agent's full trust,
  * so this review is the only gate a third-party skill ever passes through.
  */
+/**
+ * The two things a reviewer cannot learn by reading a skill's text (Phase 8e).
+ *
+ * 1. **What of it will never run here.** A bundle can ship automatic parts —
+ *    `hooks/` above all — written for a host that dispatches them. This app is
+ *    not one: `ironclaw_skills` has no hook concept, so those files install and
+ *    sit there. Discovering that by wondering why nothing fires is the failure
+ *    mode; the card says it first.
+ * 2. **What it costs.** An installed skill is the trusted tier — its whole body
+ *    is injected into the model's context every time it activates, out of a
+ *    budget it shares with other skills. Cost belongs at the moment of consent,
+ *    not after the replies quietly get worse.
+ *
+ * Shared by the folder import and the git import, so the same skill reviewed
+ * through either door is told the same thing.
+ */
+function SkillReviewFacts(props: { inert: InertLane[]; cost: ContextCost }) {
+  return (
+    <>
+      <For each={props.inert}>
+        {(lane) => (
+          <p class="skill-fact">
+            {lane.note} <span class="muted">({lane.files.join(", ")})</span>
+          </p>
+        )}
+      </For>
+      <p class="muted small">{props.cost.summary}</p>
+      <Show when={props.cost.warning}>
+        {(warning) => <p class="skill-fact">{warning()}</p>}
+      </Show>
+    </>
+  );
+}
+
 function SkillImportPanel() {
   const [path, setPath] = createSignal("");
   const [preview, setPreview] = createSignal<ImportPreview | null>(null);
@@ -3066,6 +3102,7 @@ function SkillImportPanel() {
                   .join(", ")}
               </p>
             </Show>
+            <SkillReviewFacts inert={ready().inert} cost={ready().cost} />
             <pre class="import-preview">{ready().skill_md}</pre>
             <button onClick={() => void ask()} disabled={asked()}>
               {asked()
@@ -3192,6 +3229,7 @@ function RepoImportPanel() {
                       read it carefully.
                     </p>
                   </Show>
+                  <SkillReviewFacts inert={skill.inert} cost={skill.cost} />
                   <Show
                     when={skill.installed && skill.diff}
                     fallback={<pre class="import-preview">{skill.skill_md}</pre>}

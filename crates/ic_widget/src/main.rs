@@ -3319,6 +3319,13 @@ struct RepoSkillReview {
     skill_md: String,
     /// Bundle files that ride along.
     files: Vec<ic_widget::skill_import::ImportFile>,
+    /// Bundle content this app has no lane for and will never run (`hooks/`
+    /// first). A skill written for another host is half-inert here, and the user
+    /// must not find that out by wondering why nothing fires.
+    inert: Vec<ic_widget::skill_import::InertLane>,
+    /// What activating this skill costs the model's context, priced the way the
+    /// runtime charges it.
+    cost: ic_widget::skill_import::ContextCost,
     /// Hidden-character warnings (zero-width / bidi) found in the text, if any.
     warnings: Vec<String>,
     /// Whether a skill of this namespaced name is already installed (an update).
@@ -3387,6 +3394,8 @@ async fn preview_repo_skills(
             description: skill.description.clone(),
             rel_dir: skill.rel_dir.clone(),
             skill_md: skill.skill_md.clone(),
+            inert: ic_widget::skill_import::inert_lanes(&skill.files),
+            cost: ic_widget::skill_import::context_cost(&skill.skill_md),
             files: skill.files.clone(),
             warnings: ic_widget::git_import::suspicious_chars(&skill.skill_md),
             installed,

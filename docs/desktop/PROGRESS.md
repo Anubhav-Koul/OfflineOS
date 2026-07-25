@@ -17,6 +17,127 @@ newest entry at the top (right after this header) — not to `CLAUDE.md`.
 
 ---
 
+## Phase 8e addendum — what a real third-party skill taught the review card (recorded 2026-07-25)
+
+`crates/ic_widget` (`skill_import.rs`, `git_import.rs`, `main.rs`) + `ui/`
+(`dashboard.tsx`, `api.ts`, `styles.css`). **No core patch, no new dependency.**
+Contracts verified against the pinned upstream commit **`a492857`**.
+
+The 8e importer was exercised against a second real repo —
+[`pskoett/self-improving-agent`](https://github.com/pskoett/self-improving-agent)
+— and it imported cleanly. What it *couldn't say* is what this addendum is about.
+
+### The finding: half of what installed could never run, and nothing said so
+
+**`ironclaw_skills` has no hook concept.** Not "a different hook API" — the crate
+does not contain the word (verified: zero occurrences across
+`crates/ironclaw_skills/`). The only thing the runtime does with a bundle beyond
+`SKILL.md` is put the bundle's path in the prompt (`format_skills` in
+`orchestrator/default.py` appends `Installed bundle path on disk:`); there is no
+dispatcher, no event, no lane. The fixture skill ships
+`hooks/openclaw/{handler.js,handler.ts,HOOK.md}` — an event handler its own host
+runs — and that half installs here, sits on disk, and never fires.
+
+Nothing in the review told the user that. **That is the failure mode: learning a
+skill is inert by wondering why nothing happens.** So the card now says it, at
+review time, before the yes:
+
+> This skill's automatic parts (hooks) will not run in this app; only the
+> instructional parts will.
+
+Structured as a table (`INERT_LANES`, one `LaneRule` row: marker directory +
+what to call it), because the next lane will be found exactly the way this one
+was — by importing a real skill written for a host that has one and noticing we
+don't. Adding a row is the whole change; matching, wording, and both cards are
+shared. A nested `docs/hooks/` is deliberately *not* a lane: only a top-level
+`hooks/` directory or a root `hooks.*` file counts.
+
+### The second thing the text can't tell you: what it costs to keep it
+
+An installed skill is the **trusted tier** — `format_skills` puts its whole body
+between `<skill>` tags and nothing trims it. That is a recurring cost on the
+user's context, paid on every activation, and the moment to see it is the moment
+of consent, not afterwards when replies have quietly got worse. The card now
+carries a line like:
+
+> Trusted tier: the full 20.1 KB body is injected into the model's context on
+> activation — about 5,142 tokens, 85% of the 6,000 the runtime allows all
+> active skills in one turn.
+
+Every number in it is the runtime's, not ours:
+
+- **0.25 tokens/byte** is `ironclaw_skills::selector::skill_token_cost` (and its
+  Python mirror `_skill_token_cost`) — the arithmetic that actually decides
+  whether a skill fits a turn.
+- **6,000 tokens** is `LOCAL_DEV_MAX_SKILL_CONTEXT_TOKENS` in
+  `ironclaw_reborn_composition/src/runtime.rs` — our profile's whole-turn skill
+  budget, shared by up to three skills. A skill that doesn't fit what's left is
+  **dropped, not truncated** (`TrySelectOutcome::BudgetFull`).
+- The cost is charged on the **body**, not the file: the runtime keeps
+  `prompt_content` (everything after the frontmatter) and prices that.
+
+**The warning threshold is 8 KiB of body, and the reasoning is the point.** At
+the runtime's own rate that is 2,048 tokens — the 2,000 of
+`default_max_context_tokens()`, which is the cost the selector *assumes* a skill
+has when it declares none. Past that line three things become true at once: the
+skill costs more than it says, it eats a third of the turn budget it shares with
+two others, and on the 16k window `ic_llama` gives a small local model
+(`MIN_AGENT_CTX`) it is a visible slice of the context before the user's own
+message is added. Below it, the cost is worth showing and not worth a warning.
+Both facts render through one shared `SkillReviewFacts` component, so a skill
+reviewed through the folder door and the git door is told the same thing.
+
+### The name that said itself twice
+
+`pskoett/self-improving-agent` ships one skill, `self-improving-agent` — and a
+single-skill repo is usually named after its skill. Blindly prefixing gave the
+user `pskoett-self-improving-agent-self-improving-agent` in their skills list,
+forever. `namespaced_name` now collapses it: when the slug already ends in the
+skill's name, the slug *is* the namespaced name — it still carries the owner, so
+two repos stay distinguishable. Three assertions pin it: the collapse, the
+exact-equal case (`thing`/`thing`), and that a slug merely *containing* the skill
+name (`owner-agent-tools` + `agent`) still gets prefixed.
+
+### ClawHub's install methods don't reach us; the git URL does
+
+The fixture's README offers three ways in, and all three are for a host we are
+not: `clawdhub install <slug>` (a registry CLI we don't ship), a manual
+`cp -r` of the skill subfolder into `~/.openclaw/skills/`, and a separate
+`cp -r hooks/openclaw ~/.openclaw/hooks/…` plus a gateway restart for the hook
+half. None of those paths exist here. What *does* transfer is the thing
+underneath all of them — the plain **git URL** — which is exactly what 8e's
+importer consumes, subfolder skill and all. Worth recording because it
+generalizes: a skills repo's advertised install route is usually host-specific
+packaging over a git URL, and the URL is the portable part.
+
+### The fixture is kept, and the skill is not
+
+The repo URL stays as the importer's **canonical fixture** in an `#[ignore]`d
+networked test (`clones_the_canonical_fixture_and_reports_its_inert_half`),
+because it is four awkward things at once: the skill lives in a **subfolder**,
+its description is a **multi-line quoted scalar**, its frontmatter carries a
+**valueless metadata key** (`metadata:` with no value), and it ships a **foreign
+hook bundle**. The test asserts the shape — the name doesn't stutter, the
+description reads, the hook lane is reported inert — loosely, because the repo is
+upstream's to change.
+
+**The skill itself was uninstalled after testing, deliberately.** Its automatic
+half is inert here (no hook lane), and its remaining half — logging learnings and
+errors to `.learnings/*.md` — duplicates what Phase 7b's reflection loop already
+does natively. 21 KB of always-injected prompt for functionality we already have
+is a bad trade on a small local model, and pretending otherwise in our own skills
+list would have been the dishonest version of a successful import. Verified: the
+widget-owned skills root (`%LOCALAPPDATA%\IronClaw Desktop\reborn\local-dev\
+skills`) holds nothing.
+
+### Gate
+
+fmt ✅, clippy `-D warnings` ✅ (`ic_widget --lib --tests`, `ic_integration_tests
+--all-targets --features webui-v2-beta`), `cargo test -p ic_widget --lib` **237
+pass** (up from 232), the parser-agreement gate green, frontend `tsc --noEmit` +
+build clean. The new networked fixture test was run live against the real repo
+and passes; the cost line quoted above is its actual output.
+
 ## Phase 8e notes — skills from git repos, and "study this repo" (recorded 2026-07-22)
 
 `crates/ic_widget` (new `git_import.rs`; `skill_import.rs`, `skills.rs`,

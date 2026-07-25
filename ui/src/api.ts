@@ -451,6 +451,10 @@ export interface ImportPreview {
   description: string;
   skill_md: string;
   files: ImportFile[];
+  /** Bundle content that installs here but can never run (`hooks/` first). */
+  inert: InertLane[];
+  /** What this skill costs the model's context on activation. */
+  cost: ContextCost;
 }
 
 /**
@@ -468,6 +472,34 @@ export interface InstalledSkill {
   bytes: number;
 }
 
+/** Bundle content this app has no lane for, and so will never run (Phase 8e). */
+export interface InertLane {
+  /** What the lane is called ("hooks"). */
+  lane: string;
+  /** The bundle paths that fall in it. */
+  files: string[];
+  /** The plain sentence to show on the card. */
+  note: string;
+}
+
+/** What activating a skill costs the model's context (Phase 8e). */
+export interface ContextCost {
+  /** The whole SKILL.md on disk. */
+  file_bytes: number;
+  /** The part actually injected: the body after the frontmatter. */
+  body_bytes: number;
+  /** The runtime's own token estimate for that body. */
+  approx_tokens: number;
+  /** The per-turn budget every active skill competes for. */
+  budget_tokens: number;
+  /** The cost as a percentage of that budget. */
+  budget_percent: number;
+  /** The sentence the card shows. */
+  summary: string;
+  /** Set when the body is large enough to be worth a second thought. */
+  warning: string | null;
+}
+
 /** One line of a skill diff shown on a git re-import (Phase 8e). */
 export type DiffLine =
   | { tag: "context"; text: string }
@@ -482,6 +514,10 @@ export interface RepoSkillReview {
   rel_dir: string;
   skill_md: string;
   files: ImportFile[];
+  /** Bundle content that installs here but can never run. */
+  inert: InertLane[];
+  /** What this skill costs the model's context on activation. */
+  cost: ContextCost;
   /** Hidden-character warnings (zero-width / bidi), if any. */
   warnings: string[];
   /** Whether this namespaced skill is already installed (an update). */

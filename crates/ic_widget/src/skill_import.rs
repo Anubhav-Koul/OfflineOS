@@ -12,7 +12,10 @@
 //!   sizes. It enforces the runtime's own install-bundle limits
 //!   (`MAX_INSTALL_BUNDLE_*` in `ironclaw_skills/src/management/install_bundle.rs`,
 //!   mirrored here) so an import can never be bigger than the capability path
-//!   would have allowed.
+//!   would have allowed. It also names the two things a reviewer cannot see by
+//!   reading the text: bundle content this app has no lane for and will never run
+//!   ([`inert_lanes`]), and what the body costs the model's context every time it
+//!   activates ([`context_cost`]).
 //! - [`install`] writes **the reviewed text**, passed back in, not a re-read of
 //!   the folder — the file could have changed between the review and the yes,
 //!   and what installs must be exactly what was consented to. Bundle data files
@@ -64,6 +67,10 @@ pub struct ImportPreview {
     pub skill_md: String,
     /// The bundle files that would ride along (SKILL.md itself excluded).
     pub files: Vec<ImportFile>,
+    /// Bundle content this app has no lane for, and so will never run.
+    pub inert: Vec<InertLane>,
+    /// What activating this skill costs the model's context.
+    pub cost: ContextCost,
 }
 
 /// Read a skill folder and produce its review, or say exactly why not.
@@ -88,6 +95,8 @@ pub fn preview(folder: &Path) -> Result<ImportPreview, String> {
 
     let files = bundle_files(folder)?;
     Ok(ImportPreview {
+        inert: inert_lanes(&files),
+        cost: context_cost(&draft.content),
         name: draft.name,
         description: draft.description,
         skill_md: draft.content,
@@ -369,6 +378,207 @@ fn is_reserved_device_name(name: &str) -> bool {
     false
 }
 
+// ------------------------------------------- what the card must say out loud
+
+/// A lane of bundle content this app has no way to run.
+///
+/// A skill bundle can ship more than instructions. Skills written for other
+/// hosts ship a `hooks/` folder — event handlers the *host* is supposed to
+/// dispatch. `ironclaw_skills` has no hook concept at all: the crate does not
+/// contain the word (verified against the pinned upstream `a492857`), and the
+/// only thing the runtime does with a bundle beyond `SKILL.md` is put its path
+/// in the prompt. So those files install, sit on disk, and never fire.
+///
+/// A user must never learn that by wondering why nothing happened, so the review
+/// card says it before the yes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InertLane {
+    /// What the lane is called, in the sentence ("hooks").
+    pub lane: String,
+    /// The bundle paths that fall in it.
+    pub files: Vec<String>,
+    /// The plain sentence the card shows.
+    pub note: String,
+}
+
+/// One kind of automatic content, and the bundle path that marks it.
+///
+/// Adding a lane is one row: name the marker and what to call it in the
+/// sentence. Matching, wording, and rendering are shared — which is the point,
+/// because the next lane (agents? commands? MCP server manifests?) will be found
+/// the same way this one was: by importing a real skill written for a host that
+/// has one and noticing this app does not.
+struct LaneRule {
+    /// A top-level bundle directory, or a root file whose stem is this.
+    marker: &'static str,
+    /// What the lane is called in the sentence shown to the user.
+    lane: &'static str,
+}
+
+/// Every lane known to install here and never run.
+const INERT_LANES: &[LaneRule] = &[LaneRule {
+    marker: "hooks",
+    lane: "hooks",
+}];
+
+/// The bundle content that will not run here, each with the sentence to show.
+/// Empty means everything in the bundle has somewhere to go.
+pub fn inert_lanes(files: &[ImportFile]) -> Vec<InertLane> {
+    let mut lanes = Vec::new();
+    for rule in INERT_LANES {
+        let matched: Vec<String> = files
+            .iter()
+            .filter(|file| in_lane(&file.path, rule.marker))
+            .map(|file| file.path.clone())
+            .collect();
+        if matched.is_empty() {
+            continue;
+        }
+        lanes.push(InertLane {
+            lane: rule.lane.to_string(),
+            files: matched,
+            note: format!(
+                "This skill's automatic parts ({}) will not run in this app; \
+                 only the instructional parts will.",
+                rule.lane
+            ),
+        });
+    }
+    lanes
+}
+
+/// Whether `path` (folder-relative, `/`-separated) belongs to `marker`'s lane:
+/// anything under a top-level `<marker>/`, or a root file called `<marker>.*`.
+fn in_lane(path: &str, marker: &str) -> bool {
+    let first = path.split('/').next().unwrap_or(path);
+    let stem = first.split('.').next().unwrap_or(first);
+    stem.eq_ignore_ascii_case(marker)
+}
+
+/// The runtime's own rough token estimate: ~0.25 tokens per byte (~4 bytes per
+/// token of English prose). Not a number of ours — it is the arithmetic in
+/// `ironclaw_skills::selector::skill_token_cost`, which is what actually decides
+/// whether a skill fits a turn.
+pub const SKILL_TOKENS_PER_BYTE: f64 = 0.25;
+
+/// The whole-turn budget every active skill competes for, under the profile we
+/// run: `LOCAL_DEV_MAX_SKILL_CONTEXT_TOKENS` in `ironclaw_reborn_composition`.
+/// Up to three skills share it, and one that does not fit what is left is
+/// dropped — not truncated.
+pub const SKILL_BUDGET_TOKENS: usize = 6000;
+
+/// Where the review card starts warning: 8 KiB of injected body.
+///
+/// Not a round number picked for looking sensible. At the runtime's own 0.25
+/// tokens/byte, 8 KiB of body is 2,048 tokens — the 2,000 of
+/// `default_max_context_tokens()`, which is the cost the selector *assumes* a
+/// skill has when it declares none. Past that point three things become true at
+/// once: the skill costs more than it says, it takes a third of the 6,000-token
+/// turn budget it shares with two others, and on the 16k window `ic_llama` gives
+/// a small local model (`MIN_AGENT_CTX`) it is a visible slice of the context
+/// before the user's own message is even added. Below it the cost is worth
+/// showing and not worth a warning.
+pub const CONTEXT_COST_WARN_BYTES: u64 = 8 * 1024;
+
+/// What activating a skill costs, in the terms the runtime actually charges.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ContextCost {
+    /// The whole SKILL.md on disk.
+    pub file_bytes: u64,
+    /// The part that is actually injected: the body after the frontmatter, which
+    /// is what the runtime keeps as `prompt_content` and what it charges for.
+    pub body_bytes: u64,
+    /// The runtime's own estimate of what that body costs in tokens.
+    pub approx_tokens: usize,
+    /// The per-turn budget it competes for.
+    pub budget_tokens: usize,
+    /// That cost as a percentage of the budget.
+    pub budget_percent: u32,
+    /// The sentence the card shows.
+    pub summary: String,
+    /// Set when the body is large enough to be worth a second thought.
+    pub warning: Option<String>,
+}
+
+/// Price the skill the way the runtime will, for the card.
+///
+/// An imported skill is the **trusted tier**: its body is injected verbatim into
+/// the system prompt on every activation (`format_skills` in the orchestrator
+/// puts `content` between `<skill>` tags and nothing trims it). That is a
+/// recurring cost paid on the user's context, and the moment to see it is the
+/// moment of consent — not afterwards, when replies have quietly got worse.
+pub fn context_cost(skill_md: &str) -> ContextCost {
+    let body = injected_body(skill_md);
+    let body_bytes = body.len() as u64;
+    let approx_tokens = (body.len() as f64 * SKILL_TOKENS_PER_BYTE) as usize;
+    let budget_percent =
+        ((approx_tokens as u64 * 100) / SKILL_BUDGET_TOKENS as u64).min(u32::MAX as u64) as u32;
+    let summary = format!(
+        "Trusted tier: the full {} body is injected into the model's context on \
+         activation — about {} tokens, {budget_percent}% of the {} the runtime \
+         allows all active skills in one turn.",
+        format_bytes(body_bytes),
+        thousands(approx_tokens),
+        thousands(SKILL_BUDGET_TOKENS),
+    );
+    let warning = (body_bytes > CONTEXT_COST_WARN_BYTES).then(|| {
+        format!(
+            "That is a large skill. It shares the turn's {} budget with up to two \
+             others, so a skill this size can crowd them out — and on the 16k \
+             window a small local model runs at, it is a sizeable slice of the \
+             context before your own message is added.",
+            thousands(SKILL_BUDGET_TOKENS)
+        )
+    });
+    ContextCost {
+        file_bytes: skill_md.len() as u64,
+        body_bytes,
+        approx_tokens,
+        budget_tokens: SKILL_BUDGET_TOKENS,
+        budget_percent,
+        summary,
+        warning,
+    }
+}
+
+/// The part of a SKILL.md the runtime injects: everything after the closing
+/// frontmatter fence. Falls back to the whole text when there is no frontmatter
+/// — [`parse_skill_md`] has already refused that, so this is belt and braces.
+fn injected_body(skill_md: &str) -> &str {
+    skill_md
+        .trim_start_matches('\n')
+        .strip_prefix("---")
+        .and_then(|rest| rest.split_once('\n').map(|(_, rest)| rest))
+        .and_then(split_at_closing_fence)
+        .map(|(_, body)| body)
+        .unwrap_or(skill_md)
+}
+
+/// `1.2 KB`-style sizes, matching the dashboard's own `formatBytes`.
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let kb = bytes as f64 / 1024.0;
+    if kb < 1024.0 {
+        return format!("{kb:.1} KB");
+    }
+    format!("{:.1} MB", kb / 1024.0)
+}
+
+/// `5,376` — a token count a person can read at a glance.
+fn thousands(value: usize) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,6 +713,104 @@ mod tests {
         assert!(is_reserved_device_name("LPT1"));
         assert!(!is_reserved_device_name("config.toml"));
         assert!(!is_reserved_device_name("console.md"));
+    }
+
+    /// The finding that earned this: a real third-party skill shipped a `hooks/`
+    /// bundle, and `ironclaw_skills` has no hook concept — so the files install
+    /// and never fire. The card has to say so before the yes.
+    #[test]
+    fn a_hooks_bundle_is_reported_as_inert() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        folder_with_skill(dir.path());
+        std::fs::create_dir_all(dir.path().join("hooks")).expect("mkdir");
+        std::fs::write(dir.path().join("hooks").join("on-stop.py"), "print(1)").expect("write");
+        std::fs::write(dir.path().join("hooks.json"), "{}").expect("write");
+        std::fs::create_dir_all(dir.path().join("reference")).expect("mkdir");
+        std::fs::write(dir.path().join("reference").join("notes.md"), "n").expect("write");
+
+        let preview = preview(dir.path()).expect("preview");
+        assert_eq!(preview.inert.len(), 1, "{:?}", preview.inert);
+        let lane = &preview.inert[0];
+        assert_eq!(lane.lane, "hooks");
+        assert!(
+            lane.note.contains("will not run in this app"),
+            "{}",
+            lane.note
+        );
+        // Both the folder and the root manifest are named; the reference file,
+        // which is only ever read as instruction, is not.
+        assert!(lane.files.contains(&"hooks/on-stop.py".to_string()));
+        assert!(lane.files.contains(&"hooks.json".to_string()));
+        assert!(!lane.files.iter().any(|file| file.contains("reference")));
+    }
+
+    #[test]
+    fn a_bundle_the_runtime_can_use_reports_nothing_inert() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        folder_with_skill(dir.path());
+        std::fs::create_dir_all(dir.path().join("scripts")).expect("mkdir");
+        std::fs::write(dir.path().join("scripts").join("run.py"), "x").expect("write");
+        // A nested `hooks` is not a top-level lane — the runtime treats it as
+        // ordinary bundle data, and so must the warning.
+        std::fs::create_dir_all(dir.path().join("docs").join("hooks")).expect("mkdir");
+        std::fs::write(dir.path().join("docs").join("hooks").join("why.md"), "d").expect("write");
+
+        assert!(preview(dir.path()).expect("preview").inert.is_empty());
+    }
+
+    /// The cost is charged on the *body*, because that is what the runtime keeps
+    /// as `prompt_content` and injects — the frontmatter is parsed, not sent.
+    #[test]
+    fn the_context_cost_prices_the_body_the_way_the_runtime_does() {
+        let body = "x".repeat(4000);
+        let md = format!("---\nname: sized\ndescription: d\n---\n\n{body}");
+        let cost = context_cost(&md);
+        assert!(cost.file_bytes > cost.body_bytes, "{cost:?}");
+        // The runtime's own arithmetic: 0.25 tokens per byte of the body.
+        assert_eq!(
+            cost.approx_tokens,
+            (cost.body_bytes as f64 * SKILL_TOKENS_PER_BYTE) as usize
+        );
+        assert_eq!(cost.budget_tokens, SKILL_BUDGET_TOKENS);
+        assert!(cost.summary.contains("injected into the model's context"));
+        assert!(cost.summary.contains("KB"), "{}", cost.summary);
+        // 4 KB of body is a sixth of the budget: worth showing, not worth a warning.
+        assert!(cost.warning.is_none(), "{cost:?}");
+        assert!(
+            cost.budget_percent > 0 && cost.budget_percent < 50,
+            "{cost:?}"
+        );
+    }
+
+    #[test]
+    fn a_body_over_the_threshold_warns_about_the_budget_it_eats() {
+        let md = format!(
+            "---\nname: big\ndescription: d\n---\n\n{}",
+            "x".repeat(CONTEXT_COST_WARN_BYTES as usize + 1)
+        );
+        let cost = context_cost(&md);
+        let warning = cost.warning.expect("a body over the threshold warns");
+        assert!(warning.contains("6,000"), "{warning}");
+        assert!(warning.contains("crowd them out"), "{warning}");
+        // The threshold is the runtime's default declaration, not a number of
+        // ours: 8 KiB of body is 2,048 tokens at the runtime's own rate — the
+        // 2,000 `default_max_context_tokens()` assumes when a skill declares
+        // nothing, which is the point past which a skill costs more than it says.
+        assert_eq!(
+            (CONTEXT_COST_WARN_BYTES as f64 * SKILL_TOKENS_PER_BYTE) as usize,
+            2048
+        );
+    }
+
+    #[test]
+    fn sizes_and_counts_read_like_a_person_wrote_them() {
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(21 * 1024), "21.0 KB");
+        assert_eq!(format_bytes(3 * 1024 * 1024), "3.0 MB");
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(5376), "5,376");
+        assert_eq!(thousands(1234567), "1,234,567");
     }
 
     #[test]

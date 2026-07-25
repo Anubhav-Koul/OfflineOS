@@ -317,6 +317,16 @@ body.widget-body {
   white-space: nowrap;
 }
 
+/* The two facts a skill's own text cannot tell you (Phase 8e): what part of it
+   will never run in this app, and what keeping it active costs the model's
+   context. Amber, not red — neither is a reason to refuse, both are reasons to
+   know before saying yes. */
+.skill-fact {
+  color: var(--warn);
+  font-size: 12px;
+  margin: 4px 0;
+}
+
 /* Git-repo skill import (Phase 8e). */
 .repo-skill {
   border-top: 1px solid #2b2f38;

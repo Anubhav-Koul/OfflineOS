@@ -17,6 +17,86 @@ newest entry at the top (right after this header) — not to `CLAUDE.md`.
 
 ---
 
+## Phase 8f notes — channels: the premise that did not survive VERIFY (recorded 2026-07-26)
+
+`crates/ic_integration_tests` (new `tests/channels_verify.rs`, `Cargo.toml`) +
+`docs/desktop/channels.md` (new, the full write-up). **No core patch, no new
+dependency, and — deliberately — no UI, no settings flag, no pairing code.**
+Contracts verified against the pinned upstream commit **`a492857`**.
+
+### The finding
+
+8f's step 4 says to verify *first* that channel adapters are composed and
+activatable under the local profile. They are not, and the *way* they are not is
+what scoped the sub-phase out.
+
+The spec put Telegram in scope and Slack/WhatsApp out of it on one premise:
+Telegram long-polls (`getUpdates`), which works behind NAT, while the others
+need a publicly reachable endpoint a desktop machine does not have. **In the
+Reborn stack that premise is false.** Telegram is a *webhook* adapter, so it
+needs exactly the property that ruled the other two out — and the spec's own
+scoping logic, applied to verified facts instead of assumed ones, rules Telegram
+out too.
+
+Four independent checks, all negative:
+
+1. **`GET /channels/connectable` → `{"channels":[]}`.** The route is honest; it
+   lists nothing. Its facade is wired only when Slack host-beta mounts exist,
+   and even then it is a static list holding one hardcoded **Slack** entry
+   (`slack_connectable_channel.rs`). There is no Telegram entry to enable.
+2. **`POST /extensions/pairing/redeem` → 404.** Part of the Slack mount; not
+   mounted here, and composition's own docs say it resolves Slack aliases only.
+3. **8b's connector lane offers no Telegram package** — `/extensions` and
+   `/extensions/registry` both answer 200 with real content, neither mentions
+   Telegram, and there is no first-party Telegram extension.
+4. **`ironclaw_telegram_v2_adapter` is webhook-shaped by type.** It exists and
+   is real code, but it is a self-described tracer-bullet referenced from
+   production code *nowhere* (one test in `product_workflow`). Its
+   `parse_telegram_update` refuses any payload without **host-verified** webhook
+   evidence, and verified evidence cannot be minted outside the host
+   (`host_verified` is `pub(crate)`; `test_verified` needs `test-support`; the
+   struct is sealed so components cannot fabricate one). A long-poll client has
+   no inbound request to verify, so there is no shape in which it gets in.
+
+`getUpdates` exists only in the **legacy v1** WASM channel wrapper
+(`src/channels/wasm/wrapper.rs`), and v1 is not compiled into `ironclaw-reborn`.
+
+### The canary, and why its structural half is not a grep
+
+`channels_verify.rs` has two halves. The **live** half drives a real `serve` and
+pins all three route findings, ending on a control request to a route that does
+exist so a wrong base URL cannot make it pass vacuously. The **structural** half
+calls the real adapter's parser twice with the *same bytes*: refused without
+host-verified webhook evidence, accepted with it (minted through the upstream
+`test-support` feature, which is documented as one downstream crates enable from
+dev-dependencies). That shows the refusal is about the missing webhook rather
+than a malformed message — which grepping for `getUpdates` could never show.
+
+### Nothing was built, on purpose
+
+8d's rule applies unchanged: do not build UI over a mechanism that does not
+exist. No `settings.channels_enabled`, no panel, no pairing screen — a flag with
+nothing behind it is worse than no flag. The pairing design 8f specifies is kept
+on file in `channels.md` so it does not have to be re-derived the day a channel
+arrives.
+
+### The open option, deliberately not taken alone
+
+A fork-owned long-poll bridge (`ic_telegram`, shaped like `ic_voice` /
+`ic_browser_mcp`) is feasible: poll `getUpdates` ourselves, enforce the pairing
+design in our own code, inject through the gateway HTTP API we already speak. It
+is the only route that delivers 8f's actual intent on a desktop machine. It is
+also a **new ingress into an agent that holds files, a browser, and connectors**
+— the highest security weight in the phase — and a different design from the one
+the spec describes, which is written around surfacing the runtime's channel
+rather than building one. That is a decision to take explicitly, not an
+assumption to make quietly. Recorded, not started.
+
+### Gate
+
+fmt ✅, clippy `-D warnings` ✅ (`ic_integration_tests --all-targets --features
+webui-v2-beta`), both canary halves green against a real `serve`.
+
 ## The routeless panels get a tripwire (recorded 2026-07-26)
 
 `crates/ic_integration_tests` (new `tests/routeless_surfaces.rs`, `Cargo.toml`) +

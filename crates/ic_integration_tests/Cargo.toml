@@ -67,4 +67,17 @@ ironclaw_skills = { path = "../ironclaw_skills" }
 # copy of it, so the day upstream adds a memory / audit / run route this fails
 # instead of the dashboard going on saying "unavailable" forever.
 ironclaw_webui_v2 = { path = "../ironclaw_webui_v2" }
+# `tests/channels_verify.rs` — the Phase 8f canary. It calls the real Telegram
+# adapter's parser to pin that it refuses anything without host-verified webhook
+# evidence, which is what makes it webhook-only rather than long-polling.
+#
+# `test-support` is what lets the test mint the verified evidence a *host*
+# would, so it can show the same payload parses fine once the webhook has been
+# verified — the refusal is about the missing webhook, not a malformed payload.
+# The feature is documented upstream as one downstream crates enable from
+# `[dev-dependencies]`, which is exactly what this is.
+ironclaw_product_adapters = { path = "../ironclaw_product_adapters", features = [
+    "test-support",
+] }
+ironclaw_telegram_v2_adapter = { path = "../ironclaw_telegram_v2_adapter" }
 async-trait = "0.1"

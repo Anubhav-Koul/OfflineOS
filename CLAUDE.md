@@ -110,7 +110,7 @@ One line per subsystem — full detail and *why* in `docs/desktop/PROGRESS.md`.
 - **Phase 5 — voice (`ic_voice`) + canvas (`ic_canvas_mcp`):** ✅ done.
 - **Phase 6 — packaging & hardening:** config + hardening ✅; real MSI build blocked on external inputs (code-signing cert, updater keypair + endpoint, clean-VM build).
 - **Phase 7 — ambient companion (7a–7d):** ✅ complete — proactive surfacing, self-learning skills, skill import, ambient watchers.
-- **Phase 8 — surfacing the runtime:** 8a, 8a.5, 8b, 8b.1, 8c (runtime surfaces), 8c (voice picker), 8d (verified-negative), 8e — ✅ done. **Remaining: 8f (Telegram channel) and 8g (memory seeding + subagent visibility).**
+- **Phase 8 — surfacing the runtime:** 8a, 8a.5, 8b, 8b.1, 8c (runtime surfaces), 8c (voice picker), 8d (verified-negative), 8e — ✅ done. **8f (channels): blocked upstream, documented** — the Reborn Telegram adapter is webhook-only, so the long-polling premise that put it in scope (and Slack/WhatsApp out) does not hold; nothing built, per the sub-phase's own "or the blocker is documented". See `docs/desktop/channels.md`. A fork-owned long-poll bridge is the open option, recorded and not started. **Remaining: 8g (memory seeding + subagent visibility).**
 
 **Open upstream tickets** (nearai/ironclaw):
 - [#5998](https://github.com/nearai/ironclaw/issues/5998) — no transport for a local MCP server — CP-4/CP-5 get deleted when this lands.
@@ -135,6 +135,7 @@ One line per subsystem — full detail and *why* in `docs/desktop/PROGRESS.md`.
 - `docs/desktop/packaging.md` — MSI bundling, uninstall cleanup, failure drills.
 - `docs/desktop/llm-provider-selection.md` — the cloud-failover design (now built).
 - `docs/desktop/approval-gates.md` — why there's no universal tool-approval consent UI.
+- `docs/desktop/channels.md` — why Telegram isn't connected (8f), and the pairing design kept on file for the day it can be.
 
 ---
 

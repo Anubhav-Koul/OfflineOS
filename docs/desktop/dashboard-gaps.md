@@ -83,3 +83,33 @@ boundary rules are enforced by an architecture test):
 All four are plausible upstream contributions. Until one lands, the dashboard
 lists these panels as unavailable, with the reason, rather than showing an empty
 box that looks like a bug.
+
+## The tripwire
+
+`ic_integration_tests/tests/routeless_surfaces.rs` is what notices when one
+lands. Two halves, because neither alone is enough:
+
+- **The route table.** It reads `ironclaw_webui_v2::webui_v2_routes()` — the
+  canonical descriptor set the host composes against, where adding a route
+  requires adding a descriptor — and fails if any pattern mentions memory, audit,
+  or `/runs`. The two legitimate run-scoped routes (`…/runs/{run_id}/cancel` and
+  `…/gates/{gate_ref}/resolve`) are allow-listed, and the test *also* asserts
+  those two are still present, so a stale allow-list can't quietly mask whatever
+  replaced them.
+- **A running gateway.** The descriptor list cannot see routes mounted from
+  outside it (the product-auth mount, the host-supplied SSO mount), and the Phase
+  4 lesson stands: a source trace is not a running gateway. So the second half
+  spawns `serve` and `GET`s the exact paths listed above with a valid bearer,
+  asserting `404` — exactly, because a `401` or `405` would mean something *is*
+  mounted and only the auth or the method differs. It ends on a control request
+  to a route that does exist, so a wrong base URL can't 404 everything and pass
+  while proving nothing.
+
+**A failure is good news.** It means the panel can be built: read the new
+descriptor, build it, and delete that case from the test.
+
+Why this exists at all: skills was on this list and left it in 8c — but it left
+because the widget owns its data on disk, *not* because upstream shipped a route.
+Nothing would otherwise notice a route appearing, and a panel that keeps saying
+"unavailable" about something that has become available is a lie the user has no
+way to catch. Same shape as the Phase 8d canary in `approval-gates.md`.

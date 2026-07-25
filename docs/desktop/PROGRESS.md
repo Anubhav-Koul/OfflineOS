@@ -17,6 +17,79 @@ newest entry at the top (right after this header) — not to `CLAUDE.md`.
 
 ---
 
+## The routeless panels get a tripwire (recorded 2026-07-26)
+
+`crates/ic_integration_tests` (new `tests/routeless_surfaces.rs`, `Cargo.toml`) +
+`docs/desktop/dashboard-gaps.md`. **No core patch, no new dependency** — one new
+dev-dependency edge onto a crate already in the workspace
+(`ironclaw_webui_v2`). Contracts verified against the pinned upstream commit
+**`a492857`**.
+
+### The gap this closes
+
+Memory browser, audit log, and run history are shown as unavailable-with-reason,
+and the reasons are right: memory and audit live in the gateway's *private*
+libSQL store (`root_filesystem_entries WHERE path LIKE '/memory/%'`;
+`root_filesystem_events WHERE path LIKE '/events/audit/%'`, an unversioned
+internal schema), and there is no cross-thread run enumeration at all. Reading
+those tables directly would couple the widget to internals upstream can change
+without notice — **the coupling is the objection, not the difficulty.**
+
+Re-verified against the whole route table today: the v2 surface is threads,
+messages, timeline, events/ws, cancel, resolve-gate, automations, channels,
+extensions, `llm/*`, and the NEAR AI + Codex logins. Nothing else. The only
+run-shaped paths are `…/runs/{run_id}/cancel` and `…/gates/{gate_ref}/resolve`,
+both of which need a run id the caller already has — which is exactly *why* they
+are not run history.
+
+**But nothing in the repo would have noticed that changing.** Skills was on this
+same list and left it in 8c — by the widget owning its data on disk, *not* by
+upstream shipping a route. So a route could land and the dashboard would go on
+saying "unavailable" indefinitely, which is a lie the user has no way to catch.
+8d established the pattern for a verified negative (`approval_gate_dormant.rs`
+fails the day upstream wires `RequireApproval`); this applies it to the second
+one.
+
+### Two halves, because neither alone is enough
+
+- **The route table.** Reads `ironclaw_webui_v2::webui_v2_routes()` — the
+  canonical descriptor set the host composes against ("adding a new route
+  requires a matching descriptor") — rather than a list of our own that could
+  agree with itself forever. Fails if any pattern mentions memory, audit, or
+  `/runs`. The two legitimate run-scoped routes are allow-listed, **and the test
+  asserts those two are still present**, so a stale allow-list cannot quietly
+  mask whatever replaced them.
+- **A running gateway.** The descriptor list cannot see routes mounted from
+  outside it (the product-auth mount, the host-supplied SSO mount), and the Phase
+  4 lesson stands: a source trace is not a running gateway. So the second half
+  spawns `serve` and `GET`s the exact paths `dashboard-gaps.md` names, with a
+  valid bearer, asserting **404 exactly** — a 401 or 405 would mean something
+  *is* mounted and only the auth or method differs, which is still a route and
+  still news. It ends on a control request to a route that does exist, so a wrong
+  base URL cannot 404 everything and pass while proving nothing.
+
+A failure here is **good news**: build the panel, delete the case.
+
+### The canary was falsified before it was trusted
+
+A tripwire that cannot trip is worse than none, so both halves were made to fail
+on purpose and then restored: a bogus marker added to the descriptor scan (it
+failed with *"a route now exists for a panel the dashboard reports as
+unavailable"*), and one probe path swapped for `/threads` (it failed with *"GET
+/api/webchat/v2/threads answered 200 OK on a real gateway"*). Both messages name
+the panel and say what to do next.
+
+One packaging note: `webui_v2_routes()` is itself behind `webui-v2-beta`, so
+`ic_integration_tests`'s own feature now forwards
+(`webui-v2-beta = ["ironclaw_webui_v2/webui-v2-beta"]`) and the whole file is
+gated on it — the same flag CI already passes for the gate suite.
+
+### Gate
+
+fmt ✅, clippy `-D warnings` ✅ (`ic_integration_tests --all-targets --features
+webui-v2-beta`), both new tests green against a real `serve`, and the falsified
+runs above confirm they can fail.
+
 ## Phase 8e addendum — what a real third-party skill taught the review card (recorded 2026-07-25)
 
 `crates/ic_widget` (`skill_import.rs`, `git_import.rs`, `main.rs`) + `ui/`

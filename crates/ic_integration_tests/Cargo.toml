@@ -18,7 +18,11 @@ description = "Phase 0 upstream-merge gate: spawns `ironclaw-reborn serve` and d
 #
 # The test locates the binary under the target dir; override with
 # IRONCLAW_REBORN_BIN=<path> if it lives elsewhere.
-webui-v2-beta = []
+#
+# It also switches on the same feature in `ironclaw_webui_v2`, because
+# `tests/routeless_surfaces.rs` reads that crate's route table and the table
+# itself is compiled behind the flag.
+webui-v2-beta = ["ironclaw_webui_v2/webui-v2-beta"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -58,4 +62,9 @@ ironclaw_host_runtime = { path = "../ironclaw_host_runtime" }
 # has to accept exactly what the runtime installs, so the test feeds one corpus
 # to both parsers and compares. Depending on the real one is the whole point.
 ironclaw_skills = { path = "../ironclaw_skills" }
+# `tests/routeless_surfaces.rs` — the tripwire for the three dashboard panels
+# that have no backend. It reads the runtime's *own* route table rather than a
+# copy of it, so the day upstream adds a memory / audit / run route this fails
+# instead of the dashboard going on saying "unavailable" forever.
+ironclaw_webui_v2 = { path = "../ironclaw_webui_v2" }
 async-trait = "0.1"

@@ -17,6 +17,69 @@ newest entry at the top (right after this header) — not to `CLAUDE.md`.
 
 ---
 
+## Phase 8 smoke run on Windows (recorded 2026-07-26)
+
+The last item in Phase 8's definition of done, run on the dev machine (Ryzen
+5 7600X / Radeon RX 7900 XTX, Windows 11). `crates/ic_integration_tests`
+(`memory_and_subagent_verify.rs` gains one `#[ignore]`d real-model check).
+
+### The gap the smoke run closed before it even launched
+
+**The Tauri binary had never been compiled with the 8g changes.** CI's quality
+job lints `ic_widget --lib --tests`, and `cargo test -p ic_widget --lib` builds
+the library only — neither touches `main.rs`, where the three new `seed_*`
+commands and the `subagent_running` wiring live. `cargo build -p ic_widget
+--features app --bin ic-widget` was the first compile of that code. It passed,
+as did `cargo clippy --features app --bins -D warnings`, but the point stands:
+**the binary is a gate the fork CI does not run**, and 8g's Rust would have
+shipped uncompiled if the smoke run had been skipped.
+
+### What launched
+
+Every subsystem came up, in one process tree:
+
+- summon hotkey live (`Ctrl+Shift+Space`), voice pipeline started (mic captured)
+- local model `Qwen3-4B-Q4_K_M` on the **Vulkan** backend, 37 GPU layers,
+  ctx 32768, ready in **4.06 s**; `ic_llama` schema proxy listening in front of it
+- browser MCP sidecar ready, canvas MCP server ready (in-process)
+- `ironclaw-reborn` ready in **577 ms**; the widget opened a thread and started
+  its event pump
+
+**Kill-tree re-verified.** `Stop-Process -Force` (a real `TerminateProcess`, not
+a graceful close) on the widget left **no** `ironclaw-reborn` and **no**
+`llama-server` behind. The Job Object invariant holds on this machine.
+
+### Two findings, neither fatal
+
+1. **A `console.warn` is logged at ERROR.** One fires from inside the Live2D
+   hit-profile readback (`hx.hitProfile` → PIXI; there is no `console.warn`
+   anywhere in `ui/src`, so it is the library's). The readback itself succeeded —
+   the character's own error path (`character hit profile readback failed`) never
+   fired. So this is log noise, but it is log noise **at ERROR level**, which is
+   the exact failure mode this repo already named in another context: a signal
+   that cannot report success trains you to ignore it. Worth a level fix in
+   `ic_widget::ui`; not worth blocking on.
+2. **The real-model seed check is inconclusive, and is recorded as inconclusive.**
+   A new `#[ignore]`d test drives the *shipped* `seed_prompt` through a real
+   gateway pointed at the running llama sidecar, to answer the one question a
+   mock cannot: does a 4B actually call `memory_write`? On its first run the
+   message sat at `submitted` for the full 300 s and the turn never started —
+   with the sidecar shared with the live widget, which is an environment problem,
+   not a model verdict. The test now asserts `done` **first**, with a message
+   saying exactly that, so a stalled run can never be misread as "the prompt does
+   not work". Re-run it against an uncontended sidecar to get a real answer.
+
+The seed panel's `NotAttempted` arm exists precisely because this is uncertain,
+so the product is honest either way — but the question is open, and pretending
+otherwise would have been the easy mistake here.
+
+### What a smoke run cannot cover
+
+Everything visual: whether the character renders correctly, how the transparent
+always-on-top window composites on a given driver, whether per-pixel
+click-through feels right, whether the animation holds its frame cap. Those need
+eyes on the screen and remain a human step.
+
 ## Phase 8g notes — memory seeding, and a subagent you can see (recorded 2026-07-26)
 
 `crates/ic_widget` (new `memory_seed.rs`; `gateway_client/mod.rs`, `character.rs`,

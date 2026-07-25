@@ -201,3 +201,70 @@ async fn what_the_stream_says_when_a_subagent_runs() {
         println!("--- stderr ---\n{}", server.stderr_snapshot());
     }
 }
+
+/// The smoke-run question the mock cannot answer: **does the model this product
+/// actually ships with call the tool?**
+///
+/// The seed panel's whole design rests on it — `SeedOutcome::NotAttempted`
+/// exists because a small local model will often reply "I'll remember that" and
+/// call nothing. The mock-driven canary above proves the *contract*; this proves
+/// the prompt survives contact with a 4B.
+///
+/// Ignored: it needs a running `llama-server` behind the `ic_llama` schema proxy.
+/// Point `IC_LOCAL_LLM_BASE` at it (the widget logs the proxy port on startup)
+/// and run:
+///
+/// ```text
+/// IC_LOCAL_LLM_BASE=http://127.0.0.1:54533/v1 \
+///   cargo test -p ic_integration_tests --features webui-v2-beta \
+///   --test memory_and_subagent_verify -- --ignored a_real_local_model
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a running local model; see the doc comment"]
+async fn a_real_local_model_actually_calls_memory_write() {
+    let base = std::env::var("IC_LOCAL_LLM_BASE")
+        .expect("set IC_LOCAL_LLM_BASE to the running schema proxy");
+    let server = RebornServer::start_with_llm(vec![
+        ("LLM_BACKEND".to_string(), "openai_compatible".to_string()),
+        ("LLM_BASE_URL".to_string(), base),
+        ("LLM_API_KEY".to_string(), "not-used-locally".to_string()),
+        ("LLM_MODEL".to_string(), "local".to_string()),
+    ])
+    .await;
+
+    let thread = server.create_thread().await;
+    // The exact prompt the widget sends, so this tests the shipped wording.
+    let prompt = ic_widget::memory_seed::seed_prompt("My name is Wren and I prefer short answers.");
+    server.send_message(&thread, &prompt).await;
+    let (done, stream) = server
+        .stream_until(
+            &thread,
+            "\"status\":\"completed\"",
+            Duration::from_secs(300),
+        )
+        .await;
+    let timeline = server.timeline(&thread).await;
+    let text = serde_json::to_string(&timeline).unwrap_or_default();
+    println!(
+        "run completed: {done}\nstream tail: {}",
+        &stream[stream.len().saturating_sub(400)..]
+    );
+    println!("timeline: {text}");
+    // Distinguish the two failures, because they mean opposite things. A turn
+    // that never finished says nothing about the prompt — on the first run of
+    // this the sidecar was shared with a live widget and the message sat at
+    // `submitted` for the whole 300s, which is an environment problem, not a
+    // model verdict. Only a *completed* turn can convict the wording.
+    assert!(
+        done,
+        "the turn never completed, so this run says nothing about the prompt — \
+         give the model an uncontended sidecar and a longer timeout before \
+         reading anything into it."
+    );
+    assert!(
+        text.contains("builtin.memory_write"),
+        "a completed turn on a real local model did NOT call memory_write — the \
+         panel's NotAttempted path is then the common case, and the shipped \
+         prompt needs work:\n{text}"
+    );
+}

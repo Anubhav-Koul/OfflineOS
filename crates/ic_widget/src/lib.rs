@@ -12,6 +12,7 @@
 //! | [`browser`] | Supervising the browser MCP sidecar; registering its tools |
 //! | [`canvas`] | The in-process canvas MCP server; rendering agent HTML/SVG |
 //! | [`gateway_client`] | The only place we talk to `ironclaw-reborn serve` |
+//! | [`git_import`] | Cloning a git repo of skills and namespacing them |
 //! | [`oauth_callback`] | The fixed-port loopback listener for connector OAuth |
 //! | [`hit_test`] | The click-through mask for the transparent window |
 //! | [`job_object`] | Making child processes die with us |
@@ -28,6 +29,7 @@ pub mod canvas;
 pub mod character;
 pub mod error;
 pub mod gateway_client;
+pub mod git_import;
 pub mod hit_test;
 pub mod job_object;
 pub mod model_catalog;

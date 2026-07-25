@@ -317,6 +317,24 @@ body.widget-body {
   white-space: nowrap;
 }
 
+/* Git-repo skill import (Phase 8e). */
+.repo-skill {
+  border-top: 1px solid #2b2f38;
+  padding: 10px 0;
+}
+.repo-skill:first-of-type {
+  border-top: none;
+}
+.import-preview.diff {
+  font-family: ui-monospace, Consolas, monospace;
+}
+.import-preview.diff .diff-add {
+  color: #7bd88f;
+}
+.import-preview.diff .diff-del {
+  color: var(--danger);
+}
+
 /* The installed-skills list (Phase 8c). */
 .skill-list {
   list-style: none;

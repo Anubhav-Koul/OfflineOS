@@ -31,7 +31,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::ambient::reflection;
+use crate::skill_import;
 
 /// One installed skill, as shown in the Skills panel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -90,9 +90,12 @@ pub fn list(skills_root: &Path) -> Result<Vec<InstalledSkill>, String> {
         };
 
         let (description, valid) = match std::fs::read_to_string(&skill_md) {
-            Ok(text) => match reflection::parse_skill_md(&text.replace("\r\n", "\n")) {
-                Some(draft) => (draft.description, true),
-                None => (String::new(), false),
+            // The *runtime's* rules, via the import parser — an installed skill
+            // is a real SKILL.md on disk, so a YAML block-scalar description
+            // must read as a description here rather than as "invalid".
+            Ok(text) => match skill_import::parse_skill_md(&text) {
+                Ok(draft) => (draft.description, true),
+                Err(_) => (String::new(), false),
             },
             Err(_) => (String::new(), false),
         };

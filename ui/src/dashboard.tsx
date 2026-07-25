@@ -15,6 +15,9 @@ import {
   type GoogleOAuthStatus,
   type ImportPreview,
   type InstalledSkill,
+  type RepoPreview,
+  type RepoSkillReview,
+  type StudyResult,
   type WatchRule,
   type WatchTrigger,
   type WatcherSettings,
@@ -3079,6 +3082,279 @@ function SkillImportPanel() {
   );
 }
 
+/**
+ * Import skills from a git repository (Phase 8e).
+ *
+ * Clone a repo, review each SKILL.md it ships, and install one at a time through
+ * the same red-consent-card path as a folder import. Third-party skill text is
+ * untrusted (prompt injection with persistence), so the body is shown as PLAIN
+ * TEXT (never rendered markdown), hidden characters are flagged, and a re-import
+ * shows a diff against the installed version. Names are namespaced by repo so two
+ * repos' same-named skills don't collide.
+ */
+function RepoImportPanel() {
+  const [url, setUrl] = createSignal("");
+  const [preview, setPreview] = createSignal<RepoPreview | null>(null);
+  const [busy, setBusy] = createSignal(false);
+  const [asked, setAsked] = createSignal<Set<string>>(new Set());
+  const [error, setError] = createSignal<string | null>(null);
+
+  const clone = async () => {
+    setError(null);
+    setPreview(null);
+    setAsked(new Set<string>());
+    setBusy(true);
+    try {
+      setPreview(await api.previewRepoSkills(url().trim()));
+    } catch (problem) {
+      setError(String(problem));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const ask = async (skill: RepoSkillReview) => {
+    setError(null);
+    try {
+      await api.requestRepoSkill(skill.install_name);
+      setAsked((prev) => {
+        const next = new Set(prev);
+        next.add(skill.install_name);
+        return next;
+      });
+    } catch (problem) {
+      setError(String(problem));
+    }
+  };
+
+  return (
+    <section>
+      <h2>Import skills from a git repo</h2>
+      <p class="muted small">
+        Clones the repo (depth-1, no submodules, 50 MB cap) and lists every{" "}
+        <code>SKILL.md</code> it ships. Each installs with the agent's{" "}
+        <strong>full trust</strong> and nothing scans its content — review each one
+        before you say yes.
+      </p>
+      <div class="row">
+        <input
+          type="text"
+          placeholder="https://github.com/owner/repo"
+          value={url()}
+          onInput={(event) => setUrl(event.currentTarget.value)}
+        />
+        <button onClick={() => void clone()} disabled={busy() || !url().trim()}>
+          {busy() ? "Cloning…" : "Clone & review"}
+        </button>
+      </div>
+      <Show when={preview()}>
+        {(repo) => (
+          <>
+            <p class="muted small">
+              <strong>{repo().skills.length}</strong> skill(s) in{" "}
+              <code>{repo().slug}</code>, namespaced by repo.
+            </p>
+            <Show when={repo().rejected.length > 0}>
+              <p class="muted small">
+                {repo().rejected.length} folder(s) in this repo ship a{" "}
+                <code>SKILL.md</code> that cannot be imported:
+              </p>
+              <ul class="skill-list">
+                <For each={repo().rejected}>
+                  {(bad) => (
+                    <li class="muted small">
+                      <code>{bad.rel_dir}</code> — {bad.reason}
+                    </li>
+                  )}
+                </For>
+              </ul>
+            </Show>
+            <Show when={repo().skills.length === 0}>
+              <p class="error">
+                Nothing in this repo can be imported.
+              </p>
+            </Show>
+            <For each={repo().skills}>
+              {(skill) => (
+                <div class="repo-skill">
+                  <p>
+                    <strong>{skill.name}</strong> — {skill.description}
+                    <br />
+                    <span class="muted small">
+                      installs as <code>{skill.install_name}</code>
+                      {skill.rel_dir !== "." ? ` · from ${skill.rel_dir}` : ""}
+                      {skill.installed ? " · already installed (update)" : ""}
+                    </span>
+                  </p>
+                  <Show when={skill.warnings.length > 0}>
+                    <p class="error">
+                      ⚠ hidden characters in this skill: {skill.warnings.join(", ")} —
+                      read it carefully.
+                    </p>
+                  </Show>
+                  <Show
+                    when={skill.installed && skill.diff}
+                    fallback={<pre class="import-preview">{skill.skill_md}</pre>}
+                  >
+                    <p class="muted small">Changes since the installed version:</p>
+                    <pre class="import-preview diff">
+                      <For each={skill.diff!}>
+                        {(line) => (
+                          <div
+                            classList={{
+                              "diff-add": line.tag === "added",
+                              "diff-del": line.tag === "removed",
+                            }}
+                          >
+                            {line.tag === "added"
+                              ? "+ "
+                              : line.tag === "removed"
+                                ? "- "
+                                : "  "}
+                            {line.text}
+                          </div>
+                        )}
+                      </For>
+                    </pre>
+                  </Show>
+                  <button
+                    onClick={() => void ask(skill)}
+                    disabled={asked().has(skill.install_name)}
+                  >
+                    {asked().has(skill.install_name)
+                      ? "Waiting for your answer on the character…"
+                      : skill.installed
+                        ? "Ask to update"
+                        : "Ask to install"}
+                  </button>
+                </div>
+              )}
+            </For>
+          </>
+        )}
+      </Show>
+      <Show when={error()}>
+        <p class="error">{error()}</p>
+      </Show>
+    </section>
+  );
+}
+
+/**
+ * "Study this repo" (Phase 8e).
+ *
+ * Clone a repository, show the agent a *bounded* reading list — README and
+ * manifests first, a dozen files at most — and ask it to distil the procedures
+ * into a draft skill. The draft goes through the same red consent card as every
+ * other skill; nothing installs without a yes.
+ *
+ * Two honest limits are on the panel rather than in a comment: a small local
+ * model cannot do this well (the 7b model-quality constraint), and the widget
+ * cannot register a repo's tool surface as a connector on the user's behalf —
+ * it can only name what it saw and point at the Connectors panel.
+ */
+function StudyRepoPanel() {
+  const [url, setUrl] = createSignal("");
+  const [busy, setBusy] = createSignal(false);
+  const [result, setResult] = createSignal<StudyResult | null>(null);
+  const [error, setError] = createSignal<string | null>(null);
+  const [localModel, setLocalModel] = createSignal(false);
+
+  onMount(() => {
+    void (async () => {
+      try {
+        setLocalModel((await api.localModelStatus()) !== null);
+      } catch {
+        setLocalModel(false);
+      }
+    })();
+  });
+
+  const study = async () => {
+    setError(null);
+    setResult(null);
+    setBusy(true);
+    try {
+      setResult(await api.studyRepo(url().trim()));
+    } catch (problem) {
+      setError(String(problem));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section>
+      <h2>Study a repo</h2>
+      <p class="muted small">
+        Clones a repository and reads a handful of its most explanatory files
+        (README, manifests, docs — up to 12), then asks the agent whether it
+        teaches a procedure worth keeping. Any draft is offered on the character
+        for your approval; nothing installs on its own.
+      </p>
+      <Show when={localModel()}>
+        <p class="muted small">
+          This one leans on the model hard. A small local model will read a
+          repo and draft something shallow — switch to a stronger model before
+          studying anything you care about.
+        </p>
+      </Show>
+      <div class="row">
+        <input
+          type="text"
+          placeholder="https://github.com/owner/repo"
+          value={url()}
+          onInput={(event) => setUrl(event.currentTarget.value)}
+        />
+        <button onClick={() => void study()} disabled={busy() || !url().trim()}>
+          {busy() ? "Studying…" : "Study"}
+        </button>
+      </div>
+      <Show when={busy()}>
+        <p class="muted small">
+          Cloning, reading, and asking the agent — this takes a turn, so it can
+          be slow on a local model.
+        </p>
+      </Show>
+      <Show when={result()}>
+        {(study) => (
+          <>
+            <p class="muted small">
+              Read {study().files_read.length} file(s) from{" "}
+              <code>{study().slug}</code>
+              {study().skipped > 0
+                ? `, ${study().skipped} left unread to stay in budget`
+                : ""}
+              : {study().files_read.join(", ") || "none"}.
+            </p>
+            <Show when={study().tool_surface.length > 0}>
+              <p class="muted small">
+                This repo looks like it ships {study().tool_surface.join("; ")}.
+                The widget can't wire that up for you — if you want the agent to
+                use it, add it from the Connectors panel.
+              </p>
+            </Show>
+            <Show
+              when={study().drafted}
+              fallback={
+                <p class="muted small">{study().note ?? "No draft."}</p>
+              }
+            >
+              <p>
+                Drafted <strong>{study().drafted}</strong> — answer on the
+                character to install it.
+              </p>
+            </Show>
+          </>
+        )}
+      </Show>
+      <Show when={error()}>
+        <p class="error">{error()}</p>
+      </Show>
+    </section>
+  );
+}
+
 /** Human-readable byte size for a skill's footprint. */
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -3332,6 +3608,8 @@ function Dashboard() {
         <Show when={section() === "skills"}>
           <InstalledSkillsPanel />
           <SkillImportPanel />
+          <RepoImportPanel />
+          <StudyRepoPanel />
         </Show>
 
       <Show when={section() === "settings"}>

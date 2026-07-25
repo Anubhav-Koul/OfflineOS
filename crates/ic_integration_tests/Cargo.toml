@@ -54,4 +54,8 @@ ironclaw_host_api = { path = "../ironclaw_host_api" }
 # For `default_host_port_catalog()` — the same catalog the runtime validates
 # manifests against, so the test cannot pass against a stub the real thing rejects.
 ironclaw_host_runtime = { path = "../ironclaw_host_runtime" }
+# `tests/skill_parser_agreement.rs` — the Phase 8e gate. The widget's importer
+# has to accept exactly what the runtime installs, so the test feeds one corpus
+# to both parsers and compares. Depending on the real one is the whole point.
+ironclaw_skills = { path = "../ironclaw_skills" }
 async-trait = "0.1"

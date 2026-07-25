@@ -28,7 +28,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::ambient::reflection::{self, Draft};
+use crate::ambient::reflection::Draft;
 
 /// The runtime's own install-bundle limits, mirrored from
 /// `ironclaw_skills/src/management/install_bundle.rs` — an import must never
@@ -38,6 +38,11 @@ pub const MAX_BUNDLE_FILES: usize = 256;
 pub const MAX_BUNDLE_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// Whole-bundle byte cap (20 MiB upstream).
 pub const MAX_BUNDLE_TOTAL_BYTES: u64 = 20 * 1024 * 1024;
+/// The runtime's cap on a SKILL.md itself (`MAX_PROMPT_FILE_SIZE` in
+/// `ironclaw_skills/src/types.rs`), enforced by `skill_install` and by the
+/// bounded read on discovery. A bigger file cannot install, so an import refuses
+/// it here with a message that says which limit it hit.
+pub const MAX_SKILL_MD_BYTES: u64 = 64 * 1024;
 
 /// One bundle file, as shown in the review.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -154,13 +159,110 @@ fn write_bundle(
     Ok(())
 }
 
+/// The frontmatter keys an import needs. Everything else in the YAML is the
+/// skill's own business (the runtime has its own `SkillManifest` for it) and is
+/// preserved untouched in the text we write.
+#[derive(serde::Deserialize)]
+struct Frontmatter {
+    name: String,
+    /// Optional, exactly as the runtime has it (`SkillManifest` defaults it).
+    /// A skill with no description is thin, not invalid — and refusing one the
+    /// runtime installs is a wall the user cannot get past.
+    #[serde(default)]
+    description: String,
+}
+
+/// Parse a complete SKILL.md the way the **runtime** does, with an error message
+/// a person can act on.
+///
+/// This deliberately does *not* reuse [`reflection::parse_skill_md`]. That parser
+/// reads a model's reply — a hand-rolled line scanner is right there, and its
+/// narrowness is the fail-closed posture 7b wants. A third-party file is the
+/// opposite problem: it is real YAML written by someone else, and refusing what
+/// the runtime would accept is a bug the user cannot fix. Anthropic's own skills
+/// repo is the proof — `claude-api` writes `description: |-` as a block scalar,
+/// which a line scanner reads as empty.
+///
+/// So the rules here are the runtime's (`ironclaw_skills/src/parser.rs` +
+/// `validation.rs` + `MAX_PROMPT_FILE_SIZE`), plus one guard the runtime lacks
+/// and Windows needs: a name that is a reserved device name cannot be a
+/// directory. Pinned by `skill_parser_agreement.rs`.
+pub fn parse_skill_md(content: &str) -> Result<Draft, String> {
+    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+    let normalized = normalized
+        .strip_prefix('\u{feff}')
+        .unwrap_or(&normalized)
+        .to_string();
+    if normalized.len() as u64 > MAX_SKILL_MD_BYTES {
+        return Err(format!(
+            "SKILL.md is larger than the {} KiB limit the runtime puts on a skill",
+            MAX_SKILL_MD_BYTES / 1024
+        ));
+    }
+
+    let trimmed = normalized.trim_start_matches('\n');
+    let after_first = trimmed
+        .strip_prefix("---")
+        .and_then(|rest| rest.split_once('\n').map(|(_, rest)| rest))
+        .ok_or("SKILL.md does not start with `---` frontmatter")?;
+    let (front, body) = split_at_closing_fence(after_first)
+        .ok_or("SKILL.md's `---` frontmatter is never closed by another `---` line")?;
+
+    let front: Frontmatter = serde_yml::from_str(front)
+        .map_err(|error| format!("SKILL.md's frontmatter is not valid YAML: {error}"))?;
+    let name = front.name.trim().to_string();
+    let description = front.description.trim().to_string();
+    if !valid_import_name(&name) {
+        return Err(format!(
+            "\u{201c}{name}\u{201d} is not a usable skill name: it must start with a \
+             letter or digit, use only letters, digits, `.`, `-` and `_`, be at most \
+             64 characters, and not be a reserved Windows device name"
+        ));
+    }
+    if body.trim().is_empty() {
+        return Err("SKILL.md has no body: a skill with no body is a name, not a procedure".into());
+    }
+
+    Ok(Draft {
+        name,
+        description,
+        content: normalized,
+    })
+}
+
+/// Split frontmatter from body at the first `---` on its own line.
+fn split_at_closing_fence(after_first_line: &str) -> Option<(&str, &str)> {
+    let mut offset = 0usize;
+    for line in after_first_line.split_inclusive('\n') {
+        if line.trim_end_matches('\n').trim() == "---" {
+            return Some((
+                &after_first_line[..offset],
+                &after_first_line[offset + line.len()..],
+            ));
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// The runtime's own name grammar (`[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}`), plus the
+/// Windows device-name guard it lacks — the name becomes a directory here.
+fn valid_import_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_alphanumeric()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+        && !is_reserved_device_name(name)
+}
+
 /// Parse a complete SKILL.md, with an error message a person can act on.
 fn parse(content: &str) -> Result<Draft, String> {
-    reflection::parse_skill_md(content).ok_or_else(|| {
-        "SKILL.md is not a valid skill: it needs `---` frontmatter with a \
-         kebab-case `name:` and a `description:`, followed by a non-empty body"
-            .to_string()
-    })
+    parse_skill_md(content)
 }
 
 /// Every bundle file under `folder` (SKILL.md at the root excluded), validated
@@ -314,6 +416,68 @@ mod tests {
         std::fs::write(dir.path().join("SKILL.md"), "just prose").expect("write");
         let error = preview(dir.path()).expect_err("invalid");
         assert!(error.contains("frontmatter"), "{error}");
+    }
+
+    /// The bug a real repo found: Anthropic's own `claude-api` skill writes its
+    /// description as a YAML block scalar. A line scanner reads that as empty and
+    /// refuses a skill the runtime installs happily.
+    #[test]
+    fn a_block_scalar_description_is_read_as_a_description() {
+        let md = "---\nname: claude-api\ndescription: |-\n  First line of the description.\n  Second line, still the description.\nlicense: Complete terms in LICENSE.txt\n---\n\n# Body\n\nDo the thing.\n";
+        let draft = parse_skill_md(md).expect("a block scalar is valid YAML");
+        assert_eq!(draft.name, "claude-api");
+        assert!(draft.description.starts_with("First line"), "{draft:?}");
+        assert!(draft.description.contains("Second line"), "{draft:?}");
+        // The text that installs is the file, untouched but for line endings.
+        assert!(draft.content.contains("license: Complete terms"));
+    }
+
+    #[test]
+    fn folded_and_quoted_descriptions_parse_too() {
+        let folded = "---\nname: folded\ndescription: >-\n  one\n  two\n---\n\nBody.\n";
+        assert_eq!(
+            parse_skill_md(folded).expect("folded").description,
+            "one two"
+        );
+        let quoted = "---\nname: quoted\ndescription: \"has: a colon\"\n---\n\nBody.\n";
+        assert_eq!(
+            parse_skill_md(quoted).expect("quoted").description,
+            "has: a colon"
+        );
+    }
+
+    /// The runtime's grammar is `[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}` — wider than
+    /// kebab-case. Refusing what the runtime accepts is a bug the user can't fix.
+    #[test]
+    fn the_name_grammar_is_the_runtimes_plus_a_windows_guard() {
+        for name in ["Skill_Name", "skill.v2", "a", "A1-b_c.d"] {
+            let md = format!("---\nname: {name}\ndescription: d\n---\n\nBody.\n");
+            assert!(parse_skill_md(&md).is_ok(), "{name} should be accepted");
+        }
+        for name in ["-leading", "has space", "has/slash", "con", "lpt1", ""] {
+            let md = format!("---\nname: \"{name}\"\ndescription: d\n---\n\nBody.\n");
+            assert!(parse_skill_md(&md).is_err(), "{name} should be refused");
+        }
+        let long = "a".repeat(65);
+        let md = format!("---\nname: {long}\ndescription: d\n---\n\nBody.\n");
+        assert!(parse_skill_md(&md).is_err(), "65 characters is too long");
+    }
+
+    #[test]
+    fn a_skill_md_over_the_runtimes_own_limit_says_which_limit() {
+        let md = format!(
+            "---\nname: huge\ndescription: d\n---\n\n{}",
+            "x".repeat(MAX_SKILL_MD_BYTES as usize)
+        );
+        let error = parse_skill_md(&md).expect_err("over the cap");
+        assert!(error.contains("64 KiB"), "{error}");
+    }
+
+    #[test]
+    fn a_frontmatter_that_is_never_closed_says_so() {
+        let error =
+            parse_skill_md("---\nname: x\ndescription: d\n\nBody.\n").expect_err("unclosed");
+        assert!(error.contains("never closed"), "{error}");
     }
 
     #[test]

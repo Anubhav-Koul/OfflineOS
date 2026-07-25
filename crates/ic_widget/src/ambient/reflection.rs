@@ -134,7 +134,13 @@ pub fn parse_draft(reply: &str) -> Option<Draft> {
 }
 
 /// Validate one complete SKILL.md text — no fence extraction, the file *is* the
-/// candidate. What the skill-import path (7c) uses on a user-picked file.
+/// candidate.
+///
+/// **Not what the import path uses.** These rules are for a *model's reply*, and
+/// their narrowness is the fail-closed posture 7b wants. A third-party file gets
+/// [`crate::skill_import::parse_skill_md`] instead, which applies the runtime's
+/// own YAML rules — 8e found that this scanner refuses real skills (a
+/// `description: |-` block scalar reads as absent to it).
 pub fn parse_skill_md(content: &str) -> Option<Draft> {
     candidate_draft(content.trim())
 }

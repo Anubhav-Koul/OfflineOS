@@ -142,6 +142,9 @@ struct AppState {
     /// ambient service on purpose: an import is *solicited*, so it must work
     /// with ambient off and must never spend a guardrail slot.
     pending_import: Mutex<Option<PendingImport>>,
+    /// The most recently cloned skills repo (Phase 8e), kept alive so an approved
+    /// install can copy its bundle. Replaced on each new clone.
+    repo_clone: Mutex<Option<RepoClone>>,
     /// The ambient watcher loop (Phase 7d). Spawned with ambient mode, aborted
     /// with it — with the master switch off, no signal is even sampled.
     watcher_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -151,12 +154,29 @@ struct AppState {
 struct PendingImport {
     /// The suggestion id the bubble answers with.
     id: String,
-    /// The folder being imported.
-    folder: PathBuf,
-    /// The skill's validated name.
+    /// The folder being imported, whose bundle files ride along. `None` for a
+    /// draft with no folder behind it — a "study this repo" result (Phase 8e) is
+    /// text the model wrote, not a directory someone shipped, so it installs as
+    /// text alone.
+    folder: Option<PathBuf>,
+    /// The skill's validated name (the install directory).
     name: String,
     /// The exact reviewed SKILL.md text — what an approval installs, verbatim.
     skill_md: String,
+    /// Whether this replaces a same-named installed skill (a git re-sync). The
+    /// existing skill is removed first, so the update is not refused as a
+    /// duplicate. `false` for a first install (7c folder imports are always this).
+    overwrite: bool,
+}
+
+/// A cloned skills repo, held in app state so its temp directory outlives the
+/// review: the bundle files are copied from it only when the user approves an
+/// install. Replacing it drops the old `TempDir`, which deletes the old clone.
+struct RepoClone {
+    /// Keeps the clone on disk until this is dropped.
+    _dir: tempfile::TempDir,
+    /// The skills found, with their folders inside `_dir`.
+    import: ic_widget::git_import::RepoImport,
 }
 
 /// The inputs the character state derives from, plus the last state emitted.
@@ -3274,13 +3294,300 @@ async fn request_skill_import(
     });
     *state.pending_import.lock().await = Some(PendingImport {
         id: suggestion.id.clone(),
-        folder,
+        folder: Some(folder),
         name: preview.name,
         skill_md: preview.skill_md,
+        overwrite: false,
     });
     let _ = app.emit("ambient://suggestion", &suggestion);
     update_character(&app, |inputs| inputs.suggestion_pending = true).await;
     Ok(())
+}
+
+/// One skill in a cloned repo, as shown in the dashboard review (Phase 8e).
+#[derive(Serialize)]
+struct RepoSkillReview {
+    /// The skill's own name in the repo.
+    name: String,
+    /// The namespaced name it installs as (`<repo-slug>-<name>`).
+    install_name: String,
+    description: String,
+    /// The folder within the repo, for display.
+    rel_dir: String,
+    /// The full namespaced SKILL.md text — rendered as PLAIN TEXT in the review,
+    /// never markdown (untrusted third-party content).
+    skill_md: String,
+    /// Bundle files that ride along.
+    files: Vec<ic_widget::skill_import::ImportFile>,
+    /// Hidden-character warnings (zero-width / bidi) found in the text, if any.
+    warnings: Vec<String>,
+    /// Whether a skill of this namespaced name is already installed (an update).
+    installed: bool,
+    /// When updating, the line diff installed → incoming, so only what changed is
+    /// re-reviewed.
+    diff: Option<Vec<ic_widget::git_import::DiffLine>>,
+}
+
+/// The result of cloning and scanning a skills repo for review.
+#[derive(Serialize)]
+struct RepoPreview {
+    slug: String,
+    url: String,
+    skills: Vec<RepoSkillReview>,
+    /// `SKILL.md` folders the repo ships that cannot be imported, with reasons.
+    /// Reported rather than hidden: a repo listing 17 of its 18 skills with no
+    /// explanation reads as a repo with 17 skills.
+    rejected: Vec<ic_widget::git_import::RejectedSkill>,
+}
+
+/// Clone a git repo of skills and return each skill for review (Phase 8e).
+///
+/// The clone is depth-1, no-submodules, size- and time-capped, and symlink-free
+/// (all enforced in `git_import`). It is kept alive in app state so an approved
+/// install can copy its bundle; a new clone replaces (and deletes) the old one.
+/// Nothing installs here — this is a pure read, the same shape as the 7c folder
+/// preview.
+#[tauri::command]
+async fn preview_repo_skills(
+    state: tauri::State<'_, AppState>,
+    url: String,
+) -> Result<RepoPreview, String> {
+    let url = url.trim().to_string();
+    if url.is_empty() {
+        return Err("enter a git repository URL".to_string());
+    }
+    let temp =
+        tempfile::tempdir().map_err(|error| format!("could not create a temp dir: {error}"))?;
+    let into = temp.path().join("clone");
+    let import = ic_widget::git_import::clone_and_scan(
+        url,
+        into,
+        ic_widget::git_import::MAX_REPO_BYTES,
+        ic_widget::git_import::CLONE_TIMEOUT,
+    )
+    .await?;
+
+    // Build the review (installed?/diff/warnings) before handing the clone to state.
+    let root = skills_root().ok();
+    let mut skills = Vec::new();
+    for skill in &import.skills {
+        let existing = root.as_ref().and_then(|root| {
+            std::fs::read_to_string(root.join(&skill.install_name).join("SKILL.md")).ok()
+        });
+        let (installed, diff) = match existing {
+            Some(old) => (
+                true,
+                Some(ic_widget::git_import::diff_lines(&old, &skill.skill_md)),
+            ),
+            None => (false, None),
+        };
+        skills.push(RepoSkillReview {
+            name: skill.name.clone(),
+            install_name: skill.install_name.clone(),
+            description: skill.description.clone(),
+            rel_dir: skill.rel_dir.clone(),
+            skill_md: skill.skill_md.clone(),
+            files: skill.files.clone(),
+            warnings: ic_widget::git_import::suspicious_chars(&skill.skill_md),
+            installed,
+            diff,
+        });
+    }
+    let preview = RepoPreview {
+        slug: import.slug.clone(),
+        url: import.url.clone(),
+        skills,
+        rejected: import.rejected.clone(),
+    };
+    *state.repo_clone.lock().await = Some(RepoClone { _dir: temp, import });
+    Ok(preview)
+}
+
+/// Put one reviewed repo skill on the bubble as a red consent card (Phase 8e).
+///
+/// Reuses the 7c consent path exactly: an approval installs the reviewed text
+/// verbatim through `respond_suggestion`. One skill at a time — never a bulk
+/// silent install. An update (the namespaced name already exists) is flagged so
+/// the install replaces rather than refuses.
+#[tauri::command]
+async fn request_repo_skill(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    install_name: String,
+) -> Result<(), String> {
+    let (folder, skill_md, name) = {
+        let guard = state.repo_clone.lock().await;
+        let clone = guard
+            .as_ref()
+            .ok_or("no repo has been cloned; review a repo first")?;
+        let skill = clone
+            .import
+            .skills
+            .iter()
+            .find(|skill| skill.install_name == install_name)
+            .ok_or_else(|| format!("no skill named {install_name} in the cloned repo"))?;
+        (
+            skill.folder.clone(),
+            skill.skill_md.clone(),
+            skill.install_name.clone(),
+        )
+    };
+    let overwrite = skills_root()
+        .map(|root| root.join(&name).exists())
+        .unwrap_or(false);
+
+    let suggestion = Suggestion {
+        id: uuid::Uuid::new_v4().to_string(),
+        kind: SuggestionKind::SkillImport,
+        key: format!("skill-import:{name}"),
+        source: format!("import:{name}"),
+        headline: format!(
+            "{} the skill \u{201c}{name}\u{201d}?",
+            if overwrite { "Update" } else { "Install" }
+        ),
+        body: skill_md.clone(),
+        thread_id: None,
+    };
+    record_import_event(ic_widget::ambient::log::LogEvent::Surfaced {
+        id: suggestion.id.clone(),
+        key: suggestion.key.clone(),
+        source: suggestion.source.clone(),
+        headline: suggestion.headline.clone(),
+    });
+    *state.pending_import.lock().await = Some(PendingImport {
+        id: suggestion.id.clone(),
+        folder: Some(folder),
+        name,
+        skill_md,
+        overwrite,
+    });
+    let _ = app.emit("ambient://suggestion", &suggestion);
+    update_character(&app, |inputs| inputs.suggestion_pending = true).await;
+    Ok(())
+}
+
+/// What a "study this repo" run produced.
+#[derive(Serialize)]
+struct StudyResult {
+    /// The repo slug studied.
+    slug: String,
+    /// The files the model was actually shown, so the user can judge the draft
+    /// by what informed it. A study that read three files is a study worth
+    /// distrusting, and hiding that would be the dishonest part.
+    files_read: Vec<String>,
+    /// Files left unread by the caps.
+    skipped: usize,
+    /// The repo's tool surface, as observed from its manifests. Descriptive: the
+    /// widget cannot register an arbitrary repo as a connector, so this names
+    /// what a user could wire up themselves in the Connectors panel.
+    tool_surface: Vec<String>,
+    /// The drafted skill's name, when the study produced one.
+    drafted: Option<String>,
+    /// Why no draft, when there is none.
+    note: Option<String>,
+}
+
+/// Study a git repo and, if it teaches a procedure, draft a skill from it (8e).
+///
+/// The clone is the same guarded one the skill import uses; the reading list is
+/// **bounded** (a dozen files, README and manifests first) because a small local
+/// model cannot read a repository — the Phase 7b model-quality hint applies and
+/// the panel surfaces it. The turn runs on its own fresh thread, not the ambient
+/// thread and not the user's chat: a study is *solicited*, so it must work with
+/// ambient off and must never spend a guardrail slot.
+///
+/// Nothing installs here. A draft lands on the bubble as the same red consent
+/// card as every other skill, and only a yes writes it.
+#[tauri::command]
+async fn study_repo(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    url: String,
+) -> Result<StudyResult, String> {
+    let url = url.trim().to_string();
+    if url.is_empty() {
+        return Err("enter a git repository URL".to_string());
+    }
+    let client = state.client().await?;
+
+    let temp =
+        tempfile::tempdir().map_err(|error| format!("could not create a temp dir: {error}"))?;
+    let study = ic_widget::git_import::clone_and_study(
+        url,
+        temp.path().join("clone"),
+        ic_widget::git_import::MAX_REPO_BYTES,
+        ic_widget::git_import::CLONE_TIMEOUT,
+    )
+    .await?;
+    let files_read: Vec<String> = study
+        .files
+        .iter()
+        .map(|file| file.rel_path.clone())
+        .collect();
+    let mut result = StudyResult {
+        slug: study.slug.clone(),
+        files_read,
+        skipped: study.skipped,
+        tool_surface: study.tool_surface.clone(),
+        drafted: None,
+        note: None,
+    };
+
+    // A fresh thread per study: its transcript is exactly this repo's reading,
+    // so an accepted draft can be traced to what produced it.
+    let thread_id = client
+        .create_thread()
+        .await
+        .map_err(|error| format!("could not open a thread for the study: {error}"))?;
+    let prompt = ic_widget::git_import::study_prompt(&study);
+    let reply = match ic_widget::voice::drive_turn(&client, &thread_id, &prompt).await {
+        ic_widget::voice::TurnResult::Reply(text) => text,
+        _ => {
+            result.note = Some("the agent did not answer the study".to_string());
+            return Ok(result);
+        }
+    };
+
+    let Some(draft) = ic_widget::ambient::reflection::parse_draft(&reply) else {
+        result.note =
+            Some("the agent found no reusable procedure in this repo to keep as a skill".into());
+        return Ok(result);
+    };
+
+    let overwrite = skills_root()
+        .map(|root| root.join(&draft.name).exists())
+        .unwrap_or(false);
+    let suggestion = Suggestion {
+        id: uuid::Uuid::new_v4().to_string(),
+        kind: SuggestionKind::SkillImport,
+        key: format!("skill-import:{}", draft.name),
+        source: format!("study:{}", draft.name),
+        headline: format!(
+            "{} \u{201c}{}\u{201d}, learned from {}?",
+            if overwrite { "Update" } else { "Install" },
+            draft.name,
+            study.slug
+        ),
+        body: draft.content.clone(),
+        thread_id: None,
+    };
+    record_import_event(ic_widget::ambient::log::LogEvent::Surfaced {
+        id: suggestion.id.clone(),
+        key: suggestion.key.clone(),
+        source: suggestion.source.clone(),
+        headline: suggestion.headline.clone(),
+    });
+    *state.pending_import.lock().await = Some(PendingImport {
+        id: suggestion.id.clone(),
+        folder: None,
+        name: draft.name.clone(),
+        skill_md: draft.content,
+        overwrite,
+    });
+    let _ = app.emit("ambient://suggestion", &suggestion);
+    update_character(&app, |inputs| inputs.suggestion_pending = true).await;
+    result.drafted = Some(draft.name);
+    Ok(result)
 }
 
 /// Answer a suggestion: Accept, or Not now.
@@ -3324,8 +3631,21 @@ async fn respond_suggestion(
 
             // The approved text installs verbatim — the folder is only re-read
             // for its bundle files, never for the SKILL.md the user consented to.
+            // A git re-sync (overwrite) removes the same-named installed skill
+            // first, so the update is applied rather than refused as a duplicate.
             let result = skills_root().and_then(|root| {
-                ic_widget::skill_import::install(&import.folder, &import.skill_md, &root)
+                if import.overwrite {
+                    let _ = ic_widget::skills::remove(&root, &import.name);
+                }
+                match &import.folder {
+                    Some(folder) => {
+                        ic_widget::skill_import::install(folder, &import.skill_md, &root)
+                    }
+                    // A studied repo left no folder behind — the reviewed text is
+                    // the whole skill, written by the same validated file write
+                    // the 7b draft path uses.
+                    None => ic_widget::ambient::reflection::install(&root, &import.skill_md),
+                }
             });
             let installed = match result {
                 Ok(name) => {
@@ -4444,6 +4764,9 @@ fn main() {
             set_cloud_fallback,
             preview_skill_import,
             request_skill_import,
+            preview_repo_skills,
+            request_repo_skill,
+            study_repo,
             list_installed_skills,
             remove_installed_skill,
             watchers_status,
@@ -4510,6 +4833,7 @@ fn main() {
                 ambient_thread: Mutex::new(None),
                 reflection_runs: Mutex::new(RunWatch::new()),
                 pending_import: Mutex::new(None),
+                repo_clone: Mutex::new(None),
                 watcher_task: Mutex::new(None),
             });
 

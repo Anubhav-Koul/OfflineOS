@@ -99,6 +99,22 @@ tracing-subscriber = { version = "0.3", features = [
     "env-filter",
 ], optional = true }
 notify = "8.2.0"
+# The frontmatter of an *imported* SKILL.md is real YAML, and the runtime parses
+# it with this exact crate (`ironclaw_skills/src/parser.rs`). A hand-rolled line
+# scanner refuses skills the runtime accepts — block scalars (`description: |-`)
+# above all — so the import path uses the same parser rather than a lookalike.
+# Pinned by `skill_parser_agreement.rs`, which feeds both the real thing.
+serde_yml = "0.0.12"
+# A temp directory for the cloned skills repo (Phase 8e), held in app state until
+# an install copies from it. Also a dev-dependency for tests.
+tempfile = "3"
+# Cloning a git repo of skills (Phase 8e). Pure-Rust (no `git.exe` on the user's
+# machine, no C toolchain) with the rustls HTTP transport, matching `reqwest`
+# above. Used only for a depth-1, no-submodule shallow clone into a temp dir.
+gix = { version = "0.73", default-features = false, features = [
+    "blocking-http-transport-reqwest-rust-tls",
+    "worktree-mutation",
+] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
@@ -116,7 +132,6 @@ windows = { version = "0.62", features = [
 
 [dev-dependencies]
 ic_integration_tests = { path = "../ic_integration_tests" }
-tempfile = "3"
 # Drive the OAuth callback router without a socket (Phase 8b.1), the same way
 # the canvas/browser MCP tests drive theirs.
 tower = { version = "0.5", features = ["util"] }

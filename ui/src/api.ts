@@ -468,6 +468,58 @@ export interface InstalledSkill {
   bytes: number;
 }
 
+/** One line of a skill diff shown on a git re-import (Phase 8e). */
+export type DiffLine =
+  | { tag: "context"; text: string }
+  | { tag: "added"; text: string }
+  | { tag: "removed"; text: string };
+
+/** One skill found in a cloned git repo, for review (Phase 8e). */
+export interface RepoSkillReview {
+  name: string;
+  install_name: string;
+  description: string;
+  rel_dir: string;
+  skill_md: string;
+  files: ImportFile[];
+  /** Hidden-character warnings (zero-width / bidi), if any. */
+  warnings: string[];
+  /** Whether this namespaced skill is already installed (an update). */
+  installed: boolean;
+  /** When updating, the line diff installed → incoming. */
+  diff: DiffLine[] | null;
+}
+
+/** A SKILL.md folder the repo ships that cannot be imported (Phase 8e). */
+export interface RejectedSkill {
+  rel_dir: string;
+  reason: string;
+}
+
+/** The skills a cloned repo offers (Phase 8e). */
+export interface RepoPreview {
+  slug: string;
+  url: string;
+  skills: RepoSkillReview[];
+  /** Folders that were found but cannot be imported, with reasons. */
+  rejected: RejectedSkill[];
+}
+
+/** What a "study this repo" run produced (Phase 8e). */
+export interface StudyResult {
+  slug: string;
+  /** The files the model was actually shown — judge the draft by what fed it. */
+  files_read: string[];
+  /** Files the caps left unread. */
+  skipped: number;
+  /** The repo's tool surface, as observed from its manifests. */
+  tool_surface: string[];
+  /** The drafted skill's name, when the study produced one. */
+  drafted: string | null;
+  /** Why there is no draft, when there is none. */
+  note: string | null;
+}
+
 /** What one watcher rule fires on (Phase 7d). */
 export type WatchTrigger =
   | { type: "foreground_app"; title_contains: string }
@@ -657,6 +709,18 @@ export const api = {
    *  happens there, and only a yes installs. */
   requestSkillImport: (path: string) =>
     invoke<void>("request_skill_import", { path }),
+  /** Clone a git repo of skills and return each for review (Phase 8e). Pure —
+   *  nothing installs; the clone is kept alive for a later approved install. */
+  previewRepoSkills: (url: string) =>
+    invoke<RepoPreview>("preview_repo_skills", { url }),
+  /** Put one reviewed repo skill on the bubble as a consent card. The final
+   *  yes/no happens there, and only a yes installs. */
+  requestRepoSkill: (installName: string) =>
+    invoke<void>("request_repo_skill", { installName }),
+  /** Clone a repo, read a bounded set of its files, and ask the agent to draft a
+   *  skill from what it teaches (Phase 8e). A draft lands on the bubble as a
+   *  consent card; nothing installs without a yes. */
+  studyRepo: (url: string) => invoke<StudyResult>("study_repo", { url }),
   /** List the user's installed skills (Phase 8c). Reads the widget-owned skills
    *  directory on disk — no gateway route, no LLM turn. */
   listInstalledSkills: () =>

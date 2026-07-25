@@ -28,6 +28,11 @@ pub enum CharacterState {
     /// A run is in flight. Because there is no token streaming, this holds until
     /// the reply is fetched — see `docs/desktop/chat-rendering.md`.
     Thinking,
+    /// A run is in flight **and it handed the work to a subagent** (Phase 8g).
+    /// Distinct from `Thinking` because it is a different kind of waiting: the
+    /// agent is not working on the answer, something it spawned is — and a wait
+    /// with a reason reads very differently from a wait without one.
+    Delegating,
     /// Rendering a reply (and speaking it, once TTS lands in Phase 5).
     Speaking,
     /// Offering something nobody asked for: an ambient suggestion is on screen,
@@ -79,6 +84,14 @@ pub struct CharacterInputs {
     /// without this the character would look like it was still thinking about a
     /// question it has quietly stopped answering.
     pub auth_gate_pending: bool,
+    /// The in-flight run has spawned a subagent that has not finished (8g).
+    ///
+    /// Its own input for the same reason `auth_gate_pending` is: the projection's
+    /// run status says only `running`, and the `capability_progress` SSE variant
+    /// that would have carried this **never fires** under our profile (8g's
+    /// VERIFY, the same dormancy 8d found on `gate`). It is read from the
+    /// timeline instead, which is where the runtime does record it.
+    pub subagent_running: bool,
 }
 
 impl Default for CharacterInputs {
@@ -95,6 +108,7 @@ impl Default for CharacterInputs {
             browser_approval_pending: false,
             suggestion_pending: false,
             auth_gate_pending: false,
+            subagent_running: false,
         }
     }
 }
@@ -140,7 +154,13 @@ pub fn derive(inputs: &CharacterInputs) -> CharacterState {
         // deliberately non-terminal, so an unknown status keeps the character
         // thinking rather than snapping to idle mid-turn.
         if !run.is_terminal() {
-            return CharacterState::Thinking;
+            // Same wait, better answer: when the run has handed the work to a
+            // subagent, say so rather than showing generic progress (8g).
+            return if inputs.subagent_running {
+                CharacterState::Delegating
+            } else {
+                CharacterState::Thinking
+            };
         }
     }
     // A voice turn's run rides voice's own thread, so it never reaches `run`;
@@ -307,6 +327,32 @@ mod tests {
             ..base.clone()
         };
         assert_eq!(derive(&working), CharacterState::Thinking);
+
+        // Delegating is the same wait with a better answer (8g): a run that has
+        // spawned a subagent says so instead of showing generic progress.
+        let delegating = CharacterInputs {
+            run: Some(RunPhase::Running),
+            subagent_running: true,
+            ..base.clone()
+        };
+        assert_eq!(derive(&delegating), CharacterState::Delegating);
+
+        // It is still work, so a gate outranks it and a finished run clears it.
+        let gated_delegation = CharacterInputs {
+            browser_approval_pending: true,
+            ..delegating.clone()
+        };
+        assert_eq!(derive(&gated_delegation), CharacterState::Concerned);
+        let done = CharacterInputs {
+            run: Some(RunPhase::Completed),
+            subagent_running: true,
+            ..base.clone()
+        };
+        assert_ne!(
+            derive(&done),
+            CharacterState::Delegating,
+            "a terminal run is not delegating, whatever the stale flag says"
+        );
 
         // And a gate still outranks it — that one is blocking.
         let gated = CharacterInputs {

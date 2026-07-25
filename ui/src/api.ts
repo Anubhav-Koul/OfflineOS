@@ -273,6 +273,8 @@ export type CharacterState =
   | "idle"
   | "listening"
   | "thinking"
+  /** A run is in flight and has handed the work to a subagent (Phase 8g). */
+  | "delegating"
   | "speaking"
   | "suggesting"
   | "concerned"
@@ -556,6 +558,28 @@ export interface StudyResult {
   note: string | null;
 }
 
+/**
+ * What the user must be told before seeding memory (Phase 8g).
+ *
+ * Computed on the backend from the provider settings, so a form cannot render
+ * without them and cannot get the cloud answer wrong. `cloud_note` is null only
+ * when nothing leaves the machine — the local model with no failover.
+ */
+export interface SeedDisclosures {
+  permanent: boolean;
+  permanence_note: string;
+  /** The cloud provider(s) this text would reach. Empty means none. */
+  cloud_readers: string[];
+  cloud_note: string | null;
+  max_bytes: number;
+}
+
+/** What a seed attempt actually did, judged from the timeline (Phase 8g). */
+export type SeedOutcome =
+  | { outcome: "stored"; path: string | null }
+  | { outcome: "tool_failed"; detail: string }
+  | { outcome: "not_attempted" };
+
 /** What one watcher rule fires on (Phase 7d). */
 export type WatchTrigger =
   | { type: "foreground_app"; title_contains: string }
@@ -753,6 +777,15 @@ export const api = {
    *  yes/no happens there, and only a yes installs. */
   requestRepoSkill: (installName: string) =>
     invoke<void>("request_repo_skill", { installName }),
+  /** What the user must be told before seeding memory (Phase 8g). Computed from
+   *  provider settings so the form cannot render without the disclosures. */
+  seedDisclosures: () => invoke<SeedDisclosures>("seed_disclosures"),
+  /** Seed agent memory with the user's own text. Runs on its own thread, and the
+   *  verdict comes from the timeline — never from what the model says. */
+  seedMemory: (text: string) => invoke<SeedOutcome>("seed_memory", { text }),
+  /** Read a notes file for seeding, capped. Returns the text for review — an
+   *  import must be seen and agreed to before it becomes permanent memory. */
+  readSeedFile: (path: string) => invoke<string>("read_seed_file", { path }),
   /** Clone a repo, read a bounded set of its files, and ask the agent to draft a
    *  skill from what it teaches (Phase 8e). A draft lands on the bubble as a
    *  consent card; nothing installs without a yes. */

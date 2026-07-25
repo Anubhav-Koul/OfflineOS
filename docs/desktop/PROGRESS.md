@@ -17,6 +17,89 @@ newest entry at the top (right after this header) — not to `CLAUDE.md`.
 
 ---
 
+## Phase 8g notes — memory seeding, and a subagent you can see (recorded 2026-07-26)
+
+`crates/ic_widget` (new `memory_seed.rs`; `gateway_client/mod.rs`, `character.rs`,
+`main.rs`, `lib.rs`) + `ui/` (`dashboard.tsx`, `api.ts`, `character.ts`) + a new
+canary (`ic_integration_tests/tests/memory_and_subagent_verify.rs`). **No core
+patch, no new dependency.** Verified against the pinned upstream commit
+**`a492857`**. This closes Phase 8.
+
+### VERIFY 1 — the seed contract, which is not what the plan called it
+
+8c had already corrected the plan once: `memory_import` / `memory_seed` are not
+agent tools. Driving a real gateway settled the rest:
+
+- **`builtin.memory_write` with `target: "memory"` is the seed.** It writes
+  `MEMORY.md` and the run completes.
+- **It persists across conversations** — the property that makes a seed a seed.
+  A *different thread* read it back with `builtin.memory_read` and got the
+  seeded sentence. The canary asserts exactly that, from a second thread.
+- **`builtin.memory_search` fails** here (`dispatch failed: OperationFailed` —
+  the semantic index wants an embeddings provider we do not configure). So the
+  panel promises storage and readability, never search. The canary asserts the
+  failure, so the day it starts working we find out and can promise more.
+
+**Seeding goes through the agent, not the disk.** `MEMORY.md` is a path inside
+the gateway's private libSQL root filesystem — the same store
+`dashboard-gaps.md` refuses to read directly, for the same reason. So a seed is
+a turn on its own fresh thread (solicited, like a 7c import: works with ambient
+off, never spends a guardrail slot).
+
+**The verdict comes from the timeline, never the reply.** A model that says
+"I'll remember that" without calling the tool has stored nothing, and on a small
+local model that is the *likely* outcome. `SeedOutcome` has three arms —
+`Stored`, `ToolFailed`, `NotAttempted` — and the panel says plainly which
+happened rather than congratulating the user for a write that never occurred.
+
+**Both disclosures are computed on the backend** so the form cannot render
+without them: permanence (the never-delete invariant — there is no unsend) and
+cloud exposure. The cloud one counts the **failover** provider, not just the
+active one, because a local-only setup that hands over mid-answer still sends
+the prompt with the memory in it — the case nobody thinks of. An import is
+loaded into the box *for review* rather than seeded from disk: it is the input
+most likely to be too long and least likely to have been re-read. Cap: 8 KiB,
+the same reasoning as 8e's context-cost line.
+
+### VERIFY 2 — the subagent is invisible on the wire, and visible in the timeline
+
+The spec guessed `capability_progress`. The variant exists in `WebChatV2Event`
+— and **never fires**, exactly like the `gate` event 8d found dormant. Across
+three live runs the stream carried only `projection_snapshot` /
+`projection_update` with `run_status`, with no mention of the subagent, in a run
+where the child demonstrably executed and completed.
+
+What *does* exist is a `capability_display_preview` **timeline message** whose
+`content` is a JSON record: `capability_id: "builtin.spawn_subagent"`, a status,
+and an `output_preview` carrying `child_run_id`, `child_thread_id`, and
+`flavor`. So the character reads the timeline — the same place it already reads
+assistant replies from, for the same reason (`chat-rendering.md`).
+
+New `CharacterState::Delegating` ("my assistant is on it"), derived from a
+`subagent_running` input that is its own field for the same reason
+`auth_gate_pending` is: the projection's run status says only `running`. Only
+the **most recent** spawn decides, so a thread that delegated an hour ago is not
+delegating now — otherwise the treatment would stick for the rest of the
+session. A terminal run clears it regardless.
+
+**One honest caveat, recorded rather than hidden:** under the mock LLM the
+*parent* turn ends in `driver_protocol_violation` after the child completes —
+the parent never receives its continuation call. The child itself completes
+correctly and the capability record is written while it runs, so the finding
+above does not rest on it, but it is reproducible and is noted in the canary.
+Whether the cause is the runtime or an interaction with the mock harness is not
+established.
+
+### Gate
+
+fmt ✅, clippy `-D warnings` ✅ (`ic_widget --lib --tests`, `ic_integration_tests
+--all-targets --features webui-v2-beta`), `cargo test -p ic_widget --lib` **256
+pass** (up from 237), both new canaries green against a real `serve`, frontend
+`tsc --noEmit` + build clean.
+
+**Phase 8 is complete** on every item its definition of done lists except the
+one that cannot be automated: the manual smoke run on Windows.
+
 ## Phase 8f notes — channels: the premise that did not survive VERIFY (recorded 2026-07-26)
 
 `crates/ic_integration_tests` (new `tests/channels_verify.rs`, `Cargo.toml`) +

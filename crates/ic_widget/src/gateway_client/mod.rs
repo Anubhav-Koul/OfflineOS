@@ -1092,6 +1092,34 @@ impl Timeline {
             .rev()
             .find(|message| message.kind == MessageKind::Assistant && message.content.is_some())
     }
+
+    /// Every capability invocation in the thread, oldest first.
+    ///
+    /// A record whose JSON we cannot parse is skipped rather than failing the
+    /// read: this drives display, and one unreadable blob must not blank the
+    /// whole timeline. // silent-ok: display-only projection, next poll retries
+    pub fn capability_activities(&self) -> Vec<TimelineCapability> {
+        self.messages
+            .iter()
+            .filter(|message| message.kind == MessageKind::CapabilityDisplayPreview)
+            .filter_map(|message| message.content.as_deref())
+            .filter_map(|content| serde_json::from_str::<TimelineCapability>(content).ok())
+            .collect()
+    }
+
+    /// Whether a subagent is running right now: the thread's most recent
+    /// `spawn_subagent` invocation exists and has not reached a terminal status.
+    ///
+    /// The *most recent* one, not any of them — a thread that delegated an hour
+    /// ago is not delegating now, and "my assistant is on it" must not stick to
+    /// the character for the rest of the session.
+    pub fn subagent_in_flight(&self) -> bool {
+        self.capability_activities()
+            .iter()
+            .rev()
+            .find(|activity| activity.capability_id == SPAWN_SUBAGENT_CAPABILITY)
+            .is_some_and(|activity| !activity.is_terminal())
+    }
 }
 
 /// `ThreadMessageRecord`, trimmed. Render `content` — never the provider side
@@ -1121,10 +1149,52 @@ pub enum MessageKind {
     System,
     /// A rollup of older messages.
     Summary,
+    /// A tool invocation and its result, as a JSON blob in `content`. **This is
+    /// the only place capability activity reaches us** — 8g's VERIFY found that
+    /// the `capability_progress` / `capability_activity` SSE variants exist in
+    /// the wire schema but never fire under our profile, exactly like the `gate`
+    /// event 8d found dormant. The timeline carries the real thing.
+    CapabilityDisplayPreview,
+    /// A tool result carried by reference; `content` is a `safe_summary` blob.
+    ToolResultReference,
     /// A kind this build does not know.
     #[serde(other)]
     Other,
 }
+
+/// One capability invocation, parsed out of a [`MessageKind::CapabilityDisplayPreview`]
+/// timeline message.
+///
+/// Distinct from [`CapabilityActivity`], the SSE event of nearly the same shape:
+/// that one is what the wire *would* carry, and 8g's VERIFY found it never fires
+/// under our profile. This is the record that actually exists.
+///
+/// Only the fields we act on. The record carries more (`invocation_id`,
+/// `result_ref`, byte counts); adding a field here is cheap, and reading one we
+/// don't use is noise.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TimelineCapability {
+    /// e.g. `builtin.memory_write`, `builtin.spawn_subagent`.
+    pub capability_id: String,
+    /// `completed`, `failed`, `running`.
+    pub status: String,
+    /// The tool's display title, when it has one.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// A truncated rendering of the tool's output.
+    #[serde(default)]
+    pub output_preview: Option<String>,
+}
+
+impl TimelineCapability {
+    /// Whether this invocation has stopped, either way.
+    pub fn is_terminal(&self) -> bool {
+        self.status.eq_ignore_ascii_case("completed") || self.status.eq_ignore_ascii_case("failed")
+    }
+}
+
+/// The capability id a spawned subagent reports under.
+pub const SPAWN_SUBAGENT_CAPABILITY: &str = "builtin.spawn_subagent";
 
 /// The capability ids `GET /extensions` reports for one extension.
 ///
@@ -1182,6 +1252,115 @@ fn capability_ids_of(response: &serde_json::Value, id: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The exact timeline shape the running gateway returns for a delegating
+    /// run, captured from `memory_and_subagent_verify.rs`. The capability record
+    /// arrives as a `capability_display_preview` message whose `content` is a
+    /// JSON string — not as a typed field, and not on the event stream at all.
+    fn timeline_with(kind: &str, content: serde_json::Value) -> Timeline {
+        serde_json::from_value(serde_json::json!({
+            "messages": [
+                { "sequence": 1, "kind": "user", "status": "finalized", "content": "go" },
+                { "sequence": 2, "kind": kind, "status": "finalized",
+                  "content": content.to_string() },
+            ]
+        }))
+        .expect("timeline")
+    }
+
+    #[test]
+    fn a_capability_record_is_read_out_of_the_timeline_message_it_hides_in() {
+        let timeline = timeline_with(
+            "capability_display_preview",
+            serde_json::json!({
+                "capability_id": "builtin.memory_write",
+                "status": "completed",
+                "title": "memory_write",
+                "output_preview": "{\"path\": \"MEMORY.md\"}",
+            }),
+        );
+        let activities = timeline.capability_activities();
+        assert_eq!(activities.len(), 1);
+        assert_eq!(activities[0].capability_id, "builtin.memory_write");
+        assert!(activities[0].is_terminal());
+    }
+
+    #[test]
+    fn a_running_subagent_is_in_flight_and_a_finished_one_is_not() {
+        let running = timeline_with(
+            "capability_display_preview",
+            serde_json::json!({
+                "capability_id": SPAWN_SUBAGENT_CAPABILITY,
+                "status": "running",
+            }),
+        );
+        assert!(running.subagent_in_flight());
+
+        let finished = timeline_with(
+            "capability_display_preview",
+            serde_json::json!({
+                "capability_id": SPAWN_SUBAGENT_CAPABILITY,
+                "status": "completed",
+            }),
+        );
+        assert!(
+            !finished.subagent_in_flight(),
+            "a thread that delegated earlier is not delegating now"
+        );
+    }
+
+    /// Only the *most recent* spawn decides. Otherwise one completed delegation
+    /// early in a long thread would keep the character on "my assistant is on
+    /// it" for the rest of the session.
+    #[test]
+    fn the_latest_spawn_decides_not_any_of_them() {
+        let mut timeline = timeline_with(
+            "capability_display_preview",
+            serde_json::json!({ "capability_id": SPAWN_SUBAGENT_CAPABILITY, "status": "running" }),
+        );
+        timeline.messages.push(Message {
+            sequence: 3,
+            kind: MessageKind::CapabilityDisplayPreview,
+            status: "finalized".to_string(),
+            content: Some(
+                serde_json::json!({
+                    "capability_id": SPAWN_SUBAGENT_CAPABILITY,
+                    "status": "completed",
+                })
+                .to_string(),
+            ),
+        });
+        assert!(!timeline.subagent_in_flight());
+    }
+
+    #[test]
+    fn an_unreadable_capability_record_is_skipped_not_fatal() {
+        let mut timeline = timeline_with(
+            "capability_display_preview",
+            serde_json::json!({ "capability_id": "builtin.memory_write", "status": "completed" }),
+        );
+        timeline.messages.push(Message {
+            sequence: 3,
+            kind: MessageKind::CapabilityDisplayPreview,
+            status: "finalized".to_string(),
+            content: Some("not json at all".to_string()),
+        });
+        assert_eq!(
+            timeline.capability_activities().len(),
+            1,
+            "one bad blob must not blank the whole timeline"
+        );
+    }
+
+    #[test]
+    fn other_message_kinds_carry_no_capability_activity() {
+        let timeline = timeline_with(
+            "tool_result_reference",
+            serde_json::json!({ "capability_id": SPAWN_SUBAGENT_CAPABILITY, "status": "running" }),
+        );
+        assert!(timeline.capability_activities().is_empty());
+        assert!(!timeline.subagent_in_flight());
+    }
 
     /// The exact body the running gateway returns. This is the regression: the
     /// six tools were live on the agent and the widget reported `found=0`.

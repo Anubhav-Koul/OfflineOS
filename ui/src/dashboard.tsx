@@ -1,6 +1,15 @@
 /* @refresh reload */
 import { render } from "solid-js/web";
-import { createEffect, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import {
+  createEffect,
+  createSignal,
+  For,
+  Match,
+  onCleanup,
+  onMount,
+  Show,
+  Switch,
+} from "solid-js";
 
 import {
   api,
@@ -18,6 +27,8 @@ import {
   type InertLane,
   type InstalledSkill,
   type RepoPreview,
+  type SeedDisclosures,
+  type SeedOutcome,
   type RepoSkillReview,
   type StudyResult,
   type WatchRule,
@@ -3393,6 +3404,176 @@ function StudyRepoPanel() {
   );
 }
 
+
+/**
+ * Seed the agent's memory (Phase 8g).
+ *
+ * Two disclosures are mandatory and both are computed on the backend so this
+ * form cannot render without them: seeded memory is **permanent** (the
+ * never-delete invariant — there is no unsend), and if a cloud provider is
+ * active *or configured as the local model's failover*, the text reaches that
+ * provider inside future prompts. The failover case is the one people forget.
+ *
+ * The verdict comes from the timeline, not the reply: a model that says "I'll
+ * remember that" without calling `memory_write` has stored nothing, and this
+ * panel says so rather than congratulating the user.
+ *
+ * What it deliberately does not promise is search. 8g's VERIFY found
+ * `memory_search` fails under this profile (no embeddings provider); what is
+ * guaranteed is that the text is stored and readable.
+ */
+function MemorySeedPanel() {
+  const [text, setText] = createSignal("");
+  const [filePath, setFilePath] = createSignal("");
+  const [disclosures, setDisclosures] = createSignal<SeedDisclosures | null>(null);
+  const [outcome, setOutcome] = createSignal<SeedOutcome | null>(null);
+  const [error, setError] = createSignal<string | null>(null);
+  const [busy, setBusy] = createSignal(false);
+  const [acknowledged, setAcknowledged] = createSignal(false);
+
+  onMount(() => {
+    void (async () => {
+      try {
+        setDisclosures(await api.seedDisclosures());
+      } catch (problem) {
+        setError(String(problem));
+      }
+    })();
+  });
+
+  const bytes = () => new TextEncoder().encode(text().trim()).length;
+  const overCap = () => {
+    const cap = disclosures()?.max_bytes ?? 0;
+    return cap > 0 && bytes() > cap;
+  };
+
+  const importFile = async () => {
+    setError(null);
+    try {
+      // Loaded into the box for review — never seeded straight from disk. An
+      // import is the input most likely to be too long and least likely to have
+      // been re-read.
+      setText(await api.readSeedFile(filePath().trim()));
+    } catch (problem) {
+      setError(String(problem));
+    }
+  };
+
+  const seed = async () => {
+    setError(null);
+    setOutcome(null);
+    setBusy(true);
+    try {
+      setOutcome(await api.seedMemory(text()));
+    } catch (problem) {
+      setError(String(problem));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section>
+      <h2>Tell the agent about yourself</h2>
+      <p class="muted small">
+        Anything here is written into the agent's persistent memory and is
+        available in every future conversation — not just this one.
+      </p>
+      <Show when={disclosures()}>
+        {(shown) => (
+          <>
+            <p class="skill-fact">{shown().permanence_note}</p>
+            <Show when={shown().cloud_note}>
+              {(note) => <p class="skill-fact">{note()}</p>}
+            </Show>
+            <Show when={!shown().cloud_note}>
+              <p class="muted small">
+                Your local model is the only reader — nothing here leaves this
+                machine while that stays true.
+              </p>
+            </Show>
+            <textarea
+              rows="6"
+              placeholder="I'm a nurse in Leeds. I prefer short answers. My partner's name is Sam."
+              value={text()}
+              onInput={(event) => setText(event.currentTarget.value)}
+            />
+            <p class="muted small">
+              {bytes()} / {shown().max_bytes} bytes
+              {overCap() ? " — too long to seed" : ""}
+            </p>
+            <div class="row">
+              <input
+                type="text"
+                placeholder="…or import a notes file: C:\path\to\notes.md"
+                value={filePath()}
+                onInput={(event) => setFilePath(event.currentTarget.value)}
+              />
+              <button
+                onClick={() => void importFile()}
+                disabled={!filePath().trim()}
+              >
+                Load for review
+              </button>
+            </div>
+            <label class="row">
+              <input
+                type="checkbox"
+                checked={acknowledged()}
+                onChange={(event) => setAcknowledged(event.currentTarget.checked)}
+              />
+              <span class="muted small">
+                I understand this is permanent
+                {shown().cloud_readers.length > 0
+                  ? ` and that ${shown().cloud_readers.join(" and ")} will see it`
+                  : ""}
+                .
+              </span>
+            </label>
+            <button
+              onClick={() => void seed()}
+              disabled={busy() || !acknowledged() || !text().trim() || overCap()}
+            >
+              {busy() ? "Storing…" : "Remember this"}
+            </button>
+          </>
+        )}
+      </Show>
+      <Show when={outcome()}>
+        {(result) => (
+          <Switch>
+            <Match when={result().outcome === "stored"}>
+              <p class="muted small">
+                Stored in the agent's memory
+                {(result() as { path: string | null }).path
+                  ? ` (${(result() as { path: string | null }).path})`
+                  : ""}
+                . It will be there in your next conversation.
+              </p>
+            </Match>
+            <Match when={result().outcome === "tool_failed"}>
+              <p class="error">
+                The agent tried to store it and the write failed (
+                {(result() as { detail: string }).detail}). Nothing was saved.
+              </p>
+            </Match>
+            <Match when={result().outcome === "not_attempted"}>
+              <p class="error">
+                The agent answered without actually writing anything to memory,
+                so nothing was stored. Small local models often do this — try a
+                stronger model, or say it more plainly.
+              </p>
+            </Match>
+          </Switch>
+        )}
+      </Show>
+      <Show when={error()}>
+        <p class="error">{error()}</p>
+      </Show>
+    </section>
+  );
+}
+
 /** Human-readable byte size for a skill's footprint. */
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -3628,6 +3809,7 @@ function Dashboard() {
 
         <Show when={section() === "settings"}>
           <ProfilePanel />
+          <MemorySeedPanel />
         </Show>
 
         <Show when={section() === "voice"}>

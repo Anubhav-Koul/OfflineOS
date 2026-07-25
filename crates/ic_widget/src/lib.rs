@@ -32,6 +32,7 @@ pub mod gateway_client;
 pub mod git_import;
 pub mod hit_test;
 pub mod job_object;
+pub mod memory_seed;
 pub mod model_catalog;
 pub mod oauth_callback;
 pub mod persona;

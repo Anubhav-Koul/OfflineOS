@@ -1839,6 +1839,25 @@ async fn pump_events(app: AppHandle, client: GatewayClient, thread_id: ThreadId)
                         update_character(&app, |inputs| inputs.run = Some(status.status.clone()))
                             .await;
 
+                        // Is the run delegating? The `capability_progress` SSE
+                        // variant that would say so never fires under our profile
+                        // (8g's VERIFY, the same dormancy 8d found on `gate`), so
+                        // ask the timeline, which does record it. Only while a run
+                        // is actually in flight — a terminal run clears the flag
+                        // rather than leaving "my assistant is on it" on the
+                        // character for the rest of the session.
+                        let delegating = if status.status.is_terminal() {
+                            false
+                        } else {
+                            client
+                                .timeline(&thread_id, None)
+                                .await
+                                .map(|timeline| timeline.subagent_in_flight())
+                                // silent-ok: display only; the next status tick retries
+                                .unwrap_or(false)
+                        };
+                        update_character(&app, |inputs| inputs.subagent_running = delegating).await;
+
                         // A user-initiated run just finished — maybe it taught
                         // something (Phase 7b). The watch fires once per run, only
                         // on an in-flight → completed edge, so the stream's
@@ -3248,6 +3267,108 @@ async fn list_installed_skills() -> Result<Vec<ic_widget::skills::InstalledSkill
 async fn remove_installed_skill(name: String) -> Result<(), String> {
     let root = skills_root()?;
     ic_widget::skills::remove(&root, &name)
+}
+
+// ------------------------------------------------------------ memory seeding
+
+/// What the user must be told before seeding, for the current providers (8g).
+///
+/// Computed on the backend, from settings, so the form cannot render without
+/// them and cannot get the cloud answer wrong. The failover provider counts:
+/// a local-only setup that hands over mid-answer still sends the prompt.
+#[tauri::command]
+async fn seed_disclosures(
+    state: tauri::State<'_, AppState>,
+) -> Result<ic_widget::memory_seed::SeedDisclosures, String> {
+    let settings = state.settings_store.load().map_err(user_facing)?;
+    let catalog = ic_widget::providers::api_key_providers().map_err(user_facing)?;
+    let display_name = |id: &str| {
+        catalog
+            .iter()
+            .find(|provider| provider.id == id)
+            .map(|provider| provider.display_name().to_string())
+            .unwrap_or_else(|| id.to_string())
+    };
+    let active_cloud = match &settings.active_provider {
+        ic_widget::settings::ProviderSelection::Cloud { id, .. } => Some(display_name(id)),
+        ic_widget::settings::ProviderSelection::Local => None,
+    };
+    let fallback_cloud = settings
+        .cloud_fallback
+        .as_ref()
+        .map(|fallback| display_name(fallback.id.as_str()));
+    Ok(ic_widget::memory_seed::disclosures(
+        active_cloud.as_deref(),
+        fallback_cloud.as_deref(),
+    ))
+}
+
+/// Seed agent memory with text the user wrote or imported (Phase 8g).
+///
+/// Runs on **its own fresh thread**, like a 7c import and an 8e study: seeding is
+/// *solicited*, so it must work with ambient off and must never spend a guardrail
+/// slot. Its transcript is exactly this seed, so what was stored can be traced to
+/// what asked for it.
+///
+/// The verdict comes from the **timeline**, never the reply: a model that says
+/// "I'll remember that" without calling `memory_write` has stored nothing, and
+/// that difference is the whole reason this returns an outcome rather than a
+/// success boolean.
+#[tauri::command]
+async fn seed_memory(
+    state: tauri::State<'_, AppState>,
+    text: String,
+) -> Result<ic_widget::memory_seed::SeedOutcome, String> {
+    let seed = ic_widget::memory_seed::validate(&text)?.to_string();
+    let client = state.client().await?;
+
+    let thread_id = client
+        .create_thread()
+        .await
+        .map_err(|error| format!("could not open a thread for the seed: {error}"))?;
+    let prompt = ic_widget::memory_seed::seed_prompt(&seed);
+    match ic_widget::voice::drive_turn(&client, &thread_id, &prompt).await {
+        ic_widget::voice::TurnResult::Reply(_) => {}
+        _ => return Err("the agent did not answer the seed request".to_string()),
+    }
+
+    let timeline = client
+        .timeline(&thread_id, None)
+        .await
+        .map_err(|error| format!("could not read back what was stored: {error}"))?;
+    let activities = timeline.capability_activities();
+    Ok(ic_widget::memory_seed::confirm(activities.iter().map(
+        |activity| {
+            (
+                activity.capability_id.as_str(),
+                activity.status.as_str(),
+                activity.output_preview.as_deref(),
+            )
+        },
+    )))
+}
+
+/// Read a notes file for seeding, enforcing the cap before anything is sent.
+///
+/// A separate command from [`seed_memory`] on purpose: the user must *see* the
+/// imported text, and agree to it, before it becomes permanent memory. An import
+/// that seeded directly would skip the disclosures for the one input most likely
+/// to be too long and least likely to have been re-read.
+#[tauri::command]
+async fn read_seed_file(path: String) -> Result<String, String> {
+    let path = std::path::PathBuf::from(path);
+    let metadata = std::fs::metadata(&path).map_err(|_| "no file at that path".to_string())?;
+    if metadata.len() as usize > ic_widget::memory_seed::MAX_SEED_BYTES {
+        return Err(format!(
+            "that file is {} KB; the cap for seeded memory is {} KB, because a \
+             seed is added to the prompt on every future turn",
+            metadata.len() / 1024,
+            ic_widget::memory_seed::MAX_SEED_BYTES / 1024
+        ));
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("could not read that file: {error}"))?;
+    ic_widget::memory_seed::validate(&text).map(str::to_string)
 }
 
 /// Read a skill folder and return everything the review needs. Pure — nothing
@@ -4776,6 +4897,9 @@ fn main() {
             preview_repo_skills,
             request_repo_skill,
             study_repo,
+            seed_disclosures,
+            seed_memory,
+            read_seed_file,
             list_installed_skills,
             remove_installed_skill,
             watchers_status,

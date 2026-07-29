@@ -158,6 +158,7 @@ One line per subsystem — full detail and *why* in `docs/desktop/PROGRESS.md`.
 - `docs/desktop/llm-provider-selection.md` — the cloud-failover design (now built).
 - `docs/desktop/approval-gates.md` — why there's no universal tool-approval consent UI.
 - `docs/desktop/channels.md` — why Telegram isn't connected (8f), and the pairing design kept on file for the day it can be.
+- `docs/desktop/ci-workflows.md` — which CI runs on the public repo, and why twelve inherited upstream workflows are disabled at the API level rather than in this tree. **Read before editing `.github/workflows/`** — the disable leaves no trace in the repo, so that file is the only record.
 
 ---
 

@@ -9,11 +9,20 @@
 # workspace clippy, so pre-existing upstream lints do not fail the fork gate.
 name: desktop-ci
 
+# `main` is the branch this fork publishes as (OfflineOS); `desktop/main` is the
+# local branch name it is pushed from, and is kept here so a clone using the
+# older layout still gets the gate. Naming only `desktop/main` is how this
+# workflow came to have **zero runs** on the public repo — the branch there is
+# `main`, so nothing ever matched, and the fork's own gate (including the
+# core-patch and supply-chain jobs) was present and dead. Upstream's workflows
+# do run here and do fail; they target Ubuntu and the hosted product, and this
+# fork has never claimed to satisfy them. This is the one that speaks for the
+# fork, so it has to actually fire.
 on:
   push:
-    branches: [desktop/main]
+    branches: [main, desktop/main]
   pull_request:
-    branches: [desktop/main]
+    branches: [main, desktop/main]
   workflow_dispatch:
 
 # Cancel superseded runs on the same ref.

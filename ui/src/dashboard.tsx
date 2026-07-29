@@ -1575,6 +1575,8 @@ function ProfilePanel() {
   const [assistantName, setAssistantName] = createSignal("");
   const [replyMode, setReplyMode] = createSignal<ReplyMode>("read");
   const [hotkey, setHotkey] = createSignal<string | null>(null);
+  const [shell, setShell] = createSignal(false);
+  const [restarting, setRestarting] = createSignal(false);
   const [saved, setSaved] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
 
@@ -1585,10 +1587,28 @@ function ProfilePanel() {
       setAssistantName(profile.assistant_name);
       setReplyMode(profile.reply_mode);
       setHotkey(await api.summonHotkey());
+      setShell(await api.agentShellEnabled());
     } catch (problem) {
       setError(String(problem));
     }
   });
+
+  const toggleShell = async (on: boolean) => {
+    setError(null);
+    setRestarting(true);
+    // Optimistic, then reconciled from the backend: this restarts the gateway,
+    // and a failed restart must not leave the box showing a capability the
+    // agent does not have (or hiding one it does).
+    setShell(on);
+    try {
+      await api.setAgentShellEnabled(on);
+    } catch (problem) {
+      setError(String(problem));
+    } finally {
+      setShell(await api.agentShellEnabled().catch(() => !on));
+      setRestarting(false);
+    }
+  };
 
   const save = async () => {
     setError(null);
@@ -1687,6 +1707,34 @@ function ProfilePanel() {
           )}
         </For>
       </div>
+
+      <h3>What it can do</h3>
+      <label class="wizard-voice">
+        <input
+          type="checkbox"
+          checked={shell()}
+          disabled={restarting()}
+          onChange={(event) => void toggleShell(event.currentTarget.checked)}
+        />
+        Let the agent run terminal commands
+      </label>
+      <p class="muted small">
+        Off unless you need it. Everything else the agent touches is bounded — files
+        stay inside its workspace, the browser asks before it fills a sensitive
+        field — but a terminal command runs anywhere on this machine, as you, with
+        no prompt first. It can already read and write its own files, browse, draw
+        on the canvas, and use your connectors without this.
+      </p>
+      <Show when={shell()}>
+        <p class="muted small">
+          While this is on, obviously destructive commands are refused, but that
+          list is a backstop and not a boundary — anything the agent can write to a
+          file it can also run. Turn it off when you are done.
+        </p>
+      </Show>
+      <Show when={restarting()}>
+        <p class="muted small">Restarting the agent to apply this…</p>
+      </Show>
 
       <div class="row">
         <button onClick={() => void save()}>Save</button>

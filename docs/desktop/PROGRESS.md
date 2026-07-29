@@ -17,6 +17,322 @@ newest entry at the top (right after this header) — not to `CLAUDE.md`.
 
 ---
 
+## The security batch: containing `builtin.shell` (recorded 2026-07-29)
+
+Closes R1 of the competitive review below — the one finding that was a disclosure
+risk rather than a design trade. Two core patches (CP-6, CP-7), a fork-owned
+setting, a gate that runs on Windows, and `cargo deny` as a real CI job. Nothing
+else was started; this batch was the whole session.
+
+### What the VERIFY found: the policy layer cannot deny it
+
+The instruction was to prefer a fork-owned flag driven through
+`local_dev_capability_policy`, and only patch core if that could not work. It
+cannot, by three independent routes — worth writing down because each one looks
+like it might be the seam:
+
+- **The policy is compiled in.** `local_dev_capability_policy.toml` is
+  `include_str!`-ed into `ironclaw_reborn_composition` and parsed once into a
+  process-wide `OnceLock`. No env var, no config key, no CLI flag, no file
+  override. Changing a grant means editing the file and rebuilding — which *is* a
+  core patch, just a less honest one.
+- **The loop's deny primitive is sealed.** `CapabilityFilter::Deny` exists and
+  does exactly what we want, but it is `pub(crate)` in `ironclaw_agent_loop`,
+  whose own `CLAUDE.md` says strategy traits are deliberately not exposed
+  downstream. The default strategy returns `All`.
+- **Composition has no injection point.** The built-in package and its handler
+  registry are assembled inside `factory.rs` from `builtin_first_party_package()`
+  and `builtin_first_party_handlers_*()`; a caller cannot subtract from either.
+
+So: **both lanes shipped** — the core patch, because it was the only lane open,
+and the flag, because the core patch is what makes a flag possible.
+
+### CP-7 is the control; CP-6 is defence in depth
+
+Worth being explicit about the ordering, because the instruction listed the
+denylist as the core-patch deliverable and the denylist is the *weaker* half.
+
+`builtin.shell` is the only capability granted `mounts = "ambient"` — the host
+filesystem — plus `spawn_process`, `execute_code`, and unrestricted outbound.
+Every other coding capability is workspace-mounted, and that mount is their real
+bound. Shell has no bound and no prompt (8d: `PermissionMode::Ask` is declared
+and never enforced). A substring-or-token denylist over a shell string is
+bypassable by construction: write a script, then run the script. So the control
+that actually holds is **not offering the capability**, and the denylist is what
+catches the obvious case for a user who has deliberately turned it on.
+
+**CP-7** makes `IRONCLAW_SHELL_TOOL_ENABLED` decide whether the shell manifest
+joins the built-in package and whether its handler is registered — fail-closed at
+both layers, so a dispatch that arrives anyway resolves to `UndeclaredCapability`
+rather than to a shell. **Unset means enabled**, so the patch is a no-op for
+upstream and for every core test.
+
+That default is inverted from ours, and the inversion is the interesting part.
+`IRONCLAW_TRIGGER_POLLER_ENABLED` rides in `extra_env` and is simply *absent*
+when off, which is safe because the runtime's default is off. Here the runtime's
+default is on, so **silence is the dangerous answer** and the same pattern would
+fail open the day someone forgot to populate a list. So `shell_enabled` is a
+typed field on `GatewayConfig` defaulting to `false`, and `env()` emits the
+variable unconditionally in both directions — a launch of ours cannot inherit the
+permissive default by omission. Pinned by
+`the_shell_tool_is_off_by_default_and_always_stated_explicitly`.
+
+User-facing: `settings.agent_shell_enabled`, off, in Settings → "What it can do",
+with copy that says what it actually costs ("a terminal command runs anywhere on
+this machine, as you, with no prompt first") and what the user still has without
+it. Toggling restarts the gateway, because the runtime decides at boot.
+
+**CP-6** is the Windows denylist. The interesting finding there was not the
+missing entries but that *three existing controls were already inert*:
+
+- `detect_command_injection`'s whole decode-and-execute family — `base64 -d`,
+  `xxd -r`, `printf '\x..'`, `| rev` — ends at `contains_shell_pipe`, which knew
+  only `sh`/`bash`/`zsh`/`dash`. Five names later (`iex`, `invoke-expression`,
+  `powershell`, `pwsh`, `cmd.exe`) the family fires on Windows. The detectors were
+  already written; they just could not see.
+- `FILE_READ_COMMANDS` was `cat, head, tail, less, vim, nano, …` — none of which
+  is how a file is read on Windows — so `check_sensitive_file_access` never
+  inspected an argument there and the sensitive-path list had nothing to bind to.
+- And the check underneath it could not have worked anyway: `shell_words` treats
+  `\` as a POSIX escape, so `C:\Users\me\.ssh\id_rsa` tokenizes to
+  `C:Usersme.sshid_rsa` and stops containing `/.ssh/`. The path checks now run
+  over both tokenizations. `ironclaw_safety` also had no Windows credential
+  stores — the dot-directories carry over, but DPAPI master keys, Credential
+  Manager blobs, and `%SystemRoot%\System32\config` had no entry at all.
+
+The new primitives were enumerated from Windows, not translated: recursive-forced
+deletion, drive format, shadow-copy and backup-catalog deletion, machine-hive and
+Run-key registry writes, LSASS access and hive export, Defender/firewall/event-log
+tampering, the fetch-then-execute family, task/service creation, account changes.
+Token-aware rather than substring, because Windows defeats substrings three ways:
+free flag order, PowerShell parameter prefixes (`-rec`, `-r`), and quoting —
+`powershell -Command "Remove-Item …"` is flattened before it is judged.
+
+Two false-positive decisions are load-bearing and are pinned by tests. `rm` is
+**not** a delete verb: it is a `Remove-Item` alias, but it is also the Unix delete
+command, and honouring `-r`/`-f` prefixes would reclassify ordinary
+`rm -r -f dir` on Linux. And account roots (`%USERPROFILE%`, `C:\Users`) match
+**exactly**, never by prefix — prefix-matching would put every recursive delete on
+a Windows desktop, including a build directory, in the tier nothing can waive.
+That one was found by the gate test, not by reading.
+
+### The gate, and the two times its positive control earned its keep
+
+`crates/ic_integration_tests/tests/shell_denylist_binds.rs` drives a *running*
+gateway on Windows: with the switch off, `builtin__shell` is absent from the tool
+list the model is offered; with it on, a denylisted command is refused. Unit
+tests over the matcher live in `shell_core.rs` — a denylist without a
+Windows-executing test is exactly the failure class this batch exists to close,
+and a matcher test is not that.
+
+The file carries a **positive control**: the same command, run through the same
+`cmd /C` the process port uses, against a sacrificial directory, which must
+destroy it. It caught a vacuous pass twice.
+
+1. The first draft used `powershell -Command "Remove-Item -Recurse -Force"`.
+   `cmd` answered *"'powershell' is not recognized"* — under a shell with a
+   rewritten `PATH` the child resolves nothing on disk. Both refusal assertions
+   had gone green for want of an interpreter.
+2. The second quoted the path. Rust's Windows argument escaping turns `"` into
+   `\"`, which `cmd` does not understand — exit 123, *"The filename, directory
+   name, or volume label syntax is incorrect"*. Green again, for a second wrong
+   reason.
+
+The fix was `rd /s /q` unquoted: a **cmd.exe builtin**, so it needs no `PATH`,
+and reliably lethal. Both dead ends are recorded in the test file itself, because
+the next person to touch it will reach for PowerShell.
+
+Then, per the `routeless_surfaces` precedent, the gate was **deliberately
+falsified** before being trusted: the `detect_windows_command_abuse` call was
+disabled, `serve` rebuilt, and
+`a_denylisted_windows_command_is_refused_by_the_running_gateway` confirmed to
+fail. Restored, and green.
+
+### `cargo deny`: nine advisories, three fixed, six argued
+
+Installed, run, and now a blocking CI job (`supply-chain`, all four checks). The
+repo already had a `deny.toml` with documented ignores, so this batch followed
+that file's existing convention rather than inventing one.
+
+Nine findings. **Three were fixed rather than ignored** — all moved within
+semver, so no major was touched: `anyhow` 1.0.102→1.0.104 (RUSTSEC-2026-0190,
+unsound `downcast_mut`), `crossbeam-epoch` 0.9.18→0.9.20 (RUSTSEC-2026-0204),
+and yanked `spin` 0.9.8→0.9.9.
+
+**Six remain, each ignored with a reachability argument and a removal
+condition.** Four of them rest on one checkable fact: the desktop app ships and
+supervises `ironclaw_reborn_cli`, and `cargo tree -p ironclaw_reborn_cli`
+contains **none** of `lopdf`, `pdf-extract`, `tokio-postgres`, or
+`postgres-protocol` — they reach the workspace only through the root `ironclaw`
+crate, the legacy v1 binary the fork does not build.
+
+- `lopdf` RUSTSEC-2026-0187 (stack overflow on nested PDFs) — not shipped; the
+  fix needs a `pdf-extract` major.
+- `tokio-postgres`/`postgres-protocol` RUSTSEC-2026-0178/0179/0180 — three DoS
+  advisories, all requiring the process to actually speak the Postgres wire
+  protocol. Not shipped, and the desktop profile is libSQL by design.
+- `wasmtime-wasi` RUSTSEC-2026-0182/0188 — the honest one: this **is** in the
+  shipped binary. Both are WASI-filesystem advisories (a `fd_renumber` descriptor
+  leak; hard link/rename escaping `FilePerms` on the destination), and the
+  argument is the same one `deny.toml` already makes for RUSTSEC-2026-0149 —
+  guests are not handed WASI filesystem capabilities backed by host `FilePerms`.
+  No semver-compatible fix; remove all three together when wasmtime is upgraded.
+
+Nothing the fork added — `gix`, `chromiumoxide`, `keyring`, `whisper-rs`,
+`windows`, `axum`, `reqwest` — appeared in any finding.
+
+### CI
+
+Two new jobs. `core-patches` runs the CP-6/CP-7 tests, which **no fork job ran** —
+the patches would have been replayed after every upstream merge with nothing
+checking they survived. Scoped to `first_party_tools` rather than the whole crate,
+because `cargo test -p ironclaw_host_runtime --lib` has 21 pre-existing Windows
+failures (`sandbox_process`, Unix-socket brokers) that are upstream's; scoping
+keeps the signal honest instead of drowning it. `ironclaw_safety` is green in full
+and runs in full. `supply-chain` runs `cargo deny check` — the one non-Windows
+job, since its verdict is platform-independent.
+
+### Also in this commit
+
+The two carryovers named in the batch. The console-severity fix (a Pixi/Cubism
+warning about something the app recovered from printed at ERROR) and the
+token/focus/motion/CI batch from 2026-07-28 were both written but uncommitted;
+they ship here. Their notes are the two entries directly below.
+
+Gates: `cargo fmt --all`, clippy `-D warnings` on the six fork crates including
+`--features app --bins` and on both patched core crates, `cargo test` on
+`ic_widget` (257), `ironclaw_safety` (240), `ironclaw_host_runtime`
+`first_party_tools` (22), the full `ic_integration_tests` suite,
+`cargo deny check`, `tsc --noEmit`, `npm run build`.
+
+Not covered, unchanged: everything visual. The Settings checkbox added here has
+not been seen on a screen.
+
+## Competitive review, and the mechanical batch it produced (recorded 2026-07-28)
+
+A strategy pass over the whole product against OpenClaw, Claude Cowork, the Windows
+25H2 agent Orchestrator, and the Live2D companion category. The analysis lives outside
+the repo; what follows is only what changed in it, plus the findings worth keeping.
+
+### The finding that reorders the roadmap
+
+**`builtin.shell` is granted `mounts = "ambient"` and `network = "local_dev_wildcard"`**
+(`local_dev_capability_policy.toml:82-93`) — host filesystem, `spawn_process`,
+`execute_code`, unrestricted outbound — and Phase 8d already established that no
+approval can fire for it. `read_file`/`write_file`/`apply_patch` are workspace-mounted,
+so the mount is their real bound. Shell has no such bound.
+
+There *is* a control, and it is the interesting part. `shell_core::validate_command`
+applies a denylist before executing — but the denylist is **entirely Unix-shaped**
+(`shell_core.rs:16-52`): `rm -rf /`, `dd if=/dev/zero`, `mkfs`, `> /dev/sda`, `sudo `,
+`| bash`, `/etc/passwd`, `/etc/shadow`, `~/.ssh`, `id_rsa`; `FILE_READ_COMMANDS` is
+`cat, head, tail, less, vim, nano, …`.
+
+**On Windows, our only supported target, essentially none of it binds.** No
+`Remove-Item -Recurse -Force`, no `del /f /s /q`, no `format`, no `reg delete`, no
+`Invoke-WebRequest | iex`, no `certutil -urlcache`, no `%USERPROFILE%\.ssh`. So the
+accurate statement is not "shell is unbounded" — it is **a control that looks present
+and does not bind on the target platform**, which is the same failure class as a signal
+that cannot report success. Two untrusted inputs can drive it: browser `innerText`
+(returned unscanned, `ic_browser_mcp` contains no injection handling) and imported
+skill bodies (the trusted tier, scanned for nothing).
+
+A Windows denylist is a cheap partial and the wrong primary control — a substring
+blocklist over a shell string is bypassable by writing a script and running it. The fix
+is consent in a surface we own, following `ic_browser_mcp::consent` exactly. Not built
+in this pass; it is the next substantial piece of work.
+
+### Two claims that did not survive execution
+
+- **`recheck()` is not dead code.** It has no *production* call site, but
+  `supervisor_lifecycle.rs:98` calls it. And `packaging.md`'s sleep/resume row was
+  already accurate — the 500 ms health poll plus SSE reconnect *is* the handling. The
+  only untruth was `recheck`'s own docstring instructing a `WM_POWERBROADCAST` call that
+  nothing makes. Fixed the docstring rather than adding a Win32 message hook: wiring one
+  would buy half a second over the existing poll.
+- **The character's flat states are an art limit, not a config oversight.** Hiyori ships
+  **two** motion groups (`Idle` ×9, `TapBody` ×1) and **zero** expressions; Ren's five
+  expressions are all already assigned. `delegating` was absent from both, so
+  `setState`'s `if (!mapping) return` meant the character showed *nothing* during
+  subagent work — an 8g feature with no destination. Both now map it, but neither can
+  make it visually *distinct* without new art or motion-index work. Recorded rather than
+  papered over: `model.motion()` already takes an index the config cannot express, so
+  Hiyori's nine idle motions are the cheap path to real per-state variety — and choosing
+  which index means which state needs eyes on a screen.
+
+### What changed
+
+`ui/src/styles.css`, two `character.json` manifests, `.github/workflows/desktop-ci.yml`,
+`crates/ic_widget/src/supervisor.rs`.
+
+**Design tokens.** `--line` was written literally **22 times** before it had a name.
+Added `--line` / `--line-soft` / `--well` / `--user-msg`, a radius scale, and a
+duration/easing scale; 37 literals now resolve through them. Collapsed the palette
+collisions: the setup wizard's primary CTA was `#4f6bed`, a blue appearing nowhere else
+in the product, and the read-only history reader and the live chat rendered the
+identical user message in two different blues.
+
+**A focus ring.** There was no `:focus` rule anywhere in 1,435 lines. Worse,
+`.reply-mode input { display: none }` made the reply-mode selector — in both the wizard
+and Settings — **keyboard-inoperable**, because a `display: none` radio cannot take
+focus. Now visually hidden the accessible way, with the ring drawn on the label.
+
+**An `input`/`select` selector.** There was none, so any field outside four unrelated
+container rules rendered as raw WebView2 chrome, and the three `<select>`s and ~15
+checkboxes rendered as light Windows controls inside a dark app.
+
+**`prefers-reduced-motion`.** Nine keyframes loop `infinite`, including a permanent
+shake on the error state, on a window that is always on top and never closed. Windows
+exposes the setting; we now honour it.
+
+**A contrast bug, not a style gap.** The thinking balloon painted `#3a3f4a` on
+`rgba(253,253,251,0.82)` **over the user's wallpaper** — its contrast was not low, it
+was *undefined*. Now opaque and still visibly quieter than the speech balloon (~8.9:1).
+
+**CI.** `ic_voice`, `ic_browser_mcp` and `ic_canvas_mcp` were in **no job** — neither
+linted nor tested. They are the three crates that touch host hardware, and one of them
+holds the fill-consent gate, the fork's only enforced consent surface. **148 tests now
+run that never ran.** And `main.rs` — every Tauri command — is now linted, in the
+`widget` job, because that is the only job with the frontend bundle clippy needs.
+
+`cargo deny` is **not** added: it is not installed here, so the gate could not be
+verified green before committing it, and an unverified gate is worse than a known hole.
+
+Gates: `cargo fmt --all --check`, clippy `-D warnings` on all six fork crates including
+`--features app --bins`, `cargo test` on `ic_widget` (256), `ic_voice` (88),
+`ic_browser_mcp` (47), `ic_canvas_mcp` (13), `tsc --noEmit`, `npm run build`, and
+`cargo build -p ic_widget --features app --bin ic-widget`.
+
+Not covered, unchanged: every visual claim above is reasoned from source. Nothing here
+has been seen on a screen.
+
+## The console bridge stops lying about severity (recorded 2026-07-28)
+
+Closes finding 1 of the smoke run below. `crates/ic_widget/src/main.rs`,
+`ui/src/api.ts`, `ui/src/widget.tsx`. No behavior change beyond the log level.
+
+`bridgeConsoleToLog` mirrored **both** `console.error` and `console.warn` into a
+single `log_ui_error` command that logged `tracing::error!` either way. So a
+Pixi/Cubism warning about something the app then recovered from — the Live2D
+hit-profile readback, which *succeeded* — printed at ERROR.
+
+The level now crosses the boundary with the message: `log_ui_message` takes a
+`UiLogLevel` enum (`warn` | `error`, snake_case on the wire per the typed-internals
+rule) and matches to `tracing::warn!` / `tracing::error!`. The frontend keeps two
+named entry points (`logUiError`, `logUiWarning`) so callers state severity at the
+call site rather than passing a level string around; the three genuine error paths
+in `character.ts` are unchanged.
+
+Worth naming the reason, because it is the same one this repo has invoked twice
+elsewhere: **a signal that also fires on success is a signal you learn to ignore.**
+An ERROR line that routinely means "a library warned and everything worked" costs
+you the next real ERROR.
+
+Gates: `cargo fmt`, `cargo clippy -p ic_widget --features app --bins --all-targets
+-D warnings`, `cargo test -p ic_widget --lib` (256 pass), `tsc --noEmit`, `npm run
+build`, and — the gate CI does not run — `cargo build -p ic_widget --features app
+--bin ic-widget`.
+
 ## Phase 8 smoke run on Windows (recorded 2026-07-26)
 
 The last item in Phase 8's definition of done, run on the dev machine (Ryzen

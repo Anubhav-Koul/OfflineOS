@@ -30,6 +30,21 @@ const SENSITIVE_PATH_PATTERNS: &[&str] = &[
     "/.bash_history",
     "/.zsh_history",
     "/.histfile",
+    // core-patch (desktop fork): CP-6 — Windows credential stores.
+    //
+    // The list above is Unix-shaped. The dot-directories (`.ssh`, `.aws`,
+    // `.azure`, `.kube`) do carry over, because the tools that create them use
+    // the same names on Windows and this check normalizes `\` to `/` before
+    // matching. What had no entry at all is everything Windows keeps somewhere
+    // else: the DPAPI master keys, the Credential Manager blobs, and the
+    // registry hives that back local account secrets.
+    "/appdata/roaming/microsoft/credentials/",
+    "/appdata/local/microsoft/credentials/",
+    "/appdata/roaming/microsoft/protect/",
+    "/appdata/roaming/microsoft/crypto/",
+    "/windows/system32/config/",
+    "/windows/repair/sam",
+    "/windows/ntds/",
 ];
 
 /// Sensitive file extensions that indicate cryptographic key material.
@@ -196,6 +211,36 @@ mod tests {
             "/home/user/.terraform.d/credentials.tfrc.json"
         )));
         assert!(is_sensitive_path(Path::new("/home/user/.azure/config")));
+    }
+
+    #[test]
+    fn blocks_windows_credential_stores() {
+        // core-patch (desktop fork): CP-6. Native Windows spellings — the
+        // backslashes are normalized before matching.
+        for path in [
+            "C:\\Users\\me\\AppData\\Roaming\\Microsoft\\Credentials\\ABC123",
+            "C:\\Users\\me\\AppData\\Roaming\\Microsoft\\Protect\\S-1-5-21\\key",
+            "C:\\Windows\\System32\\config\\SAM",
+            "C:\\Windows\\System32\\config\\SECURITY",
+            "C:\\Windows\\NTDS\\ntds.dit",
+            // Carried over from the Unix patterns because the tools use the
+            // same directory names on Windows.
+            "C:\\Users\\me\\.ssh\\id_rsa",
+            "C:\\Users\\me\\.aws\\credentials",
+        ] {
+            assert!(
+                is_sensitive_path_str(&path.replace('\\', "/"))
+                    || is_sensitive_path(Path::new(path)),
+                "expected Windows credential path to be sensitive: {path}"
+            );
+        }
+
+        assert!(!is_sensitive_path(Path::new(
+            "C:\\Users\\me\\Documents\\notes.md"
+        )));
+        assert!(!is_sensitive_path(Path::new(
+            "C:\\Users\\me\\AppData\\Roaming\\MyApp\\settings.json"
+        )));
     }
 
     #[test]

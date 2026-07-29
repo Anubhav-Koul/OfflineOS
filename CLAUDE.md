@@ -110,7 +110,29 @@ One line per subsystem — full detail and *why* in `docs/desktop/PROGRESS.md`.
 - **Phase 5 — voice (`ic_voice`) + canvas (`ic_canvas_mcp`):** ✅ done.
 - **Phase 6 — packaging & hardening:** config + hardening ✅; real MSI build blocked on external inputs (code-signing cert, updater keypair + endpoint, clean-VM build).
 - **Phase 7 — ambient companion (7a–7d):** ✅ complete — proactive surfacing, self-learning skills, skill import, ambient watchers.
-- **Phase 8 — surfacing the runtime:** 8a, 8a.5, 8b, 8b.1, 8c (runtime surfaces), 8c (voice picker), 8d (verified-negative), 8e — ✅ done. **8f (channels): blocked upstream, documented** — the Reborn Telegram adapter is webhook-only, so the long-polling premise that put it in scope (and Slack/WhatsApp out) does not hold; nothing built, per the sub-phase's own "or the blocker is documented". See `docs/desktop/channels.md`. A fork-owned long-poll bridge is the open option, recorded and not started. **8g — ✅ done**: memory seeding via `builtin.memory_write` (verdict read from the timeline, both disclosures computed backend-side, failover provider counted) and a `Delegating` character state read from the timeline, because `capability_progress` never fires. **Phase 8 is complete except the manual Windows smoke run.**
+- **Phase 8 — surfacing the runtime:** 8a, 8a.5, 8b, 8b.1, 8c (runtime surfaces), 8c (voice picker), 8d (verified-negative), 8e — ✅ done. **8f (channels): blocked upstream, documented** — the Reborn Telegram adapter is webhook-only, so the long-polling premise that put it in scope (and Slack/WhatsApp out) does not hold; nothing built, per the sub-phase's own "or the blocker is documented". See `docs/desktop/channels.md`. A fork-owned long-poll bridge is the open option, recorded and not started. **8g — ✅ done**: memory seeding via `builtin.memory_write` (verdict read from the timeline, both disclosures computed backend-side, failover provider counted) and a `Delegating` character state read from the timeline, because `capability_progress` never fires. **Phase 8 is complete** — the manual Windows smoke run passed on 2026-07-26 (every subsystem up in one process tree, kill-tree re-verified after a real `TerminateProcess`). It also caught that **the Tauri binary is a gate the fork CI does not run**: CI lints `ic_widget --lib --tests`, so `main.rs` had never been compiled with 8g's code. Two open items from it, neither fatal: the `#[ignore]`d real-model seed check is **inconclusive** (the sidecar was contended; re-run against an uncontended one to learn whether a 4B actually calls `memory_write`), and everything visual — rendering, transparent-window compositing per driver, click-through feel, frame cap — remains a human step a smoke run cannot cover.
+
+- **Security batch — `builtin.shell` contained (2026-07-29):** ✅ done. VERIFY
+  established the capability policy layer **cannot** deny it from fork-owned code
+  (compiled-in `OnceLock` TOML; `CapabilityFilter::Deny` is `pub(crate)` in
+  `ironclaw_agent_loop`; no injection point in `factory.rs`), so both lanes
+  shipped. **CP-7** — `IRONCLAW_SHELL_TOOL_ENABLED` gates the manifest *and* the
+  handler (unset = enabled, so upstream is unaffected); the widget always states
+  it explicitly in both directions because here silence would fail *open*, unlike
+  the trigger poller. Surfaced as `settings.agent_shell_enabled`, **off by
+  default**, in Settings → "What it can do"; toggling restarts the gateway.
+  **CP-6** — the Windows denylist, enumerated from Windows primitives, plus three
+  controls that were already inert on Windows (`contains_shell_pipe` knew no
+  Windows interpreter, `FILE_READ_COMMANDS` no Windows reader, and `shell_words`
+  dissolved every Windows path by treating `\` as a POSIX escape). CP-6 is
+  defence in depth, not a boundary — a denylist over a shell string is bypassable
+  by writing a script. Gate: `shell_denylist_binds.rs` drives both halves through
+  a running gateway on Windows with a positive control, and was run red before
+  green. `cargo deny` is now a blocking CI job: 3 advisories fixed within semver,
+  6 ignored with per-item reachability arguments (4 provably absent from the
+  shipped binary, 2 wasmtime-wasi). New CI jobs `core-patches` and
+  `supply-chain`. An upstream PR for CP-6 is **drafted and not posted**, pending
+  review; it deliberately discloses nothing about `PermissionMode::Ask`.
 
 **Open upstream tickets** (nearai/ironclaw):
 - [#5998](https://github.com/nearai/ironclaw/issues/5998) — no transport for a local MCP server — CP-4/CP-5 get deleted when this lands.
@@ -139,4 +161,6 @@ One line per subsystem — full detail and *why* in `docs/desktop/PROGRESS.md`.
 
 ---
 
-Current phase: 8 — read `docs/desktop/phases/phase8.md` before building. History: `docs/desktop/PROGRESS.md`.
+Phases 0–8 are complete; there is no Phase 9 spec. What is left to ship v1 is not code: the MSI's external inputs (signing cert, updater keypair + endpoint, clean-VM build), the visual pass on a real screen, and the two decisions recorded and deliberately not taken — the fork-owned Telegram long-poll bridge (`docs/desktop/channels.md`) and the routeless-panel routes, which belong upstream. Before building anything, read the sub-phase spec in `docs/desktop/phases/` and the history in `docs/desktop/PROGRESS.md`.
+
+Post-Phase-8 work is tracked as dated batches in `PROGRESS.md` rather than as new phases. The security batch (2026-07-29) closed the one finding that blocked a public release. **Still open from the same review, and deliberately not started in that batch:** provenance and injection handling on untrusted text (browser `innerText` and imported skill bodies are both unscanned — the two inputs that made the shell finding reachable), project identity + updater + code signing, markdown in chat and the waiting experience, and the first upstream merge rehearsal.

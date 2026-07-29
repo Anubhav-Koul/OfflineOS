@@ -1752,14 +1752,33 @@ fn set_hit_mask(state: tauri::State<'_, AppState>, mask: HitMask) -> Result<(), 
     Ok(())
 }
 
-/// Surface a frontend error on stderr, where the developer is already watching.
+/// Which level a bridged frontend message lands on.
+///
+/// The frontend bridge mirrors both `console.error` and `console.warn`, and the
+/// libraries under the app (Pixi, pixi-live2d-display, the Cubism Framework) do
+/// warn about things that then succeed. Logging those at ERROR is the failure
+/// mode this repo has already named elsewhere: a signal that also fires on
+/// success is a signal you learn to ignore. So the level crosses the boundary
+/// with the message.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum UiLogLevel {
+    Warn,
+    Error,
+}
+
+/// Surface a frontend diagnostic on stderr, where the developer is already
+/// watching.
 ///
 /// The webview's console is awkward to reach in a transparent borderless widget;
-/// this bridges the errors worth seeing (a failed character load, say) to the
+/// this bridges the messages worth seeing (a failed character load, say) to the
 /// same log the gateway and sidecar write to.
 #[tauri::command]
-fn log_ui_error(message: String) {
-    tracing::error!(target: "ic_widget::ui", "{message}");
+fn log_ui_message(level: UiLogLevel, message: String) {
+    match level {
+        UiLogLevel::Warn => tracing::warn!(target: "ic_widget::ui", "{message}"),
+        UiLogLevel::Error => tracing::error!(target: "ic_widget::ui", "{message}"),
+    }
 }
 
 #[tauri::command]
@@ -2632,6 +2651,17 @@ async fn bring_up_gateway(app: AppHandle, selection: ProviderSelection) {
         .map(|settings| settings.ambient_enabled)
         .unwrap_or(false); // silent-ok: unreadable settings mean no ambient, the safe side
 
+    // Same shape, same reason: the runtime decides whether to declare
+    // `builtin.shell` at boot and never revisits it, so this toggle restarts the
+    // gateway. Unreadable settings mean no shell — the safe side, and here the
+    // safe side is also the side that differs from the runtime's own default.
+    let shell_enabled = app
+        .state::<AppState>()
+        .settings_store
+        .load()
+        .map(|settings| settings.agent_shell_enabled)
+        .unwrap_or(false); // silent-ok: unreadable settings mean no shell
+
     let started = async {
         let token = SecretStore::new()
             .gateway_token()
@@ -2639,6 +2669,7 @@ async fn bring_up_gateway(app: AppHandle, selection: ProviderSelection) {
         let mut config = GatewayConfig::new(reborn_binary(), reborn_home()?, token)
             .map_err(|error| error.to_string())?;
         config.llm_env = llm_env;
+        config.shell_enabled = shell_enabled;
         // Ambient's trigger poller plus, when a Google OAuth client is configured,
         // the environment `serve` needs to run the connector OAuth flow. The
         // redirect URI is built from our fixed callback port so it matches what
@@ -3206,6 +3237,32 @@ async fn set_reflection_enabled(
     enabled: bool,
 ) -> Result<(), String> {
     state.update_settings(|settings| settings.reflection_enabled = enabled)?;
+    Ok(())
+}
+
+/// Whether the agent is currently offered terminal commands.
+#[tauri::command]
+fn agent_shell_enabled(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let settings = state.settings_store.load().map_err(user_facing)?;
+    Ok(settings.agent_shell_enabled)
+}
+
+/// Give the agent terminal commands, or take them away.
+///
+/// **This restarts the gateway.** The runtime decides whether to declare
+/// `builtin.shell` at all when it boots (core-patch CP-7), so the capability
+/// cannot appear or disappear under a running one — the same reason the ambient
+/// toggle restarts. Withholding it is the fork's primary control here: the
+/// denylist in `shell_core` is defence in depth, and a substring denylist over a
+/// shell string is bypassable by writing a script and running the script.
+#[tauri::command]
+async fn set_agent_shell_enabled(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let settings = state.update_settings(|settings| settings.agent_shell_enabled = enabled)?;
+    restart_gateway(app, settings.active_provider).await;
     Ok(())
 }
 
@@ -4881,7 +4938,7 @@ fn main() {
             character_settings,
             set_character,
             set_hit_mask,
-            log_ui_error,
+            log_ui_message,
             open_dashboard,
             voice_status,
             set_voice_muted,
@@ -4890,6 +4947,8 @@ fn main() {
             set_ambient_enabled,
             set_ambient_guardrails,
             set_reflection_enabled,
+            agent_shell_enabled,
+            set_agent_shell_enabled,
             use_model,
             set_cloud_fallback,
             preview_skill_import,

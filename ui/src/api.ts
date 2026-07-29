@@ -732,7 +732,11 @@ export const api = {
     invoke<void>("answer_browser_fill", { id, approved }),
   /** Begin an OS window drag — the character's body is the drag handle. */
   startDragging: () => getCurrentWindow().startDragging(),
-  logUiError: (message: string) => invoke<void>("log_ui_error", { message }),
+  logUiError: (message: string) =>
+    invoke<void>("log_ui_message", { level: "error", message }),
+  /** For diagnostics that are not failures — a library warning the app survived. */
+  logUiWarning: (message: string) =>
+    invoke<void>("log_ui_message", { level: "warn", message }),
   /** Whether voice is enabled, actually running, and muted. */
   voiceStatus: () => invoke<VoiceStatus>("voice_status"),
   /** Mute or unmute the microphone. */
@@ -762,6 +766,13 @@ export const api = {
   /** Turn the reflection pass on or off. No restart. */
   setReflectionEnabled: (enabled: boolean) =>
     invoke<void>("set_reflection_enabled", { enabled }),
+  /** Whether the agent is currently offered terminal commands. */
+  agentShellEnabled: () => invoke<boolean>("agent_shell_enabled"),
+  /** Give the agent terminal commands, or take them away. **Restarts the
+   *  gateway**: the runtime decides at boot whether the capability exists at
+   *  all, so it cannot appear or disappear under a running one. */
+  setAgentShellEnabled: (enabled: boolean) =>
+    invoke<void>("set_agent_shell_enabled", { enabled }),
   /** Read a skill folder for review. Pure — nothing stores, nothing installs. */
   previewSkillImport: (path: string) =>
     invoke<ImportPreview>("preview_skill_import", { path }),

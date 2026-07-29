@@ -271,6 +271,148 @@ sidecar gate becomes defence-in-depth. Full write-up: `CLAUDE.md` Phase 4 notes,
 
 ---
 
+## CP-6 — the shell denylist does not bind on Windows (PATCHED)
+
+- **Files:**
+  - `crates/ironclaw_host_runtime/src/first_party_tools/shell_core.rs` — Windows
+    entries in `BLOCKED_COMMANDS`/`DANGEROUS_PATTERNS`/`FILE_READ_COMMANDS`, the
+    new `detect_windows_command_abuse` family, Windows interpreters in
+    `contains_shell_pipe`, and both-tokenization path checks
+  - `crates/ironclaw_safety/src/sensitive_paths.rs` — Windows credential stores
+- **Why:** `shell_core::validate_command` applies a denylist before executing, and
+  the denylist is **entirely Unix-shaped**: `rm -rf /`, `dd if=/dev/zero`, `mkfs`,
+  `> /dev/sda`, `sudo `, `| bash`, `/etc/passwd`, `~/.ssh`; `FILE_READ_COMMANDS`
+  is `cat, head, tail, less, vim, nano, …`. On Windows — the fork's only supported
+  target — essentially **none of it binds**. There is no `/etc/passwd`, no `sudo`,
+  no `/dev/sda`, and no `rm`. `LocalHostProcessPort` runs `cmd /C <command>` there,
+  so this is a live path, not a hypothetical one.
+
+  The accurate statement is not "shell is unbounded" — it is **a control that
+  looks present and does not bind on the target platform**, the same failure class
+  this repo has named twice (a signal that cannot report success; a warning
+  logged at ERROR). That is what makes it a patch rather than a preference.
+- **Three gaps, three fixes:**
+  1. **The existing detectors could not see.** `detect_command_injection`'s
+     decode-and-execute family (`base64 -d`, `xxd -r`, `printf '\x..'`, `| rev`)
+     all end at `contains_shell_pipe`, which knew only `sh`/`bash`/`zsh`/`dash`.
+     Adding `iex`, `invoke-expression`, `powershell`, `pwsh`, `cmd.exe` switches
+     the whole family on for Windows. Smallest change here, probably the largest
+     return: the detectors were already written.
+  2. **The sensitive-path check had nothing to bind to.** Windows readers
+     (`get-content`, `type`, `findstr`, `copy`, `certutil`, …) now populate
+     `FILE_READ_COMMANDS`. Two supporting fixes were needed for that to actually
+     work: `shell_words` treats `\` as a POSIX escape, which dissolves every
+     Windows path it is given (`C:\Users\me\.ssh\id_rsa` → `C:Usersme.sshid_rsa`,
+     no longer containing `/.ssh/`), so the path checks now run over both
+     tokenizations; and `sensitive_paths` had no Windows credential stores at all
+     — the dot-directories carry over, but DPAPI master keys, Credential Manager
+     blobs, and `%SystemRoot%\System32\config` did not exist in the list.
+  3. **The primitives themselves**, enumerated from Windows rather than
+     translated from Unix: recursive-forced deletion, drive format, shadow-copy
+     and backup-catalog deletion, machine-hive and Run-key registry writes, LSASS
+     access and hive export, Defender/firewall/event-log tampering, the
+     fetch-then-execute family (`certutil -urlcache`, `bitsadmin /transfer`,
+     `mshta http…`, `regsvr32 /i:http`, `msiexec http…`,
+     `powershell -EncodedCommand`), task/service creation, local account changes.
+     Token-aware, not substring, because Windows defeats substrings three ways:
+     free flag order, PowerShell parameter prefixes (`-rec`, `-r`), and quoting
+     (`powershell -Command "Remove-Item …"`, which is flattened first).
+- **Blast radius — what the patch deliberately does not touch:**
+  - `rm` is **not** a delete verb here. It is a `Remove-Item` alias in PowerShell
+    but also *the* Unix delete command, and the recursive/force detection honours
+    two-character parameter prefixes — including it would reclassify ordinary
+    `rm -r -f dir` on Linux and macOS. The existing `rm -rf /` entry keeps that.
+  - Short ambiguous names (`reg`, `net`, `sc`, `format`) match only when
+    immediately followed by a mutating subcommand, so `Format-Table`,
+    `reg query`, `net user`, and `sc query` are untouched.
+  - Account roots (`%USERPROFILE%`, `C:\Users`) match **exactly**, never by
+    prefix; prefix-matching would put every recursive delete on a Windows desktop
+    in the never-waivable tier.
+  - The two-tier split is preserved: catastrophic → always blocked; high-risk →
+    blocked unless `allow_dangerous` (which the Reborn shell path never sets).
+- **This is not a boundary.** A denylist over a shell string is bypassable by
+  construction — write a script, then run the script. CP-6 is defence in depth
+  behind CP-7, which is the control that actually decides.
+- **Tripwires:** `validate_command_blocks_windows_primitives`,
+  `detect_command_injection_covers_windows_interpreter_pipes`,
+  `sensitive_path_detection_covers_windows_readers`,
+  `validate_command_allows_ordinary_windows_and_unix_work`,
+  `windows_account_roots_match_exactly_not_by_prefix` in `shell_core.rs`;
+  `blocks_windows_credential_stores` in `sensitive_paths.rs`. All are run by the
+  `core-patches` CI job, which exists because no fork job ran core crates before.
+  End-to-end: `shell_denylist_binds.rs` (see CP-7).
+- **Upstream candidate:** yes, and drafted — a portability/hardening PR in the
+  shape of #6098. It deliberately says nothing about `PermissionMode::Ask` never
+  being enforced; that stays private pending #6000. Draft is held for review and
+  **not posted**, per the standing preference.
+
+---
+
+## CP-7 — `builtin.shell` cannot be withheld (PATCHED)
+
+- **Files:**
+  - `crates/ironclaw_host_runtime/src/first_party_tools/mod.rs` —
+    `SHELL_TOOL_ENABLED_ENV`, applied to both the manifest and the handler
+  - `crates/ironclaw_host_runtime/src/lib.rs` — re-export
+- **Why — what the VERIFY found.** The question was whether the capability policy
+  layer could deny `builtin.shell` or scope its mounts/network from fork-owned
+  code. **It cannot, by three independent routes:**
+  - `local_dev_capability_policy.toml` is `include_str!`-compiled into
+    `ironclaw_reborn_composition` and parsed once into a process-wide `OnceLock`.
+    There is no env var, config key, CLI flag, or file override — the only way to
+    change a grant is to edit the file and rebuild, which *is* a core patch.
+  - The loop framework does have a deny primitive — `CapabilityFilter::Deny` —
+    but it is `pub(crate)` in `ironclaw_agent_loop`, whose `CLAUDE.md` states
+    strategy traits are deliberately not exposed downstream. The default strategy
+    returns `CapabilityFilter::All`.
+  - The built-in package and its handler registry are composed entirely inside
+    `factory.rs` from `builtin_first_party_package()` /
+    `builtin_first_party_handlers_*()`, with no injection point for a caller.
+
+  So lane (a) — a fork-owned flag driving the policy layer — is not reachable, and
+  lane (b) applies: a core patch is justified on security grounds.
+- **Why this and not only the denylist.** The denylist (CP-6) is bypassable by
+  construction. `builtin.shell` is the only capability granted `mounts =
+  "ambient"` (the host filesystem) plus `spawn_process`, `execute_code`, and
+  `local_dev_wildcard` network; every other coding capability is workspace-mounted
+  and bounded by that mount. No approval can fire — Phase 8d established that
+  `PermissionMode::Ask` is declared and never enforced. Two untrusted inputs reach
+  the model that could drive it: browser `innerText` (returned unscanned) and
+  imported skill bodies (the trusted tier, scanned for nothing). The control that
+  actually holds is therefore *not offering the capability*.
+- **Fix:** `IRONCLAW_SHELL_TOOL_ENABLED` decides whether `shell::manifest()` joins
+  the built-in package and whether the handler is registered. **Unset means
+  enabled**, so upstream deployments and every core test are unaffected — the
+  patch is a no-op unless something sets it.
+- **Fail-closed at two layers:** no manifest means the capability never reaches
+  the model's surface; no handler means a dispatch that arrives anyway resolves to
+  `UndeclaredCapability` rather than to a shell.
+- **The fork side, and why the default direction is inverted from ambient's.**
+  `GatewayConfig::shell_enabled` is a typed field defaulting to `false`, and
+  `GatewayConfig::env()` emits the variable **unconditionally, in both
+  directions**. This is deliberately unlike `IRONCLAW_TRIGGER_POLLER_ENABLED`,
+  which rides in `extra_env` and is simply absent when off: there, the runtime's
+  default is off, so silence is safe. Here the runtime's default is *on*, so
+  silence is the dangerous answer and an omission-shaped bug would fail open.
+  Pinned by `the_shell_tool_is_off_by_default_and_always_stated_explicitly`.
+  Surfaced as `settings.agent_shell_enabled`, off, in Settings → "What it can do".
+  Toggling restarts the gateway, because the runtime decides at boot.
+- **Tripwire:** `crates/ic_integration_tests/tests/shell_denylist_binds.rs`, which
+  drives both halves through a *running* gateway on Windows: the capability is
+  absent from the model's tool list with the switch off, and a denylisted command
+  is refused with it on. It carries a positive control — the same command run
+  through the same `cmd /C`, which must destroy a sacrificial directory — because
+  without it "the directory survived" could equally mean the command was a no-op.
+  That control earned its place twice during development (see the file's notes on
+  `powershell` not being on `PATH`, and on `cmd` quoting). The whole file was run
+  red before it was trusted green, per the `routeless_surfaces` precedent.
+- **Upstream candidate:** plausible but not drafted. It is a policy feature rather
+  than a portability fix, and bundling it with CP-6 would weaken that PR's tight
+  framing. Revisit if upstream ever wires a real approval gate — at which point
+  CP-7 becomes redundant and should be deleted.
+
+---
+
 ## Upstream status (checked 2026-07-15)
 
 | Ref | What | Status |

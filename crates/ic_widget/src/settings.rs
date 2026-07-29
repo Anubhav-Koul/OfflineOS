@@ -266,6 +266,22 @@ pub struct Settings {
     /// [`Settings::ambient_enabled`] is also on.
     #[serde(default)]
     pub watchers: WatcherSettings,
+    /// Whether the agent may run terminal commands (`builtin.shell`).
+    ///
+    /// **Off by default.** This is the one capability the runtime grants
+    /// `mounts = "ambient"` — the whole host filesystem, plus `spawn_process`,
+    /// `execute_code`, and unrestricted outbound — where every other file tool
+    /// is workspace-mounted and bounded by that mount. And no approval can fire
+    /// for it: `PermissionMode::Ask` is declared on the manifest and nothing
+    /// enforces it (Phase 8d). Two untrusted inputs reach the model that could
+    /// drive it — web page text and imported skill bodies.
+    ///
+    /// So it is opt-in, and the switch is real rather than cosmetic: it decides
+    /// `IRONCLAW_SHELL_TOOL_ENABLED`, which the runtime reads once at boot to
+    /// choose whether to declare the capability at all (core-patch CP-7).
+    /// Toggling it therefore restarts the gateway, like ambient mode.
+    #[serde(default)]
+    pub agent_shell_enabled: bool,
     /// Connector OAuth (Phase 8b.1). Holds the one thing about the OAuth callback
     /// that is not secret and not derivable: the fixed loopback port the redirect
     /// lands on. The Google OAuth *client* itself lives in the credential store.

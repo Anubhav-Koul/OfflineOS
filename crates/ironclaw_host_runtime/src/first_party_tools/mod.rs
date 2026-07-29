@@ -65,6 +65,48 @@ pub use trigger_management::{
 };
 
 pub const BUILTIN_FIRST_PARTY_PROVIDER: &str = "builtin";
+
+/// core-patch (desktop fork): CP-7 — operator kill-switch for the built-in
+/// shell capability.
+///
+/// `builtin.shell` is granted `mounts = "ambient"` and
+/// `network = "local_dev_wildcard"` under `local-dev`
+/// (`local_dev_capability_policy.toml`): the host filesystem, `spawn_process`,
+/// `execute_code`, and unrestricted outbound, with no approval gate in front of
+/// it (`PermissionMode::Ask` is declared on the manifest and never enforced —
+/// nothing constructs `Decision::RequireApproval`). Every other coding
+/// capability is `mounts = "workspace"`, so the mount is their real bound;
+/// shell has no such bound.
+///
+/// The desktop fork ships to end users rather than developers, and its agent
+/// reaches untrusted text (web page contents, imported skill bodies). A
+/// denylist over a shell string is bypassable by construction — write a script,
+/// then run the script — so the load-bearing control is *not offering the
+/// capability at all* unless the user asks for it.
+///
+/// Set to `1`/`true` to offer the tool; `0`/`false` (or anything else) to
+/// withhold it. **Unset means enabled**, so this is a no-op for every existing
+/// deployment; the fork's supervisor always sets it explicitly, in both
+/// directions, so a missing value can never quietly mean "on" there.
+///
+/// Withholding is fail-closed at two layers: the capability is absent from the
+/// built-in manifest, so it never reaches the model's capability surface, and
+/// no handler is registered, so a forged dispatch resolves to
+/// `UndeclaredCapability` rather than to a shell.
+pub const SHELL_TOOL_ENABLED_ENV: &str = "IRONCLAW_SHELL_TOOL_ENABLED";
+
+fn shell_tool_enabled() -> bool {
+    shell_tool_enabled_from(std::env::var(SHELL_TOOL_ENABLED_ENV).ok().as_deref())
+}
+
+/// Split from [`shell_tool_enabled`] so the decision is testable without
+/// mutating process-global environment from a parallel test runner.
+fn shell_tool_enabled_from(raw: Option<&str>) -> bool {
+    match raw {
+        Some(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"),
+        None => true,
+    }
+}
 pub const READ_FILE_CAPABILITY_ID: &str = "builtin.read_file";
 pub const WRITE_FILE_CAPABILITY_ID: &str = "builtin.write_file";
 pub const LIST_DIR_CAPABILITY_ID: &str = "builtin.list_dir";
@@ -160,9 +202,12 @@ pub fn builtin_first_party_package() -> Result<ExtensionPackage, ExtensionError>
                     json::manifest()?,
                     http::manifest()?,
                     http::save_manifest()?,
-                    shell::manifest()?,
                     spawn_subagent::manifest()?,
                 ];
+                // core-patch (desktop fork): CP-7.
+                if shell_tool_enabled() {
+                    capabilities.push(shell::manifest()?);
+                }
                 capabilities.extend(memory::manifests()?);
                 capabilities.extend(coding_manifests()?);
                 capabilities.extend(skill_management::manifests()?);
@@ -252,8 +297,14 @@ fn builtin_first_party_base_registry() -> Result<FirstPartyCapabilityRegistry, H
         .with_handler(
             CapabilityId::new(MEMORY_TREE_CAPABILITY_ID)?,
             handler.clone(),
-        )
-        .with_handler(CapabilityId::new(SHELL_CAPABILITY_ID)?, handler.clone());
+        );
+    // core-patch (desktop fork): CP-7. Withholding the handler as well as the
+    // manifest is what makes this fail closed — a dispatch that arrives anyway
+    // (a replayed call, a forged surface version) resolves to
+    // `UndeclaredCapability` instead of to a shell.
+    if shell_tool_enabled() {
+        registry.insert_handler(CapabilityId::new(SHELL_CAPABILITY_ID)?, handler.clone());
+    }
     for metadata in CODING_CAPABILITIES {
         registry.insert_handler(CapabilityId::new(metadata.id)?, handler.clone());
     }
@@ -550,4 +601,27 @@ fn coding_capability_metadata(capability_id: &str) -> Option<CodingCapabilityMet
         .iter()
         .copied()
         .find(|metadata| metadata.id == capability_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// core-patch (desktop fork): CP-7. Absent means enabled, so the switch is
+    /// a no-op for deployments that never heard of it; anything that is not an
+    /// affirmative yes withholds the tool.
+    #[test]
+    fn shell_tool_kill_switch_defaults_to_enabled_and_fails_closed() {
+        assert!(shell_tool_enabled_from(None));
+        assert!(shell_tool_enabled_from(Some("1")));
+        assert!(shell_tool_enabled_from(Some("true")));
+        assert!(shell_tool_enabled_from(Some(" TRUE ")));
+
+        for withheld in ["0", "false", "False", "", "   ", "yes", "on", "maybe"] {
+            assert!(
+                !shell_tool_enabled_from(Some(withheld)),
+                "{withheld:?} is not an affirmative yes and must withhold the shell"
+            );
+        }
+    }
 }

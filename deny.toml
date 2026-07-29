@@ -27,6 +27,44 @@ ignore = [
     # so the TRUNCATE bypass is not reachable from our guest surface. Remove once
     # wasmtime is upgraded to a patched release.
     "RUSTSEC-2026-0149",
+
+    # --- Desktop fork, triaged 2026-07-29 when `cargo deny` first became a CI
+    # gate here. Each entry below records *why* it is not actionable now, not
+    # merely that it is inconvenient. Three siblings found in the same run
+    # (anyhow RUSTSEC-2026-0190, crossbeam-epoch RUSTSEC-2026-0204, and the
+    # yanked spin 0.9.8) are absent from this list because they were fixed
+    # rather than ignored — all three moved within semver.
+    #
+    # The four `not-shipped` entries rest on one checkable fact: the desktop app
+    # ships and supervises `ironclaw_reborn_cli`, and
+    # `cargo tree -p ironclaw_reborn_cli` contains none of lopdf, pdf-extract,
+    # tokio-postgres, or postgres-protocol. They reach the workspace only
+    # through the root `ironclaw` crate — the legacy v1 binary, which this fork
+    # does not build or distribute. Re-check that with the command above before
+    # trusting this note; it is the whole justification.
+
+    # lopdf: stack overflow on deeply nested PDF objects. Pinned by
+    # pdf-extract 0.7.12; no semver-compatible fix. Not shipped (see above), and
+    # nothing in the fork parses PDFs.
+    "RUSTSEC-2026-0187",
+    # tokio-postgres / postgres-protocol: three denial-of-service advisories,
+    # each requiring the process to actually speak the Postgres wire protocol to
+    # a malicious or malformed peer. Not shipped (see above), and the desktop
+    # profile is libSQL by design — `CLAUDE.md`'s storage decision is that a
+    # desktop user must never need Postgres.
+    "RUSTSEC-2026-0178",
+    "RUSTSEC-2026-0179",
+    "RUSTSEC-2026-0180",
+    # wasmtime-wasi: unlike the four above, this one *is* in the shipped binary.
+    # Both advisories are about the WASI filesystem surface — a descriptor leak
+    # in `fd_renumber`, and hard link/rename escaping `FilePerms` on the
+    # destination. Same reachability argument as RUSTSEC-2026-0149 immediately
+    # above: IronClaw's WASM sandbox does not hand guest modules WASI filesystem
+    # capabilities backed by host `FilePerms`; guests talk to the host through
+    # explicit host functions. No semver-compatible fix — the patch is a
+    # wasmtime major. Remove both with 0149 when wasmtime is upgraded.
+    "RUSTSEC-2026-0182",
+    "RUSTSEC-2026-0188",
 ]
 
 [licenses]

@@ -59,6 +59,16 @@ pub const DEFAULT_OWNER_USER_ID: &str = "reborn-cli";
 /// access and must be an explicit user decision, not a default.
 pub const DEFAULT_PROFILE: &str = "local-dev";
 
+/// The runtime's kill-switch for `builtin.shell` (core-patch CP-7).
+///
+/// Spelled out rather than imported: no `ic_*` crate depends on a core crate,
+/// and adding `ironclaw_host_runtime` to the widget for one string would be a
+/// large dependency for a small constant. The drift guard is
+/// `shell_denylist_binds.rs` in `ic_integration_tests`, which depends on both
+/// and asserts this literal still equals
+/// `ironclaw_host_runtime::SHELL_TOOL_ENABLED_ENV`.
+pub const SHELL_TOOL_ENABLED_ENV: &str = "IRONCLAW_SHELL_TOOL_ENABLED";
+
 /// What the gateway is doing. Drives the widget's health badge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "state")]
@@ -121,6 +131,23 @@ pub struct GatewayConfig {
     /// Separate from [`Self::llm_env`] because it is not a provider choice and is
     /// not rebuilt when the provider changes.
     pub extra_env: Vec<(String, String)>,
+    /// Whether the agent is offered `builtin.shell` — raw command execution on
+    /// the user's machine.
+    ///
+    /// **Not** part of [`Self::extra_env`], deliberately. `extra_env` is a list a
+    /// caller can forget to populate, and forgetting this one means the shell is
+    /// *on*: the runtime's own default for `IRONCLAW_SHELL_TOOL_ENABLED` is
+    /// enabled, because upstream cannot change behaviour for deployments that
+    /// never heard of the switch (core-patch CP-7). Making it a required field
+    /// with a `false` default means [`GatewayConfig::env`] always states the
+    /// decision explicitly, so no launch of ours can inherit the permissive
+    /// default by omission.
+    ///
+    /// Off unless the user turns it on in Settings. The companion has scoped
+    /// file tools, a browser, a canvas, and connectors; a raw shell is not
+    /// load-bearing for the product, and it is the one capability whose grant is
+    /// `mounts = "ambient"` — the host filesystem, with no approval prompt.
+    pub shell_enabled: bool,
     /// How long one spawn has to become ready.
     pub startup_timeout: Duration,
     /// Consecutive failures before giving up.
@@ -145,6 +172,7 @@ impl GatewayConfig {
             user_id: DEFAULT_OWNER_USER_ID.to_string(),
             llm_env: Vec::new(),
             extra_env: Vec::new(),
+            shell_enabled: false,
             // The first boot installs bundled skills and runs migrations.
             startup_timeout: Duration::from_secs(90),
             max_crashes: 3,
@@ -197,6 +225,11 @@ impl GatewayConfig {
             ("IRONCLAW_REBORN_PROFILE".into(), self.profile.clone()),
             ("IRONCLAW_REBORN_WEBUI_TOKEN".into(), self.token.clone()),
             ("IRONCLAW_REBORN_WEBUI_USER_ID".into(), self.user_id.clone()),
+            // Always emitted, in both directions — see `shell_enabled`.
+            (
+                SHELL_TOOL_ENABLED_ENV.into(),
+                self.shell_enabled.to_string(),
+            ),
         ];
         env.extend(self.llm_env.iter().cloned());
         env.extend(self.extra_env.iter().cloned());
@@ -302,9 +335,18 @@ impl GatewaySupervisor {
 
     /// Re-check health now, rather than waiting for the next poll.
     ///
-    /// Call this on `WM_POWERBROADCAST` resume: a laptop that slept for an hour
-    /// has a gateway whose sockets and database handles may or may not have
-    /// survived, and the user is looking at the widget right now.
+    /// **Nothing in production calls this today** — only `supervisor_lifecycle`
+    /// does. The docstring used to read "call this on `WM_POWERBROADCAST`
+    /// resume", which described an intention rather than the code: no power
+    /// broadcast handler exists anywhere in the tree, so a reader checking
+    /// whether sleep/resume was handled would have concluded it was.
+    ///
+    /// Resume *is* handled, just not here: the supervisor polls health every
+    /// [`HEALTH_POLL_INTERVAL`] and the SSE stream reconnects on its own, so a
+    /// laptop waking after an hour recovers within half a second without this.
+    /// Wiring a power broadcast would buy that half second and nothing else —
+    /// which is why it has not been worth the Win32 message hook. Keep this as
+    /// the fast path for whenever it is.
     pub async fn recheck(&self) -> Result<()> {
         self.client.health().await
     }
@@ -651,6 +693,32 @@ mod tests {
         // Must equal `[identity].default_owner`, or WebUI-created threads are
         // invisible to the turn runner.
         assert_eq!(env["IRONCLAW_REBORN_WEBUI_USER_ID"], DEFAULT_OWNER_USER_ID);
+    }
+
+    #[test]
+    fn the_shell_tool_is_off_by_default_and_always_stated_explicitly() {
+        // The inverse of the trigger-poller shape below: the runtime's own
+        // default for this one is *on*, so silence is the dangerous answer.
+        // Every config we build must therefore carry an explicit value, and the
+        // default must be `false`.
+        let plain: std::collections::HashMap<_, _> = config().env().into_iter().collect();
+        assert_eq!(plain[SHELL_TOOL_ENABLED_ENV], "false");
+
+        let mut enabled = config();
+        enabled.shell_enabled = true;
+        let env: std::collections::HashMap<_, _> = enabled.env().into_iter().collect();
+        assert_eq!(env[SHELL_TOOL_ENABLED_ENV], "true");
+
+        // And `extra_env` cannot silently overwrite the decision by ordering:
+        // the shell value is emitted before `extra_env`, so a caller who put the
+        // variable there too would win — which is why it is a typed field, and
+        // why nothing in the widget puts it in `extra_env`.
+        assert!(
+            !config()
+                .extra_env
+                .iter()
+                .any(|(name, _)| name == SHELL_TOOL_ENABLED_ENV)
+        );
     }
 
     #[test]

@@ -8,6 +8,27 @@
   --ok: #57c98a;
   --warn: #e2b04a;
 
+  /* Surfaces. `--line` was written literally 22 times before it had a name; it is
+     both the border colour of the whole product and the neutral button fill. */
+  --line: #2b2f38;
+  --line-soft: #262a33;
+  --well: #12141a;
+  --user-msg: #253247;
+
+  /* Radii. Cards previously used 8px, 10px and 12px with no rule for which. */
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 8px;
+  --r-xl: 12px;
+  --r-pill: 999px;
+
+  /* Motion. Durations were a mix of `0.15s` and `120ms`, and three of five
+     transitions omitted an easing function entirely. */
+  --t-fast: 120ms;
+  --t-base: 180ms;
+  --t-slow: 320ms;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+
   color-scheme: dark;
   font-family: "Segoe UI", system-ui, sans-serif;
   font-size: 14px;
@@ -15,6 +36,15 @@
 
 * {
   box-sizing: border-box;
+}
+
+/* Focus. There was no `:focus` rule anywhere in this file, so every control fell
+   back to the WebView2 default ring — including the ones drawn over a transparent
+   window, where it is close to invisible. One ring, everywhere, keyboard-only. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--r-sm);
 }
 
 body {
@@ -108,13 +138,13 @@ body.widget-body {
    not read as loudly as an actual answer. */
 .say-thinking .say-cloud,
 .say-status .say-cloud {
-  background: rgba(253, 253, 251, 0.82);
+  background: #e8e8e5;
   color: #3a3f4a;
   font-style: italic;
 }
 .say-thinking .say-tail,
 .say-status .say-tail {
-  border-top-color: rgba(253, 253, 251, 0.82);
+  border-top-color: #e8e8e5;
 }
 .say-thinking .say-cloud {
   animation: say-pulse 1.6s ease-in-out infinite;
@@ -171,14 +201,14 @@ body.widget-body {
   color: #10231a;
 }
 .ask-actions .deny {
-  background: #2b2f38;
+  background: var(--line);
   color: var(--text);
 }
 
 /* A sensitive-fill prompt is a stronger warning than a normal gate: it is the
    only thing between the agent and the user's password. Red, not amber. */
 .ask-fill {
-  border-color: var(--danger, #d1524a);
+  border-color: var(--danger);
   background: rgba(38, 22, 22, 0.97);
 }
 
@@ -188,7 +218,7 @@ body.widget-body {
  * only an offer, and it must never read as an alarm.
  */
 .ask-suggest {
-  border-color: var(--accent, #4a7fd1);
+  border-color: var(--accent);
   background: rgba(22, 28, 38, 0.97);
 }
 
@@ -196,7 +226,7 @@ body.widget-body {
    not blue like an offer: saying yes changes what the agent can do from now
    on, so the card is a consent prompt and must not read as a notification. */
 .ask-install {
-  border-color: var(--danger, #d1524a);
+  border-color: var(--danger);
   background: rgba(38, 22, 22, 0.97);
 }
 .ask-skill-text {
@@ -215,7 +245,7 @@ body.widget-body {
 .ask-warning {
   margin: 0 0 8px;
   font-size: 11px;
-  color: var(--danger, #d1524a);
+  color: var(--danger);
 }
 
 /* Stop, inside the character's thinking balloon (Phase 8a). Small and quiet —
@@ -225,7 +255,7 @@ body.widget-body {
   padding: 1px 8px;
   border: 1px solid #3a4150;
   border-radius: 10px;
-  background: #2b2f38;
+  background: var(--line);
   color: var(--text);
   font: inherit;
   font-size: 11px;
@@ -272,7 +302,7 @@ body.widget-body {
   white-space: pre-wrap;
   word-break: break-word;
   background: rgba(0, 0, 0, 0.25);
-  border: 1px solid var(--danger, #d1524a);
+  border: 1px solid var(--danger);
   border-radius: 6px;
   max-height: 320px;
   overflow: auto;
@@ -298,7 +328,7 @@ body.widget-body {
   justify-content: space-between;
   gap: 10px;
   padding: 8px 6px;
-  border-top: 1px solid #2b2f38;
+  border-top: 1px solid var(--line);
   border-radius: 4px;
 }
 .voice-row:first-child {
@@ -329,7 +359,7 @@ body.widget-body {
 
 /* Git-repo skill import (Phase 8e). */
 .repo-skill {
-  border-top: 1px solid #2b2f38;
+  border-top: 1px solid var(--line);
   padding: 10px 0;
 }
 .repo-skill:first-of-type {
@@ -359,7 +389,7 @@ body.widget-body {
   justify-content: space-between;
   gap: 10px;
   padding: 10px 4px;
-  border-top: 1px solid #2b2f38;
+  border-top: 1px solid var(--line);
 }
 .skill-row:first-child {
   border-top: none;
@@ -375,36 +405,26 @@ button.danger {
   border-color: var(--danger);
 }
 
-.widget-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 10px;
-  background: var(--panel);
-  /* The whole strip is the drag handle for the undecorated window. */
-  cursor: grab;
-  user-select: none;
-}
-
-.widget-header .title {
-  font-weight: 600;
-  flex: 1;
-}
-
 button.ghost {
   background: none;
   border: none;
   color: var(--muted);
   cursor: pointer;
-  font-size: 16px;
+  /* Matches the primary button. It was 16px, which rendered the secondary action
+     larger than the primary one and out of scale with the 15px panel heading. */
+  font-size: 14px;
   padding: 0 4px;
+  transition: color var(--t-fast) var(--ease);
+}
+button.ghost:hover {
+  color: var(--text);
 }
 
 .badge {
   font-size: 11px;
   padding: 2px 7px;
   border-radius: 999px;
-  background: #2b2f38;
+  background: var(--line);
   color: var(--muted);
   white-space: nowrap;
 }
@@ -600,7 +620,7 @@ button.ghost {
 }
 .bubble.user {
   align-self: flex-end;
-  background: #2a3446;
+  background: var(--user-msg);
 }
 .bubble.assistant {
   align-self: flex-start;
@@ -624,59 +644,19 @@ button.ghost {
 /* The read-only history of a past conversation (Phase 8a). */
 .history {
   margin-top: 12px;
-  border-top: 1px solid #262a33;
+  border-top: 1px solid var(--line-soft);
   padding-top: 8px;
 }
 .history .transcript {
   max-height: 420px;
-  background: #12141a;
+  background: var(--well);
   border-radius: 8px;
 }
 
-.status {
-  color: var(--muted);
-  font-size: 12px;
-  font-style: italic;
-}
-
-.gate {
-  border: 1px solid var(--warn);
-  border-radius: 8px;
-  padding: 10px;
-  background: rgba(226, 176, 74, 0.08);
-}
-.gate-headline {
-  font-weight: 600;
-  margin-bottom: 6px;
-}
-.gate-body {
-  margin: 0 0 8px;
-  font-size: 12px;
-  white-space: pre-wrap;
-  color: var(--muted);
-  max-height: 140px;
-  overflow: auto;
-}
-.gate-actions {
-  display: flex;
-  gap: 8px;
-}
-.gate-actions .approve {
-  background: var(--ok);
-  color: #10231a;
-}
-.gate-actions .deny {
-  background: #2b2f38;
-  color: var(--text);
-}
-
-/* A sensitive-fill prompt is a stronger warning than a normal gate: it is the
-   only thing between the agent and the user's password. Red, not amber. */
-.gate-fill {
-  border-color: var(--danger, #d1524a);
-  background: rgba(209, 82, 74, 0.1);
-  margin-top: 8px;
-}
+/* The `.gate*` family that used to live here was a near-duplicate of `.ask*`
+   and had no references left in any .tsx; `.status` and `.widget-header` were
+   the same story. Removed rather than kept "just in case" — the live rules are
+   `.ask`, `.ask-fill`, `.ask-suggest`, `.ask-install`. */
 .fill-row {
   display: flex;
   gap: 8px;
@@ -701,7 +681,7 @@ button.ghost {
   border-radius: 4px;
 }
 .fill-value.insecure {
-  color: var(--danger, #d1524a);
+  color: var(--danger);
 }
 .fill-reason {
   margin-top: 6px;
@@ -709,23 +689,47 @@ button.ghost {
   color: var(--muted);
 }
 
-.composer {
-  display: flex;
-  gap: 8px;
-  padding: 10px;
-  border-top: 1px solid #2b2f38;
-  background: var(--panel);
-}
-.composer input {
-  flex: 1;
+/* Text inputs. There was no `input` selector at all before this: any field not
+   inside one of four unrelated container rules rendered as raw WebView2 chrome.
+   `<select>` and the checkboxes were worse — native light-grey Windows controls
+   sitting inside a dark app. */
+input[type="text"],
+input[type="password"],
+input[type="number"],
+input[type="search"],
+input[type="url"],
+select,
+textarea {
   background: var(--bg);
-  border: 1px solid #2b2f38;
-  border-radius: 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
   color: var(--text);
+  font: inherit;
   padding: 8px 10px;
+  transition: border-color var(--t-fast) var(--ease);
 }
-.composer input:disabled {
+input:hover:not(:disabled),
+select:hover:not(:disabled),
+textarea:hover:not(:disabled) {
+  border-color: #3a4150;
+}
+input:disabled,
+select:disabled,
+textarea:disabled {
   opacity: 0.6;
+}
+input::placeholder,
+textarea::placeholder {
+  color: var(--muted);
+}
+select {
+  cursor: pointer;
+}
+/* Tint the native tick/dot so the controls stop rendering in light chrome. */
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--accent);
+  cursor: pointer;
 }
 
 button {
@@ -762,7 +766,7 @@ button.stop {
   gap: 2px;
   padding: 16px 8px;
   background: var(--panel);
-  border-right: 1px solid #262a33;
+  border-right: 1px solid var(--line-soft);
   position: sticky;
   top: 0;
   height: 100vh;
@@ -828,17 +832,9 @@ button.stop {
   margin: 0 0 8px;
 }
 .wizard-lead {
-  color: var(--muted, #9aa0ac);
+  color: var(--muted);
   margin: 0 0 16px;
   line-height: 1.5;
-}
-.wizard-steps {
-  margin: 0 0 20px;
-  padding-left: 20px;
-  line-height: 1.55;
-}
-.wizard-steps li {
-  margin-bottom: 12px;
 }
 .wizard-voice {
   display: flex;
@@ -846,7 +842,7 @@ button.stop {
   gap: 8px;
   margin-top: 8px;
   font-weight: 400;
-  color: var(--muted, #9aa0ac);
+  color: var(--muted);
 }
 .wizard-actions {
   display: flex;
@@ -856,20 +852,15 @@ button.stop {
   padding: 9px 18px;
   border: none;
   border-radius: 8px;
-  background: #4f6bed;
-  color: #fff;
+  background: var(--accent);
+  color: #0d1b33;
   font-size: 14px;
+  font-weight: 600;
   cursor: pointer;
 }
 .wizard-primary:disabled {
   opacity: 0.6;
   cursor: default;
-}
-.wizard-note {
-  margin: 14px 0 0;
-  font-size: 12px;
-  color: var(--muted, #9aa0ac);
-  text-align: center;
 }
 .dashboard h1 {
   font-size: 20px;
@@ -889,7 +880,7 @@ button.stop {
 }
 pre.log,
 pre.reason {
-  background: #12141a;
+  background: var(--well);
   border-radius: 6px;
   padding: 10px;
   max-height: 320px;
@@ -937,7 +928,7 @@ ul.rows .row {
   align-items: center;
   gap: 10px;
   padding: 9px 4px;
-  border-top: 1px solid #2b2f38;
+  border-top: 1px solid var(--line);
 }
 ul.rows .row:first-child {
   border-top: none;
@@ -998,7 +989,7 @@ ul.warnings li::before {
   align-items: center;
   gap: 10px;
   padding: 10px 4px;
-  border-top: 1px solid #2b2f38;
+  border-top: 1px solid var(--line);
 }
 .provider-option:first-of-type {
   border-top: none;
@@ -1030,7 +1021,7 @@ ul.warnings li::before {
 .key-row input {
   flex: 1;
   background: var(--bg);
-  border: 1px solid #2b2f38;
+  border: 1px solid var(--line);
   border-radius: 6px;
   color: var(--text);
   padding: 7px 10px;
@@ -1094,7 +1085,7 @@ h3.subhead {
   padding: 12px;
   border-radius: 8px;
   background: var(--panel);
-  border: 1px solid #2b2f38;
+  border: 1px solid var(--line);
   margin-bottom: 12px;
 }
 .download-head {
@@ -1106,7 +1097,7 @@ h3.subhead {
 .progress {
   height: 8px;
   border-radius: 999px;
-  background: #12141a;
+  background: var(--well);
   overflow: hidden;
 }
 .progress-bar {
@@ -1171,7 +1162,7 @@ h3.subhead {
   gap: 8px;
   padding: 10px;
   background: var(--panel);
-  border: 1px solid #2b2f38;
+  border: 1px solid var(--line);
   border-radius: 8px;
 }
 .chat-line {
@@ -1200,7 +1191,7 @@ h3.subhead {
 }
 .chat-line.user {
   align-self: flex-end;
-  background: #223046;
+  background: var(--user-msg);
 }
 .chat-line.assistant {
   align-self: flex-start;
@@ -1228,7 +1219,7 @@ h3.subhead {
   resize: vertical;
   padding: 8px 10px;
   border-radius: 8px;
-  border: 1px solid #2b2f38;
+  border: 1px solid var(--line);
   background: var(--bg);
   color: var(--text);
   font: inherit;
@@ -1259,7 +1250,7 @@ h3.subhead {
 .profile-grid input[type="text"] {
   padding: 8px 10px;
   border-radius: 8px;
-  border: 1px solid #2b2f38;
+  border: 1px solid var(--line);
   background: var(--bg);
   color: var(--text);
   font: inherit;
@@ -1271,7 +1262,7 @@ h3.subhead {
 .reply-mode {
   flex: 1 1 0;
   padding: 10px;
-  border: 1px solid #2b2f38;
+  border: 1px solid var(--line);
   border-radius: 8px;
   cursor: pointer;
   background: var(--panel);
@@ -1280,8 +1271,24 @@ h3.subhead {
   border-color: var(--ok);
   background: rgba(87, 201, 138, 0.1);
 }
+/* Visually hidden, but NOT `display: none`. It was the latter, which makes a
+   radio unfocusable — so the reply-mode selector, in both the setup wizard and
+   Settings, could not be operated from the keyboard at all. The radio still
+   takes focus here; the ring is drawn on the label around it. */
 .reply-mode input {
-  display: none;
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.reply-mode:has(input:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 .hotkey-row {
   display: flex;
@@ -1315,7 +1322,7 @@ h3.subhead {
   background: var(--panel);
   color: var(--muted);
   font-size: 12px;
-  border: 1px solid #2b2f38;
+  border: 1px solid var(--line);
 }
 .wizard-progress li.active {
   border-color: var(--accent);
@@ -1338,7 +1345,7 @@ h3.subhead {
   align-items: flex-start;
   padding: 10px 12px;
   border-radius: 8px;
-  border: 1px solid #2b2f38;
+  border: 1px solid var(--line);
   background: var(--panel);
   color: var(--text);
   cursor: pointer;
@@ -1358,7 +1365,7 @@ h3.subhead {
 .wizard-download .bar {
   height: 6px;
   border-radius: 999px;
-  background: #2b2f38;
+  background: var(--line);
   overflow: hidden;
 }
 .wizard-download .bar-fill {
@@ -1378,7 +1385,7 @@ h3.subhead {
   width: 14px;
   height: 14px;
   border-radius: 50%;
-  border: 2px solid #2b2f38;
+  border: 2px solid var(--line);
 }
 .wake-dot.filled {
   background: var(--ok);
@@ -1420,7 +1427,7 @@ h3.subhead {
   flex: 1 1 120px;
   height: 8px;
   border-radius: 999px;
-  background: #2b2f38;
+  background: var(--line);
   overflow: hidden;
   min-width: 100px;
 }
@@ -1431,4 +1438,23 @@ h3.subhead {
 }
 .level-fill.good {
   background: var(--ok);
+}
+
+/* ── Reduced motion ─────────────────────────────────────────────────────────
+   Nine of the keyframes above loop `infinite`, including a permanent shake on
+   the error state — on a window that is always on top and never closed. Windows
+   exposes "Show animations" as a system setting; honouring it is both an
+   accessibility duty and, for an idle desktop companion, a battery one.
+
+   The character's own renderer is capped separately at 30fps in character.ts.
+   This only governs CSS. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

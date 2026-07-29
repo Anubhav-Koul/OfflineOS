@@ -8,6 +8,7 @@
     "idle": { "live2d": { "expression": "exp_01", "motion": "Idle" } },
     "listening": { "live2d": { "expression": "exp_02" } },
     "thinking": { "live2d": { "expression": "exp_03" } },
+    "delegating": { "live2d": { "expression": "exp_03" } },
     "speaking": { "live2d": { "expression": "exp_04" } },
     "suggesting": { "live2d": { "expression": "exp_02" } },
     "concerned": { "live2d": { "expression": "exp_05" } },

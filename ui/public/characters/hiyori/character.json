@@ -10,6 +10,7 @@
     "thinking": { "live2d": { "motion": "Idle" } },
     "speaking": { "live2d": { "motion": "TapBody" } },
     "suggesting": { "live2d": { "motion": "TapBody" } },
+    "delegating": { "live2d": { "motion": "TapBody" } },
     "concerned": { "live2d": { "motion": "Idle" } },
     "error": { "live2d": { "motion": "Idle" } }
   }

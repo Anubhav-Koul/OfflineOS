@@ -51,9 +51,39 @@ jobs:
       - name: Clippy (ic_llama)
         run: cargo clippy -p ic_llama --all-targets -- -D warnings
       # The library only: the Tauri shell needs the frontend bundle, which the
-      # `widget` job builds.
+      # `widget` job builds — and that job now lints the binary, so `main.rs` is
+      # covered there rather than being skipped entirely.
       - name: Clippy (ic_widget)
         run: cargo clippy -p ic_widget --lib --tests -- -D warnings
+      # These three were in no job at all: not linted, and not tested. Between
+      # them they are the crates that touch host hardware — audio, a real
+      # browser, the canvas host.
+      - name: Clippy (ic_voice)
+        run: cargo clippy -p ic_voice --all-targets -- -D warnings
+      - name: Clippy (ic_browser_mcp)
+        run: cargo clippy -p ic_browser_mcp --all-targets -- -D warnings
+      - name: Clippy (ic_canvas_mcp)
+        run: cargo clippy -p ic_canvas_mcp --all-targets -- -D warnings
+
+  host-crates:
+    name: ic_voice / ic_browser_mcp / ic_canvas_mcp tests (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # Hermetic, like the ic_llama job: every test needing a real microphone,
+      # a real browser, or downloaded speech models is `#[ignore]`d. What runs
+      # here is protocol shape, parsing, policy and consent logic — including
+      # the browser sidecar's fill-consent gate, which is the fork's only
+      # enforced consent surface and was previously unverified by CI.
+      - name: Run ic_voice tests
+        run: cargo test -p ic_voice
+      - name: Run ic_browser_mcp tests
+        run: cargo test -p ic_browser_mcp
+      - name: Run ic_canvas_mcp tests
+        run: cargo test -p ic_canvas_mcp
 
   ic-llama:
     name: ic_llama tests (windows)
@@ -110,6 +140,63 @@ jobs:
         working-directory: ui
       - name: Build the widget
         run: cargo build -p ic_widget --features app --bin ic-widget
+      # `main.rs` — every Tauri command, the cursor poller, the fullscreen
+      # detector, the uninstall cleanup — was linted by nothing. The `quality`
+      # job cannot cover it because clippy on the binary needs the frontend
+      # bundle that this job just built. Phase 8g's Rust reached `main.rs`
+      # uncompiled and only a manual smoke run caught it; this is that gate.
+      - name: Clippy (ic_widget binary)
+        run: cargo clippy -p ic_widget --features app --bins -- -D warnings
+
+  core-patches:
+    name: core-patch tests (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # CP-6 and CP-7 live in core crates, which no fork job ran — so the
+      # Windows shell denylist and the shell kill-switch would have been
+      # replayed after every upstream merge with nothing checking they survived.
+      #
+      # Scoped to the patched module rather than the whole crate, for the reason
+      # in this file's header: `cargo test -p ironclaw_host_runtime --lib` has
+      # 21 pre-existing failures on Windows (`sandbox_process`, Unix-socket
+      # brokers) that are upstream's and out of scope for the fork gate. Scoping
+      # keeps the signal honest instead of drowning it.
+      - name: Run first-party tool tests (CP-6 denylist, CP-7 kill-switch)
+        run: cargo test -p ironclaw_host_runtime --lib first_party_tools
+      # `ironclaw_safety` is green in full on Windows, so it runs in full.
+      - name: Run safety tests (CP-6 Windows credential paths)
+        run: cargo test -p ironclaw_safety --lib
+
+  supply-chain:
+    name: cargo deny (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # The one job that is not Windows: `cargo deny` reads `Cargo.lock` and the
+      # advisory database, so its verdict is platform-independent, and Ubuntu
+      # runners are faster and cheaper for it.
+      #
+      # The fork added a dependency surface upstream never had — gix,
+      # chromiumoxide, keyring, whisper-rs, windows, axum, reqwest — and nothing
+      # was auditing it. All four checks are blocking: advisories, bans,
+      # licenses, sources. Current advisory exceptions are listed in
+      # `deny.toml`, each with a reachability argument and a removal condition.
+      # Built from source rather than pulled from a marketplace action: every
+      # other `uses:` in this file is pinned to a commit SHA, and adding one
+      # more third-party action into the supply-chain job would be an odd place
+      # to widen trust. `Swatinem/rust-cache` caches `~/.cargo/bin`, so this
+      # compiles once per cache generation rather than once per run.
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: cargo deny check
+        run: cargo deny check
 
   release-build:
     name: core release build (windows)

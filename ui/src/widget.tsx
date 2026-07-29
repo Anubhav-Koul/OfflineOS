@@ -54,12 +54,16 @@ function bridgeConsoleToLog() {
       return String(value);
     }
   };
+  // The level is preserved across the bridge. A library warning about something
+  // it then recovers from is not an error, and logging it as one teaches the
+  // reader that ERROR in this log means nothing.
+  const sink = { error: api.logUiError, warn: api.logUiWarning } as const;
   for (const level of ["error", "warn"] as const) {
     const original = console[level].bind(console);
     console[level] = (...args: unknown[]) => {
       original(...args);
       const text = args.map(render).join(" ").slice(0, 1000);
-      void api.logUiError(`console.${level}: ${text}`).catch(() => undefined);
+      void sink[level](`console.${level}: ${text}`).catch(() => undefined);
     };
   }
   window.addEventListener("error", (event) =>

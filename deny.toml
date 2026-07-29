@@ -35,27 +35,26 @@ ignore = [
     # yanked spin 0.9.8) are absent from this list because they were fixed
     # rather than ignored — all three moved within semver.
     #
-    # The four `not-shipped` entries rest on one checkable fact: the desktop app
-    # ships and supervises `ironclaw_reborn_cli`, and
-    # `cargo tree -p ironclaw_reborn_cli` contains none of lopdf, pdf-extract,
-    # tokio-postgres, or postgres-protocol. They reach the workspace only
-    # through the root `ironclaw` crate — the legacy v1 binary, which this fork
-    # does not build or distribute. Re-check that with the command above before
-    # trusting this note; it is the whole justification.
+    # The `not-shipped` entry rests on one checkable fact: the desktop app ships
+    # and supervises `ironclaw_reborn_cli`, and
+    # `cargo tree -p ironclaw_reborn_cli` contains neither lopdf nor
+    # pdf-extract. They reach the workspace only through the root `ironclaw`
+    # crate — the legacy v1 binary, which this fork does not build or
+    # distribute. Re-check that with the command above before trusting this
+    # note; it is the whole justification.
 
     # lopdf: stack overflow on deeply nested PDF objects. Pinned by
     # pdf-extract 0.7.12; no semver-compatible fix. Not shipped (see above), and
     # nothing in the fork parses PDFs.
     "RUSTSEC-2026-0187",
-    # tokio-postgres / postgres-protocol: three denial-of-service advisories,
-    # each requiring the process to actually speak the Postgres wire protocol to
-    # a malicious or malformed peer. Not shipped (see above), and the desktop
-    # profile is libSQL by design — `CLAUDE.md`'s storage decision is that a
-    # desktop user must never need Postgres.
-    "RUSTSEC-2026-0178",
-    "RUSTSEC-2026-0179",
-    "RUSTSEC-2026-0180",
-    # wasmtime-wasi: unlike the four above, this one *is* in the shipped binary.
+    # RUSTSEC-2026-0178/0179/0180 (tokio-postgres, postgres-protocol) were
+    # ignored here on 2026-07-29 with a not-shipped argument, and are now simply
+    # **fixed**: Dependabot's tokio-ecosystem group moved tokio-postgres
+    # 0.7.17 -> 0.7.18 and postgres-protocol 0.6.11 -> 0.6.12, both within
+    # semver. Removed rather than left in place — a stale ignore is a claim
+    # nobody re-checks, and `cargo deny` reports an unmatched entry only as a
+    # warning, so it would have sat here indefinitely looking load-bearing.
+    # wasmtime-wasi: unlike lopdf above, this one *is* in the shipped binary.
     # Both advisories are about the WASI filesystem surface — a descriptor leak
     # in `fd_renumber`, and hard link/rename escaping `FilePerms` on the
     # destination. Same reachability argument as RUSTSEC-2026-0149 immediately

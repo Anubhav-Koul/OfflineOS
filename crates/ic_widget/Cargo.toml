@@ -104,7 +104,7 @@ notify = "8.2.0"
 # scanner refuses skills the runtime accepts — block scalars (`description: |-`)
 # above all — so the import path uses the same parser rather than a lookalike.
 # Pinned by `skill_parser_agreement.rs`, which feeds both the real thing.
-serde_yml = "0.0.12"
+serde_yml = "0.0.13"
 # A temp directory for the cloned skills repo (Phase 8e), held in app state until
 # an install copies from it. Also a dev-dependency for tests.
 tempfile = "3"

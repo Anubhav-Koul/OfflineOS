@@ -41,7 +41,7 @@ jobs:
       packages: ${{ steps.packages.outputs.packages }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
@@ -108,7 +108,7 @@ jobs:
         package: ${{ fromJSON(needs.package-matrix.outputs.packages) }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
@@ -117,7 +117,7 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Restore Rust cache
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
         with:
           key: reborn-integration-${{ matrix.package }}
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/reborn-integration' }}

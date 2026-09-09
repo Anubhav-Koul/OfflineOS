@@ -15,7 +15,7 @@ path = "src/lib.rs"
 [dependencies]
 # CDP browser control. `tokio-runtime` selects the tokio async backend; no TLS
 # feature — CDP to a local browser is a plain loopback WebSocket.
-chromiumoxide = { version = "0.7", default-features = false, features = [
+chromiumoxide = { version = "0.8", default-features = false, features = [
     "tokio-runtime",
 ] }
 # The MCP transport. Same major version the gateway already uses, so the
@@ -38,11 +38,11 @@ serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-base64 = "0.22"
+base64 = "0.23"
 
 [target.'cfg(windows)'.dependencies]
 # Registry probe to locate an installed Chrome/Edge.
-winreg = "0.52"
+winreg = "0.55"
 
 [dev-dependencies]
 tempfile = "3"

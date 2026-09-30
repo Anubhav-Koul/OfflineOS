@@ -71,7 +71,7 @@ serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4.3"
 # Ambient guardrails: quiet hours are a *local* wall-clock question and the rate
 # cap is an elapsed-time one, so both readings come from one chrono instant.
@@ -81,7 +81,7 @@ chrono = { version = "0.4", default-features = false, features = [
     "std",
 ] }
 keyring = { version = "3", features = ["windows-native"] }
-dirs = "6"
+dirs = "7"
 # The connector OAuth callback listener (Phase 8b.1): a widget-owned loopback
 # server on a fixed port that proxies the redirect into `serve`. Same axum the
 # canvas MCP already pulls in, so no new transitive weight.
@@ -111,7 +111,7 @@ tempfile = "3"
 # Cloning a git repo of skills (Phase 8e). Pure-Rust (no `git.exe` on the user's
 # machine, no C toolchain) with the rustls HTTP transport, matching `reqwest`
 # above. Used only for a depth-1, no-submodule shallow clone into a temp dir.
-gix = { version = "0.73", default-features = false, features = [
+gix = { version = "0.88", default-features = false, features = [
     "blocking-http-transport-reqwest-rust-tls",
     "worktree-mutation",
 ] }

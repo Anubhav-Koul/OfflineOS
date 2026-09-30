@@ -18,7 +18,7 @@ test-support = []
 cpal = "0.18.1"
 # 0.16 for the `FftFixedIn` chunked API; 3.0/4.0 rewrote resampling around
 # audioadapters (`Fft` + `FixedSync`), a heavier surface we don't need.
-rubato = "0.16"
+rubato = "5.0"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"
@@ -33,7 +33,7 @@ whisper-rs = "0.16"
 # newtypes for provisioning the voice models (whisper, Piper voice + exe).
 ic_llama = { path = "../ic_llama" }
 # Extracting the Piper release archive (piper.exe + its DLLs), same pin as ic_llama.
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 # WASAPI default-device-change notifications: cpal exposes no device-change API, so
